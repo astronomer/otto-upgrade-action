@@ -25,6 +25,8 @@ jobs:
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
       - name: Otto Upgrade (dry-run)
         id: upgrade
@@ -62,6 +64,8 @@ jobs:
     if: ${{ github.event_name == 'workflow_dispatch' }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       - name: Otto Upgrade (live, dry-run)
         if: ${{ env.ASTRO_API_TOKEN != '' }}
         env:

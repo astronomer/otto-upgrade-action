@@ -50,9 +50,10 @@ PYPI_BASE_URL = os.environ.get("PYPI_BASE_URL", "https://pypi.org/pypi")
 
 TIER_ORDER = {"patch": 0, "minor": 1, "major": 2, "none": -1}
 VALID_TARGETS = {"patch", "latest-minor", "latest"}
-# PEP 440 prerelease markers. `post` is intentionally excluded — a post-release
+# PEP 440 prerelease markers, preceded by a digit or dot so they match both
+# `1.0.0rc1` and `1.0.0.dev3`. `post` is intentionally excluded — a post-release
 # is a final release that supersedes its base, not a prerelease.
-_PRERELEASE = re.compile(r"(\d)(a|b|c|rc|alpha|beta|dev|pre)\d*", re.IGNORECASE)
+_PRERELEASE = re.compile(r"[.\d](rc|alpha|beta|a|b|c|dev|pre)\d*", re.IGNORECASE)
 
 
 def _http_json(url: str) -> Any:

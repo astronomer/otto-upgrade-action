@@ -26,6 +26,25 @@ def stub_http(monkeypatch):
     monkeypatch.setattr(rt, "_http_json", fake)
 
 
+# --- version helpers ------------------------------------------------------- #
+@pytest.mark.parametrize(
+    "ver,expected",
+    [("9.30.0", False), ("10.1.0rc1", True), ("9.0.0.post1", False),
+     ("2.0.0.dev3", True), ("1.2.3b2", True), ("3.3.0rc1", True), ("21.0.0", False)],
+)
+def test_is_prerelease(ver, expected):
+    assert rt.is_prerelease(ver) is expected
+
+
+@pytest.mark.parametrize(
+    "ver,expected",
+    [("3.2.1", (3, 2, 1)), ("3.1-17", (3, 1, 17)), ("1!2.0.0", (2, 0, 0)),
+     ("2.0.0.post1", (2, 0, 0, 1)), ("9.0", (9, 0))],
+)
+def test_version_tuple(ver, expected):
+    assert rt.version_tuple(ver) == expected
+
+
 # --- runtime tiering ------------------------------------------------------- #
 def test_patch_target_stays_on_minor():
     r = rt.resolve_runtime("3.1-5", target="patch", max_scope="minor")
