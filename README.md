@@ -73,6 +73,9 @@ jobs:
 The consuming workflow must `actions/checkout` the repo first — the action
 operates on the working tree and pushes a branch from it.
 
+**Pinning.** `@v0` (above) tracks the latest `v0.x`. Pin `@v0.1.0` for an exact
+version, or `@<commit-sha>` for the strongest supply-chain guarantee.
+
 ## What a PR looks like
 
 The version bump is the cheap part:
