@@ -25,9 +25,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: ShellCheck
+        # Floor at warning: SC2317/SC2329 (trap-handler "unreachable"/"unused")
+        # are info-level false positives whose presence varies by shellcheck
+        # version, so they must not gate CI across runner-image updates.
         run: |
           sudo apt-get update && sudo apt-get install -y shellcheck
-          shellcheck scripts/*.sh
+          shellcheck --severity=warning scripts/*.sh
 
   yamllint:
     runs-on: ubuntu-latest

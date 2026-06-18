@@ -37,8 +37,10 @@ export PYTHONPYCACHEPREFIX="$WORKDIR/pycache"
 report="$WORKDIR/verify-report.md"
 status="skipped"
 
-# Invoked indirectly via `trap ... EXIT` below; shellcheck can't see that.
-# shellcheck disable=SC2329
+# Invoked indirectly via `trap ... EXIT` below; shellcheck can't see that, so it
+# flags the function as never-invoked (SC2329, v0.11+) and its body as
+# unreachable (SC2317, v0.9). Both are false positives for a trap handler.
+# shellcheck disable=SC2329,SC2317
 emit() {
   echo "$status" > "$WORKDIR/verify-status.txt"
   if [[ -n "${GITHUB_OUTPUT:-}" ]]; then echo "status=$status" >> "$GITHUB_OUTPUT"; fi
