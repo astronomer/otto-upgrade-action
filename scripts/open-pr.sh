@@ -139,7 +139,27 @@ expected=""
 if git fetch "$auth_remote" "refs/heads/$BRANCH:refs/remotes/origin/$BRANCH" 2>/dev/null; then
   expected="$(git rev-parse "refs/remotes/origin/$BRANCH" 2>/dev/null || true)"
 fi
+
+# Quiet-day short-circuit: if the rolling branch already exists with the exact
+# same tree we'd push (e.g. yesterday's run already proposed this target and
+# nothing newer shipped), do NOT push. A fresh commit would differ only by
+# timestamp, which would needlessly re-trigger the PR's CI and add "force-pushed"
+# noise every run. Leave the existing PR untouched.
 if [[ -n "$expected" ]]; then
+  local_tree="$(git rev-parse 'HEAD^{tree}')"
+  remote_tree="$(git rev-parse "${expected}^{tree}" 2>/dev/null || true)"
+  if [[ -n "$remote_tree" && "$local_tree" == "$remote_tree" ]]; then
+    echo "Rolling PR branch already reflects this target — nothing to push."
+    step_output changed "false"
+    existing=$(gh pr list --repo "$GITHUB_REPOSITORY" --head "$BRANCH" --state open \
+      --json number,url --jq '.[0] | "\(.number) \(.url)"' 2>/dev/null || true)
+    if [[ -n "$existing" ]]; then
+      step_output pr-number "${existing%% *}"
+      step_output pr-url "${existing##* }"
+      echo "Existing PR is up to date: ${existing##* }"
+    fi
+    exit 0
+  fi
   git push --force-with-lease="refs/heads/$BRANCH:$expected" "$auth_remote" "HEAD:refs/heads/$BRANCH"
 else
   # Branch doesn't exist remotely yet — a plain push creates it.
