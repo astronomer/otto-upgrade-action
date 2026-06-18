@@ -1,0 +1,18 @@
+version: 2
+updates:
+  # Keep the SHA-pinned actions current. Dependabot bumps the SHA and the
+  # `# vX.Y.Z` comment together, grouped into one PR/week, with a 7-day cooldown
+  # so a freshly-poisoned release isn't auto-bumped before the community spots it.
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    cooldown:
+      default-days: 7
+    groups:
+      gh-actions:
+        patterns: ["*"]
+    labels:
+      - "dependencies"
+    reviewers:
+      - "astronomer/agents-approvers"

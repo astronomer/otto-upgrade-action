@@ -1,0 +1,314 @@
+name: "Otto Airflow Upgrade"
+description: "Scheduled, Otto-driven Airflow upgrades: detect the current Runtime + providers, bump to a safe target, have Otto migrate the DAG code for breaking changes, verify, and open a PR."
+author: "Astronomer"
+branding:
+  icon: "arrow-up-circle"
+  color: "purple"
+
+inputs:
+  astro-api-token:
+    required: false
+    default: ""
+    description: "Astronomer API token for the Otto code-migration step. If empty, falls back to the ASTRO_API_TOKEN env var. When no token is available the action still opens the version-bump PR, but skips the Otto migration and flags breaking changes for manual review."
+  astro-domain:
+    required: false
+    default: "astronomer.io"
+    description: "Astronomer domain. Override for non-prod (e.g. 'astronomer-dev.io')."
+  astro-organization:
+    required: false
+    default: ""
+    description: "Astronomer organization ID for gateway routing. Falls back to the ASTRO_ORGANIZATION env var."
+  github-token:
+    required: false
+    default: ${{ github.token }}
+    description: "Token used to push the branch and open/update the PR. Needs contents:write and pull-requests:write. To have the upgrade PR itself trigger your other CI workflows, supply a PAT or GitHub App token instead of the default GITHUB_TOKEN."
+  project-path:
+    required: false
+    default: "."
+    description: "Path to the Astro project root (the directory containing the Dockerfile and requirements.txt)."
+  target:
+    required: false
+    default: "latest-minor"
+    description: "How far to bump the Runtime: 'patch' (newest build on the current Airflow minor), 'latest-minor' (newest Runtime within the current Airflow major), or 'latest' (newest stable Runtime). Always clamped by max-upgrade-scope."
+  max-upgrade-scope:
+    required: false
+    default: "minor"
+    description: "Safety clamp on how big a jump may be auto-authored: 'patch', 'minor', or 'major'. Majors are advisory-only regardless of this value — a scheduled bot never auto-authors an Airflow major migration; it surfaces it for the guided upgrade instead."
+  include-providers:
+    required: false
+    default: "true"
+    description: "Also bump pinned 'apache-airflow-providers-*' entries in requirements.txt. Unpinned providers are reported but never changed."
+  verify-level:
+    required: false
+    default: "import"
+    description: "Post-upgrade verification: 'syntax' (byte-compile DAGs), 'import' (additionally import every DAG against the target Airflow + providers), or 'none'. Verification only ever fails on a genuine code error; env/setup problems report 'skipped'."
+  base-branch:
+    required: false
+    default: ""
+    description: "PR base branch. Empty uses the currently checked-out branch."
+  branch:
+    required: false
+    default: "otto/airflow-upgrade"
+    description: "Head branch for the rolling upgrade PR. Re-runs force-push to it and update the same PR in place rather than opening a new one each run."
+  labels:
+    required: false
+    default: "airflow-upgrade,dependencies"
+    description: "Comma-separated labels applied to the PR (best-effort; missing labels are skipped with a warning)."
+  model:
+    required: false
+    default: ""
+    description: "Model identifier passed to Otto via --model. Empty uses Otto's default."
+  astro-cli-version:
+    required: false
+    default: ""
+    description: "Astro CLI version to install for the Otto step. Empty installs the latest published version (recommended). Only consulted when the Otto migration step runs."
+  dry-run:
+    required: false
+    default: "false"
+    description: "Compute the plan, apply the bumps locally, and write the would-be PR body to the job summary — but do not push or open a PR. Use this to preview what the action would do."
+
+outputs:
+  current-runtime:
+    description: "Detected current Runtime tag."
+    value: ${{ steps.resolve.outputs.current-runtime }}
+  target-runtime:
+    description: "Resolved target Runtime tag."
+    value: ${{ steps.resolve.outputs.target-runtime }}
+  overall-scope:
+    description: "Largest tier across the resolved plan: patch, minor, major, or none."
+    value: ${{ steps.resolve.outputs.overall-tier }}
+  no-update:
+    description: "'true' when nothing is behind and the action no-ops."
+    value: ${{ steps.resolve.outputs.no-update }}
+  verify-status:
+    description: "Verification result: passed, failed, or skipped (skipped when verification didn't run)."
+    value: ${{ steps.verify.outputs.status || 'skipped' }}
+  pr-number:
+    description: "Number of the opened/updated PR (empty in dry-run or no-op)."
+    value: ${{ steps.open-pr.outputs.pr-number }}
+  pr-url:
+    description: "URL of the opened/updated PR (empty in dry-run or no-op)."
+    value: ${{ steps.open-pr.outputs.pr-url }}
+  branch:
+    description: "Head branch the upgrade was committed to."
+    value: ${{ steps.open-pr.outputs.branch }}
+
+runs:
+  using: "composite"
+  steps:
+    - name: Detect current versions
+      id: detect
+      shell: bash
+      env:
+        PROJECT_PATH: ${{ inputs.project-path }}
+      run: |
+        set -euo pipefail
+        mkdir -p /tmp/otto-upgrade
+        python3 "$GITHUB_ACTION_PATH/scripts/detect_versions.py" > /tmp/otto-upgrade/current.json
+        echo "::group::Detected versions"
+        cat /tmp/otto-upgrade/current.json
+        echo "::endgroup::"
+
+    - name: Resolve upgrade targets
+      id: resolve
+      shell: bash
+      env:
+        CURRENT_FILE: /tmp/otto-upgrade/current.json
+        TARGET: ${{ inputs.target }}
+        MAX_SCOPE: ${{ inputs.max-upgrade-scope }}
+        INCLUDE_PROVIDERS: ${{ inputs.include-providers }}
+      run: |
+        set -euo pipefail
+        python3 "$GITHUB_ACTION_PATH/scripts/resolve_target.py" > /tmp/otto-upgrade/plan.json
+        echo "::group::Resolved plan"
+        cat /tmp/otto-upgrade/plan.json
+        echo "::endgroup::"
+        P=/tmp/otto-upgrade/plan.json
+        {
+          echo "overall-tier=$(jq -r '.overall_tier' "$P")"
+          echo "no-update=$(jq -r '.no_update' "$P")"
+          echo "needs-migration=$(jq -r '.needs_migration' "$P")"
+          echo "author-changes=$(jq -r '.author_changes' "$P")"
+          echo "scope-exceeded=$(jq -r '.scope_exceeded' "$P")"
+          echo "current-runtime=$(jq -r '.runtime.current_tag // ""' "$P")"
+          echo "target-runtime=$(jq -r '.runtime.target_tag // ""' "$P")"
+        } >> "$GITHUB_OUTPUT"
+        if [[ "$(jq -r '.no_update' "$P")" == "true" ]]; then
+          echo "Nothing to upgrade — everything is within scope of the latest available. No PR."
+        fi
+
+    - name: Apply version bumps
+      id: apply
+      if: steps.resolve.outputs.no-update != 'true' && steps.resolve.outputs.author-changes == 'true'
+      shell: bash
+      env:
+        PROJECT_PATH: ${{ inputs.project-path }}
+        PLAN_FILE: /tmp/otto-upgrade/plan.json
+      run: |
+        set -euo pipefail
+        python3 "$GITHUB_ACTION_PATH/scripts/apply_bump.py" > /tmp/otto-upgrade/apply.json
+        echo "::group::Applied bumps"
+        cat /tmp/otto-upgrade/apply.json
+        echo "::endgroup::"
+
+    - name: Resolve Otto auth
+      id: auth
+      # Runs for any real bump. Otto is mandatory: a real (PR-opening) run with
+      # no token is a hard error — this action exists to migrate code with Otto,
+      # not to ship unmigrated version bumps. The only tokenless path is a
+      # dry-run preview, where Otto is simply skipped.
+      if: steps.resolve.outputs.author-changes == 'true' && steps.resolve.outputs.no-update != 'true'
+      shell: bash
+      env:
+        INPUT_ASTRO_API_TOKEN: ${{ inputs.astro-api-token }}
+        INPUT_ASTRO_DOMAIN: ${{ inputs.astro-domain }}
+        INPUT_ASTRO_ORGANIZATION: ${{ inputs.astro-organization }}
+        DRY_RUN: ${{ inputs.dry-run }}
+      run: |
+        set -euo pipefail
+        TOKEN="${INPUT_ASTRO_API_TOKEN:-${ASTRO_API_TOKEN:-}}"
+        DOMAIN="${INPUT_ASTRO_DOMAIN:-${ASTRO_DOMAIN:-astronomer.io}}"
+        ORG="${INPUT_ASTRO_ORGANIZATION:-${ASTRO_ORGANIZATION:-}}"
+        if [[ -z "$TOKEN" || -z "$ORG" ]]; then
+          if [[ "$DRY_RUN" == "true" ]]; then
+            echo "::warning::No Astronomer token/organization — dry-run preview will skip the Otto migration (version/plan preview only)."
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "::error::This action requires an Astronomer API token + organization (the upgrade is performed by Otto). Set 'astro-api-token'/'astro-organization' (or the ASTRO_API_TOKEN/ASTRO_ORGANIZATION env vars), or use 'dry-run: true' to preview without Otto."
+          exit 1
+        fi
+        echo "::add-mask::$TOKEN"
+        {
+          echo "ASTRO_TOKEN=$TOKEN"
+          echo "ASTRO_API_TOKEN=$TOKEN"
+          echo "ASTRO_DOMAIN=$DOMAIN"
+          echo "ASTRO_ORGANIZATION=$ORG"
+        } >> "$GITHUB_ENV"
+        echo "enabled=true" >> "$GITHUB_OUTPUT"
+
+    - name: Install Astro CLI
+      id: install
+      if: steps.auth.outputs.enabled == 'true'
+      uses: astronomer/setup-astro-cli@d8de1c738a79b83c057d185202557c894e33d2f7  # v0.0.1
+      with:
+        version: ${{ inputs.astro-cli-version }}
+
+    - name: Verify Otto is available
+      if: steps.auth.outputs.enabled == 'true'
+      shell: bash
+      env:
+        CLI_VERSION: ${{ steps.install.outputs.cli-version }}
+        CLI_PATH: ${{ steps.install.outputs.cli-path }}
+      run: |
+        set -euo pipefail
+        echo "::group::Verify Otto"
+        # Capture-then-grep (not `grep -q` on a pipe): `astro --help` is long
+        # enough that grep closing the pipe early kills astro with SIGPIPE (141),
+        # which pipefail would surface as a false negative. Mirrors AI-710 in
+        # otto-review-action.
+        help_out="$("$CLI_PATH" --help 2>&1 || true)"
+        if ! printf '%s\n' "$help_out" | grep -qiE '^\s*otto\b'; then
+          echo "::error::Astro CLI ${CLI_VERSION} at ${CLI_PATH} does not bundle Otto. Otto requires Astro CLI >= 1.42.0."
+          exit 1
+        fi
+        # The migration step drives Otto's airflow-upgrade skill (assembled by
+        # Core from the upgrade KB) using --output-schema for the structured
+        # result. Confirm this Otto supports headless structured output.
+        otto_help_out="$("$CLI_PATH" otto --help 2>&1 || true)"
+        if ! printf '%s\n' "$otto_help_out" | grep -qE '\-\-output-schema\b'; then
+          echo "::error::Astro CLI ${CLI_VERSION} bundles Otto but it lacks --output-schema (headless structured output). Update the Astro CLI to a build whose Otto supports headless structured output."
+          exit 1
+        fi
+        echo "Astro CLI ${CLI_VERSION} bundles Otto with headless structured output."
+        echo "::endgroup::"
+
+    - name: Build Otto prompt
+      if: steps.auth.outputs.enabled == 'true'
+      shell: bash
+      env:
+        WORKDIR: /tmp/otto-upgrade
+        PLAN_FILE: /tmp/otto-upgrade/plan.json
+        PROJECT_PATH: ${{ inputs.project-path }}
+      run: bash "$GITHUB_ACTION_PATH/scripts/build-prompt.sh"
+
+    - name: Run Otto migration
+      if: steps.auth.outputs.enabled == 'true'
+      shell: bash
+      env:
+        ASTRO_TOKEN: ${{ env.ASTRO_TOKEN }}
+        ASTRO_API_TOKEN: ${{ env.ASTRO_API_TOKEN }}
+        ASTRO_DOMAIN: ${{ env.ASTRO_DOMAIN }}
+        ASTRO_ORGANIZATION: ${{ env.ASTRO_ORGANIZATION }}
+        OTTO_X_ASTRO_CLIENT_IDENTIFIER: otto-upgrade-action
+        OTTO_X_ASTRO_CLIENT_VERSION: ${{ github.action_ref }}
+        ASTRO_CLI_PATH: ${{ steps.install.outputs.cli-path }}
+        ACTION_PATH: ${{ github.action_path }}
+        WORKDIR: /tmp/otto-upgrade
+        INPUT_MODEL: ${{ inputs.model }}
+      run: bash "$GITHUB_ACTION_PATH/scripts/run-otto.sh"
+
+    - name: Set up uv (for import-level verification)
+      # verify-level=import builds an ephemeral env at the target version via uv.
+      # Provision it here so the check actually runs instead of silently
+      # reporting 'skipped' when the runner has no uv (the common case).
+      if: >-
+        steps.resolve.outputs.author-changes == 'true' &&
+        steps.resolve.outputs.no-update != 'true' &&
+        inputs.verify-level == 'import'
+      uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39  # v8.2.0
+
+    - name: Verify upgrade
+      id: verify
+      if: steps.resolve.outputs.author-changes == 'true' && steps.resolve.outputs.no-update != 'true'
+      shell: bash
+      env:
+        PROJECT_PATH: ${{ inputs.project-path }}
+        PLAN_FILE: /tmp/otto-upgrade/plan.json
+        VERIFY_LEVEL: ${{ inputs.verify-level }}
+        WORKDIR: /tmp/otto-upgrade
+        ACTION_PATH: ${{ github.action_path }}
+      run: bash "$GITHUB_ACTION_PATH/scripts/verify.sh"
+
+    - name: Open or update PR
+      id: open-pr
+      if: steps.resolve.outputs.author-changes == 'true' && steps.resolve.outputs.no-update != 'true'
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.github-token }}
+        PROJECT_PATH: ${{ inputs.project-path }}
+        PLAN_FILE: /tmp/otto-upgrade/plan.json
+        OTTO_FILE: /tmp/otto-upgrade/result.json
+        VERIFY_FILE: /tmp/otto-upgrade/verify-report.md
+        ACTION_PATH: ${{ github.action_path }}
+        WORKDIR: /tmp/otto-upgrade
+        BASE_BRANCH: ${{ inputs.base-branch }}
+        BRANCH: ${{ inputs.branch }}
+        LABELS: ${{ inputs.labels }}
+        DRY_RUN: ${{ inputs.dry-run }}
+        ACTION_REF: ${{ github.action_ref }}
+      run: bash "$GITHUB_ACTION_PATH/scripts/open-pr.sh"
+
+    - name: Major-upgrade advisory
+      if: steps.resolve.outputs.author-changes != 'true' && steps.resolve.outputs.no-update != 'true'
+      shell: bash
+      run: |
+        set -euo pipefail
+        advisory=$(jq -r '.advisory // "A major upgrade is available."' /tmp/otto-upgrade/plan.json)
+        echo "::warning::$advisory"
+        if [[ -n "${GITHUB_STEP_SUMMARY:-}" ]]; then
+          { echo "# Airflow major upgrade available"; echo; echo "> $advisory"; } >> "$GITHUB_STEP_SUMMARY"
+        fi
+
+    - name: Fail run on verification failure
+      # Runs last, AFTER the PR is opened, so a failed verification still ships a
+      # PR (with the failure flagged in its body) but the scheduled run goes red
+      # so the maintainer notices. Merge-gating is the consumer repo's CI job.
+      # Not in dry-run: a preview opens no PR (and, tokenless, skips the Otto
+      # migration), so unmigrated bumped code "failing" verification is expected
+      # and must not red the run or claim a PR was opened.
+      if: steps.verify.outputs.status == 'failed' && inputs.dry-run != 'true'
+      shell: bash
+      run: |
+        echo "::error::Verification failed at the target version. A PR was opened with the failure flagged; do not merge until it's resolved."
+        exit 1

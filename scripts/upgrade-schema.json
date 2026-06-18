@@ -1,0 +1,26 @@
+{
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "summary": {
+      "type": "string",
+      "description": "One-line description of the code changes made for the upgrade."
+    },
+    "changes_made": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "Breaking changes the migration handled (e.g. 'airflow.operators.python -> airflow.providers.standard.operators.python')."
+    },
+    "manual_followups": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "Changes a human must finish — anything ambiguous or risky left unedited."
+    },
+    "files_changed": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "Repository paths edited during the migration."
+    }
+  },
+  "required": ["summary", "changes_made", "manual_followups", "files_changed"]
+}

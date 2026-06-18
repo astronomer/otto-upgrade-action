@@ -1,0 +1,227 @@
+"""Resolver tiering, clamping, and the majors-are-advisory rule."""
+
+import contextlib
+import io
+import json
+from pathlib import Path
+
+import pytest
+import resolve_target as rt
+from conftest import load_fixture
+
+
+@pytest.fixture(autouse=True)
+def stub_http(monkeypatch):
+    """Route _http_json at the runtime feed and PyPI fixtures."""
+    feed = load_fixture("runtime-feed.json")
+    amazon = load_fixture("pypi-amazon.json")
+
+    def fake(url: str):
+        if "astronomer-runtime" in url or url.endswith("runtime-feed.json"):
+            return feed
+        if "amazon" in url:
+            return amazon
+        raise AssertionError(f"unexpected URL {url}")
+
+    monkeypatch.setattr(rt, "_http_json", fake)
+
+
+# --- version helpers ------------------------------------------------------- #
+@pytest.mark.parametrize(
+    "ver,expected",
+    [("9.30.0", False), ("10.1.0rc1", True), ("9.0.0.post1", False),
+     ("2.0.0.dev3", True), ("1.2.3b2", True), ("3.3.0rc1", True), ("21.0.0", False)],
+)
+def test_is_prerelease(ver, expected):
+    assert rt.is_prerelease(ver) is expected
+
+
+@pytest.mark.parametrize(
+    "ver,expected",
+    [("3.2.1", (3, 2, 1)), ("3.1-17", (3, 1, 17)), ("1!2.0.0", (2, 0, 0)),
+     ("2.0.0.post1", (2, 0, 0, 1)), ("9.0", (9, 0))],
+)
+def test_version_tuple(ver, expected):
+    assert rt.version_tuple(ver) == expected
+
+
+# --- runtime tiering ------------------------------------------------------- #
+def test_patch_target_stays_on_minor():
+    r = rt.resolve_runtime("3.1-5", target="patch", max_scope="minor")
+    assert r["target_tag"] == "3.1-7"
+    assert r["tier"] == "patch"
+    assert r["clamped"] is False
+
+
+def test_latest_minor_moves_within_major():
+    r = rt.resolve_runtime("3.1-5", target="latest-minor", max_scope="minor")
+    assert r["target_tag"] == "3.2-3"
+    assert r["target_airflow"] == "3.2.2"
+    assert r["tier"] == "minor"
+
+
+def test_runtime_build_patch_same_airflow():
+    # 3.0-9 and 3.0-10 are both Airflow 3.0.5 — a newer Runtime *build* on the
+    # same Airflow (CVE/provider-bundle fix). Must be a patch bump, not a no-op.
+    r = rt.resolve_runtime("3.0-9", target="patch", max_scope="patch")
+    assert r["target_tag"] == "3.0-10"
+    assert r["tier"] == "patch"
+
+
+def test_non_stable_channel_is_ignored():
+    # 3.3-rc (alpha channel) and 3.3-1 (stable channel but Airflow 3.3.0rc1, a
+    # prerelease Airflow) must never be picked even with target=latest.
+    r = rt.resolve_runtime("3.2-1", target="latest", max_scope="major")
+    assert r["target_tag"] == "3.2-3"
+    assert "rc" not in (r["target_airflow"] or "")
+
+
+def test_unknown_current_tag_is_skipped_not_crashed():
+    r = rt.resolve_runtime("9.9-9", target="latest", max_scope="major")
+    assert r["tier"] == "none"
+    assert r["target_tag"] == "9.9-9"
+    assert "not found" in r["note"]
+
+
+# --- runtime clamping ------------------------------------------------------ #
+def test_major_jump_clamped_to_minor():
+    # On AF2, asking for 'latest' wants AF3 (major); max-scope=minor must hold
+    # it to the newest AF2 runtime.
+    r = rt.resolve_runtime("2.10-12", target="latest", max_scope="minor")
+    assert r["clamped"] is True
+    assert r["target_tag"] == "2.11-1"
+    assert r["tier"] == "minor"
+
+
+def test_major_jump_clamped_to_patch():
+    r = rt.resolve_runtime("2.10-12", target="latest", max_scope="patch")
+    # No newer patch on the 2.10 line in the fixture -> stays put.
+    assert r["target_tag"] == "2.10-12"
+    assert r["tier"] == "none"
+
+
+# --- providers ------------------------------------------------------------- #
+def test_provider_minor_clamp_excludes_yanked_and_prerelease():
+    p = rt._provider_latest("apache-airflow-providers-amazon", "9.0.0", "minor")
+    # 9.31.0 is yanked, 10.1.0rc1 is prerelease, 10.0.0 is a major -> clamp to 9.30.0.
+    assert p["target"] == "9.30.0"
+    assert p["tier"] == "minor"
+    assert p["clamped"] is True
+
+
+def test_provider_major_allowed_when_scope_major():
+    p = rt._provider_latest("apache-airflow-providers-amazon", "9.0.0", "major")
+    assert p["target"] == "10.0.0"
+    assert p["tier"] == "major"
+
+
+def test_provider_no_downgrade():
+    p = rt._provider_latest("apache-airflow-providers-amazon", "99.0.0", "major")
+    assert p["tier"] == "none"
+    assert p["target"] == "99.0.0"
+
+
+def test_provider_pypi_failure_is_reported_not_crashed(monkeypatch):
+    monkeypatch.setattr(rt, "_http_json", lambda url: (_ for _ in ()).throw(OSError("boom")))
+    p = rt._provider_latest("apache-airflow-providers-amazon", "9.0.0", "minor")
+    assert p["tier"] == "none"
+    assert p["target"] == "9.0.0"          # unchanged
+    assert "PyPI lookup failed" in p["note"]
+
+
+def test_provider_no_stable_releases(monkeypatch):
+    # Only prereleases + a fully-yanked release -> nothing installable -> no bump.
+    monkeypatch.setattr(rt, "_http_json", lambda url: {
+        "releases": {"9.1.0rc1": [{"yanked": False}], "9.0.0": [{"yanked": True}]}
+    })
+    p = rt._provider_latest("apache-airflow-providers-amazon", "8.0.0", "major")
+    assert p["tier"] == "none"
+    assert "no stable releases" in p["note"]
+
+
+# --- full plan: majors are advisory-only ----------------------------------- #
+def _run_plan(tmp_path: Path, monkeypatch, current: dict, **env):
+    cur_file = tmp_path / "current.json"
+    cur_file.write_text(json.dumps(current))
+    monkeypatch.setenv("CURRENT_FILE", str(cur_file))
+    for k, v in env.items():
+        monkeypatch.setenv(k, v)
+
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        rt.main()
+    return json.loads(buf.getvalue())
+
+
+def test_major_plan_is_advisory_only(tmp_path, monkeypatch):
+    plan = _run_plan(
+        tmp_path, monkeypatch,
+        {"runtime": {"tag": "2.10-12", "image_repo": "x/runtime"}, "providers": []},
+        TARGET="latest", MAX_SCOPE="major", INCLUDE_PROVIDERS="false",
+    )
+    assert plan["overall_tier"] == "major"
+    assert plan["author_changes"] is False  # never auto-author a major
+    assert plan["advisory"]
+
+
+def test_minor_plan_authors_changes(tmp_path, monkeypatch):
+    plan = _run_plan(
+        tmp_path, monkeypatch,
+        {"runtime": {"tag": "3.1-5", "image_repo": "x/runtime"},
+         "providers": [{"package": "apache-airflow-providers-amazon", "pinned_version": "9.0.0"}]},
+        TARGET="latest-minor", MAX_SCOPE="minor",
+    )
+    assert plan["overall_tier"] == "minor"
+    assert plan["author_changes"] is True
+    assert plan["needs_migration"] is True
+    assert plan["no_update"] is False
+
+
+def test_no_update_when_current_is_latest(tmp_path, monkeypatch):
+    plan = _run_plan(
+        tmp_path, monkeypatch,
+        {"runtime": {"tag": "3.2-3", "image_repo": "x/runtime"}, "providers": []},
+        TARGET="latest", MAX_SCOPE="major", INCLUDE_PROVIDERS="false",
+    )
+    assert plan["no_update"] is True
+    assert plan["author_changes"] is False
+
+
+def test_provider_only_major_is_authored(tmp_path, monkeypatch):
+    # Runtime already at latest (no Airflow move), but a provider major is
+    # available with max-scope=major. Provider majors ARE authored — only
+    # *Airflow* majors are advisory-only.
+    plan = _run_plan(
+        tmp_path, monkeypatch,
+        {"runtime": {"tag": "3.2-3", "image_repo": "x/runtime"},
+         "providers": [{"package": "apache-airflow-providers-amazon", "pinned_version": "9.0.0"}]},
+        TARGET="latest", MAX_SCOPE="major",
+    )
+    assert plan["overall_tier"] == "major"
+    assert plan["author_changes"] is True
+    assert plan["advisory"] == ""
+
+
+def test_digest_pinned_runtime_is_refused(tmp_path, monkeypatch):
+    plan = _run_plan(
+        tmp_path, monkeypatch,
+        {"runtime": {"tag": "3.1-5", "image_repo": "x/runtime", "digest": "sha256:deadbeef"},
+         "providers": []},
+        TARGET="latest", MAX_SCOPE="major", INCLUDE_PROVIDERS="false",
+    )
+    assert plan["runtime"]["tier"] == "none"           # not bumped
+    assert "digest-pinned" in plan["runtime"]["note"]
+    assert plan["runtime"]["target_tag"] == "3.1-5"    # tag unchanged
+    # …but the current Airflow is still resolved from the tag, so Otto/verify
+    # have a real version to work against (3.1-5 -> Airflow 3.1.0 in the fixture).
+    assert plan["runtime"]["current_airflow"] == "3.1.0"
+    assert plan["no_update"] is True
+
+    # An unknown digest-pinned tag leaves current_airflow None (graceful).
+    plan2 = _run_plan(
+        tmp_path, monkeypatch,
+        {"runtime": {"tag": "9.9-9", "image_repo": "x/runtime", "digest": "sha256:dead"},
+         "providers": []},
+        TARGET="latest", MAX_SCOPE="major", INCLUDE_PROVIDERS="false",
+    )
+    assert plan2["runtime"]["current_airflow"] is None
