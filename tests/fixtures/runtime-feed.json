@@ -1,0 +1,12 @@
+{
+  "schemaVersion": "test",
+  "runtimeVersionsV3": {
+    "2.10-12": { "metadata": { "airflowVersion": "2.10.5", "channel": "stable", "releaseDate": "2025-01-01" } },
+    "2.11-1":  { "metadata": { "airflowVersion": "2.11.0", "channel": "stable", "releaseDate": "2025-03-01" } },
+    "3.1-5":   { "metadata": { "airflowVersion": "3.1.0",  "channel": "stable", "releaseDate": "2025-09-01" } },
+    "3.1-7":   { "metadata": { "airflowVersion": "3.1.2",  "channel": "stable", "releaseDate": "2025-10-01" } },
+    "3.2-1":   { "metadata": { "airflowVersion": "3.2.0",  "channel": "stable", "releaseDate": "2026-04-01" } },
+    "3.2-3":   { "metadata": { "airflowVersion": "3.2.2",  "channel": "stable", "releaseDate": "2026-06-01" } },
+    "3.3-rc":  { "metadata": { "airflowVersion": "3.3.0",  "channel": "alpha",  "releaseDate": "2026-06-10" } }
+  }
+}

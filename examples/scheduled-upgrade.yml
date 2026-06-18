@@ -1,0 +1,29 @@
+# Example consumer workflow. Copy into a customer's repo at
+# .github/workflows/airflow-upgrade.yml and set the two secrets.
+name: Airflow upgrade
+
+on:
+  schedule:
+    - cron: "0 6 * * 1"   # Mondays 06:00 UTC
+  workflow_dispatch:       # also runnable on demand
+
+permissions:
+  contents: write          # push the upgrade branch
+  pull-requests: write     # open/update the PR
+
+jobs:
+  upgrade:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astronomer/otto-upgrade-action@v0
+        with:
+          astro-api-token: ${{ secrets.ASTRO_API_TOKEN }}
+          astro-organization: ${{ secrets.ASTRO_ORGANIZATION }}
+          # Reach for the newest Runtime within your current Airflow major,
+          # but never auto-author a major migration.
+          target: latest-minor
+          max-upgrade-scope: minor
+          # Where your Astro project lives, if not the repo root.
+          # project-path: .

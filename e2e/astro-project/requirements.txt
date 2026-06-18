@@ -1,0 +1,5 @@
+# Pinned providers so the upgrade action has something concrete to bump.
+# Unpinned entries (no ==) are reported but never changed.
+apache-airflow-providers-amazon==9.0.0
+apache-airflow-providers-http==5.0.0
+pandas

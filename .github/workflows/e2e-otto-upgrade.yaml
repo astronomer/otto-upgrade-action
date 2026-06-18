@@ -1,0 +1,79 @@
+name: E2E - Otto Upgrade
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+    paths:
+      - 'action.yaml'
+      - 'scripts/**'
+      - 'e2e/**'
+      - '.github/workflows/e2e-otto-upgrade.yaml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  # Credential-free smoke test: detect -> resolve (live feed + PyPI) -> apply ->
+  # verify -> render the PR body, all in dry-run. Opens no PR, needs no secrets,
+  # runs under `act`. Exercises every step except the Otto migration (which needs
+  # a token and the `upgrader` persona).
+  dry-run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Otto Upgrade (dry-run)
+        id: upgrade
+        uses: ./
+        with:
+          project-path: e2e/astro-project
+          target: latest-minor
+          max-upgrade-scope: minor
+          run-otto: "false"
+          verify-level: syntax
+          dry-run: "true"
+
+      - name: Assert the action produced a plan
+        env:
+          CURRENT: ${{ steps.upgrade.outputs.current-runtime }}
+          TARGET: ${{ steps.upgrade.outputs.target-runtime }}
+          SCOPE: ${{ steps.upgrade.outputs.overall-scope }}
+          NOUP: ${{ steps.upgrade.outputs.no-update }}
+          VERIFY: ${{ steps.upgrade.outputs.verify-status }}
+        run: |
+          set -euo pipefail
+          echo "current=$CURRENT target=$TARGET scope=$SCOPE no-update=$NOUP verify=$VERIFY"
+          [[ -n "$CURRENT" ]] || { echo "::error::no current runtime detected"; exit 1; }
+          case "$SCOPE" in patch|minor|major) ;; *) echo "::error::unexpected scope '$SCOPE'"; exit 1;; esac
+          [[ "$VERIFY" == "passed" ]] || { echo "::error::verify-status was '$VERIFY', expected passed"; exit 1; }
+          echo "✅ dry-run produced a $SCOPE plan ($CURRENT -> $TARGET) and verification passed."
+
+  # Real upgrade against the sample project. Runs only when the Astro secrets are
+  # configured (skipped on forks / secret-less runs). Still dry-run so the e2e
+  # never opens a PR against this repo — it proves the Otto migration path wires
+  # up end to end. Requires an Otto build with the `upgrader` persona.
+  live-dry-run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    if: ${{ github.event_name == 'workflow_dispatch' }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Otto Upgrade (live, dry-run)
+        if: ${{ env.ASTRO_API_TOKEN != '' }}
+        env:
+          ASTRO_API_TOKEN: ${{ secrets.ASTRO_API_TOKEN }}
+          ASTRO_ORGANIZATION: ${{ secrets.ASTRO_ORGANIZATION }}
+        uses: ./
+        with:
+          project-path: e2e/astro-project
+          target: latest-minor
+          max-upgrade-scope: minor
+          run-otto: "true"
+          verify-level: import
+          dry-run: "true"
+          astro-api-token: ${{ secrets.ASTRO_API_TOKEN }}
+          astro-organization: ${{ secrets.ASTRO_ORGANIZATION }}

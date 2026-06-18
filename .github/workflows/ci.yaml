@@ -1,0 +1,39 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  unit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - name: Unit tests (no network — fixtures)
+        run: uv run --with pytest python -m pytest tests/ -q
+      - name: Lint
+        run: uv run --with ruff ruff check scripts/ tests/
+
+  shellcheck:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: ShellCheck
+        run: |
+          sudo apt-get update && sudo apt-get install -y shellcheck
+          shellcheck scripts/*.sh
+
+  yamllint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: yaml-lint
+        uses: ibiqlik/action-yamllint@v3
+        with:
+          file_or_dir: action.yaml .github/workflows
