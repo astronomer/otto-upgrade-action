@@ -30,6 +30,10 @@ VERIFY_LEVEL="${VERIFY_LEVEL:-import}"
 WORKDIR="${WORKDIR:-/tmp/otto-upgrade}"
 mkdir -p "$WORKDIR"
 
+# Keep byte-compilation artifacts out of the project tree so open-pr.sh's
+# `git add -A` can't sweep __pycache__/*.pyc into the upgrade PR.
+export PYTHONPYCACHEPREFIX="$WORKDIR/pycache"
+
 report="$WORKDIR/verify-report.md"
 status="skipped"
 
@@ -80,28 +84,41 @@ if [[ "$VERIFY_LEVEL" == "syntax" ]]; then
   exit 0
 fi
 
-# --- import (target Airflow) ----------------------------------------------- #
-tgt_af=$(jq -r '.runtime.target_airflow // empty' "$PLAN_FILE")
-if [[ -z "$tgt_af" ]]; then
-  status="skipped"
-  echo "ℹ️ Import check skipped: no resolved target Airflow version (runtime not bumped). Syntax check passed." > "$report"
-  exit 0
-fi
+# --- import (target Airflow + the project's full deps) --------------------- #
+# Pin Airflow to the target if the runtime moved, else to the current Airflow
+# (provider-only bumps still need an Airflow to import against). When the
+# runtime tag is unknown, leave Airflow to be resolved from requirements.
+af_pin=$(jq -r '.runtime.target_airflow // .runtime.current_airflow // empty' "$PLAN_FILE")
 if ! command -v uv >/dev/null 2>&1; then
   status="skipped"
   echo "ℹ️ Import check skipped: \`uv\` not available to build the target env. Syntax check passed." > "$report"
   exit 0
 fi
 
-with_args=(--with "apache-airflow==$tgt_af")
-while IFS= read -r line; do
-  [[ -z "$line" ]] && continue
-  with_args+=(--with "$line")
-done < <(jq -r '.providers[]? | select(.target != null and .current != .target) | "\(.package)==\(.target)"' "$PLAN_FILE")
+# Build the env from the project's *full* requirements (already rewritten to the
+# bumped pins by apply_bump.py) so unchanged providers and other deps a DAG
+# imports are present — otherwise we'd get false ModuleNotFoundErrors. Then pin
+# Airflow on top.
+with_args=()
+if [[ -f "$PROJECT_PATH/requirements.txt" ]]; then
+  with_args+=(--with-requirements "$PROJECT_PATH/requirements.txt")
+fi
+if [[ -n "$af_pin" ]]; then
+  with_args+=(--with "apache-airflow==$af_pin")
+fi
+if [[ ${#with_args[@]} -eq 0 ]]; then
+  status="skipped"
+  echo "ℹ️ Import check skipped: no requirements.txt and no resolvable Airflow pin. Syntax check passed." > "$report"
+  exit 0
+fi
 
-echo "::group::Import check (apache-airflow==$tgt_af)"
+echo "::group::Import check (apache-airflow==${af_pin:-from-requirements})"
 set +e
-out=$(timeout 600 uv run --no-project "${with_args[@]}" -- \
+# Strip secrets from the subprocess: it imports repository DAG code, which we
+# treat as untrusted. It must not be able to read the Astro token or any GitHub
+# token from its environment.
+out=$(env -u ASTRO_TOKEN -u ASTRO_API_TOKEN -u GH_TOKEN -u GITHUB_TOKEN \
+  timeout 600 uv run --no-project "${with_args[@]}" -- \
   python3 "$ACTION_PATH/scripts/import_check.py" "${roots[@]}" 2>"$WORKDIR/import-setup.err")
 rc=$?
 set -e

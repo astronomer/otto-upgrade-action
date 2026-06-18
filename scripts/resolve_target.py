@@ -13,12 +13,16 @@ run unauthenticated so it works in CI / `act` without secrets):
 
 Tiering is driven by the *Airflow* version behind each runtime tag, not the tag
 string, so it is correct regardless of the runtime tag scheme (AF2-era semver
-tags like ``12.12.0`` vs AF3-era ``3.2-5``).
+tags like ``12.12.0`` vs AF3-era ``3.2-5``). One exception: a newer Runtime
+*build* on the **same** Airflow version (e.g. ``3.1-5`` -> ``3.1-7``, both
+Airflow 3.1.2 — a base-image CVE or provider-bundle fix) is a real `patch`-tier
+upgrade, not a no-op.
 
-Design choice — majors are advisory-only. A scheduled bot must never author an
-Airflow 2->3 (or any major) migration PR unattended; that is the guided-upgrade
-path. When the only available jump is a major, the plan sets
-``author_changes=false`` and carries an advisory instead of a diff.
+Design choice — Airflow majors are advisory-only. A scheduled bot must never
+author an Airflow 2->3 (or any Airflow-major) migration PR unattended; that is
+the guided-upgrade path. When the runtime jump resolves to a major, the plan
+sets ``author_changes=false`` and carries an advisory instead of a diff. Provider
+majors *are* authored (far lower risk than an Airflow major).
 
 Env in:
   CURRENT_FILE    path to detect-versions JSON  (required)
@@ -45,7 +49,10 @@ RUNTIME_FEED_URL = os.environ.get(
 PYPI_BASE_URL = os.environ.get("PYPI_BASE_URL", "https://pypi.org/pypi")
 
 TIER_ORDER = {"patch": 0, "minor": 1, "major": 2, "none": -1}
-_PRERELEASE = re.compile(r"(a|b|rc|dev|pre|post)", re.IGNORECASE)
+VALID_TARGETS = {"patch", "latest-minor", "latest"}
+# PEP 440 prerelease markers. `post` is intentionally excluded — a post-release
+# is a final release that supersedes its base, not a prerelease.
+_PRERELEASE = re.compile(r"(\d)(a|b|c|rc|alpha|beta|dev|pre)\d*", re.IGNORECASE)
 
 
 def _http_json(url: str) -> Any:
@@ -58,23 +65,26 @@ def _http_json(url: str) -> Any:
 def version_tuple(v: str) -> tuple[int, ...]:
     """Best-effort numeric tuple for a version string.
 
-    ``3.2.1`` -> (3, 2, 1); ``3.1-17`` -> (3, 1, 17). Non-numeric trailers
-    (rc1, dev0) are dropped — callers gate prereleases separately.
+    ``3.2.1`` -> (3, 2, 1); ``3.1-17`` -> (3, 1, 17). The PEP 440 epoch and
+    local segment are dropped so they don't inflate the comparison
+    (``1!2.0.0`` compares as ``2.0.0``); trailing prerelease/post markers are
+    ignored — callers gate prereleases separately.
     """
+    v = v.split("+", 1)[0]          # drop local segment
+    if "!" in v:                    # drop epoch
+        v = v.split("!", 1)[1]
     nums = re.findall(r"\d+", v)
     return tuple(int(n) for n in nums) if nums else (0,)
 
 
 def is_prerelease(v: str) -> bool:
-    # A trailing rc/dev/b segment, e.g. 21.0.0rc1 or 9.1.0.dev0.
     return bool(_PRERELEASE.search(v.split("+", 1)[0]))
 
 
 def tier_between(cur: str, tgt: str) -> str:
     """patch / minor / major between two Airflow (or semver) versions."""
-    c, t = version_tuple(cur), version_tuple(tgt)
-    c = (c + (0, 0, 0))[:3]
-    t = (t + (0, 0, 0))[:3]
+    c = (version_tuple(cur) + (0, 0, 0))[:3]
+    t = (version_tuple(tgt) + (0, 0, 0))[:3]
     if t == c:
         return "none"
     if t[0] != c[0]:
@@ -88,16 +98,19 @@ def tier_between(cur: str, tgt: str) -> str:
 # Runtime
 # --------------------------------------------------------------------------- #
 def _runtime_candidates() -> list[dict[str, Any]]:
-    """Flatten the runtime feed into stable candidates with airflow versions."""
+    """Flatten the runtime feed into stable candidates with airflow versions.
+
+    V3 entries take precedence over legacy ones on a tag-string collision.
+    """
     feed = _http_json(RUNTIME_FEED_URL)
     out: list[dict[str, Any]] = []
-    for key in ("runtimeVersionsV3", "runtimeVersions"):
+    for key in ("runtimeVersionsV3", "runtimeVersions"):  # V3 first => precedence
         for tag, entry in (feed.get(key) or {}).items():
             meta = entry.get("metadata", {})
             if meta.get("channel") != "stable":
                 continue
             af = meta.get("airflowVersion")
-            if not af:
+            if not af or is_prerelease(af):  # never target a prerelease Airflow
                 continue
             out.append(
                 {
@@ -107,7 +120,14 @@ def _runtime_candidates() -> list[dict[str, Any]]:
                     "scheme": "v3" if key == "runtimeVersionsV3" else "legacy",
                 }
             )
-    return out
+    seen: set[str] = set()
+    deduped: list[dict[str, Any]] = []
+    for c in out:
+        if c["tag"] in seen:
+            continue
+        seen.add(c["tag"])
+        deduped.append(c)
+    return deduped
 
 
 def _newest(cands: list[dict[str, Any]]) -> dict[str, Any] | None:
@@ -117,9 +137,19 @@ def _newest(cands: list[dict[str, Any]]) -> dict[str, Any] | None:
     return max(cands, key=lambda c: (version_tuple(c["airflow"]), c["release_date"]))
 
 
+def _runtime_tier(current_tag: str, cur_af: str, pick: dict[str, Any]) -> str:
+    """Tier of a runtime move. A newer build on the same Airflow is `patch`."""
+    tier = tier_between(cur_af, pick["airflow"])
+    if tier == "none" and pick["tag"] != current_tag:
+        return "patch"
+    return tier
+
+
 def resolve_runtime(current_tag: str, target: str, max_scope: str) -> dict[str, Any]:
     cands = _runtime_candidates()
-    by_tag = {c["tag"]: c for c in cands}
+    by_tag: dict[str, Any] = {}
+    for c in cands:
+        by_tag.setdefault(c["tag"], c)
     cur = by_tag.get(current_tag)
 
     if cur is None:
@@ -149,7 +179,7 @@ def resolve_runtime(current_tag: str, target: str, max_scope: str) -> dict[str, 
         pick = _newest(same_major)
 
     pick = pick or cur
-    tier = tier_between(cur_af, pick["airflow"])
+    tier = _runtime_tier(current_tag, cur_af, pick)
 
     # Clamp to max-upgrade-scope. If the natural pick is too big a jump, fall
     # back to the newest candidate that stays within scope.
@@ -160,7 +190,7 @@ def resolve_runtime(current_tag: str, target: str, max_scope: str) -> dict[str, 
             pick = _newest(same_minor) or cur
         elif max_scope == "minor":
             pick = _newest(same_major) or cur
-        tier = tier_between(cur_af, pick["airflow"])
+        tier = _runtime_tier(current_tag, cur_af, pick)
 
     return {
         "current_tag": current_tag,
@@ -180,7 +210,7 @@ def resolve_runtime(current_tag: str, target: str, max_scope: str) -> dict[str, 
 def _provider_latest(package: str, cur: str, max_scope: str) -> dict[str, Any]:
     try:
         data = _http_json(f"{PYPI_BASE_URL}/{package}/json")
-    except Exception as exc:  # network / 404 — report, don't crash the plan
+    except Exception as exc:  # noqa: BLE001 — network / 404; report, don't crash the plan
         return {"package": package, "current": cur, "target": cur, "tier": "none",
                 "clamped": False, "note": f"PyPI lookup failed: {exc}"}
 
@@ -189,7 +219,8 @@ def _provider_latest(package: str, cur: str, max_scope: str) -> dict[str, Any]:
     for ver, files in releases.items():
         if is_prerelease(ver):
             continue
-        if files and all(f.get("yanked") for f in files):
+        # No artifacts, or every artifact yanked -> not installable; skip.
+        if not files or all(f.get("yanked") for f in files):
             continue
         stable.append(ver)
     if not stable:
@@ -215,8 +246,8 @@ def _provider_latest(package: str, cur: str, max_scope: str) -> dict[str, Any]:
         target = best(pool) if pool else cur
         tier = tier_between(cur, target)
 
-    # Never propose a downgrade (current pin newer than anything on the index we'd pick).
-    if version_tuple(target) < cm:
+    # Never propose a downgrade (pad both sides so 9.0 vs 9.0.0 isn't a "downgrade").
+    if (version_tuple(target) + (0, 0, 0))[:3] < (cm + (0, 0, 0))[:3]:
         target, tier, clamped = cur, "none", False
 
     return {"package": package, "current": cur, "target": target, "tier": tier,
@@ -229,6 +260,10 @@ def main() -> int:
     max_scope = os.environ.get("MAX_SCOPE", "minor")
     include_providers = os.environ.get("INCLUDE_PROVIDERS", "true").lower() == "true"
 
+    if target not in VALID_TARGETS:
+        print(f"::error::invalid TARGET '{target}' (expected one of {sorted(VALID_TARGETS)})",
+              file=sys.stderr)
+        return 2
     if max_scope not in TIER_ORDER:
         print(f"::error::invalid MAX_SCOPE '{max_scope}'", file=sys.stderr)
         return 2
@@ -237,8 +272,20 @@ def main() -> int:
 
     rt = current.get("runtime")
     if rt and rt.get("tag"):
-        plan["runtime"] = resolve_runtime(rt["tag"], target, max_scope)
-        plan["runtime"]["image_repo"] = rt.get("image_repo", "")
+        if rt.get("digest"):
+            # A digest-pinned FROM resolves by digest and ignores the tag, so
+            # bumping the tag wouldn't change the built image. Refuse rather than
+            # ship a PR that claims an upgrade the build won't actually take.
+            plan["runtime"] = {
+                "current_tag": rt["tag"], "current_airflow": None,
+                "target_tag": rt["tag"], "tier": "none", "clamped": False,
+                "image_repo": rt.get("image_repo", ""),
+                "note": "FROM line is digest-pinned (@sha256:...); not auto-bumped. "
+                "Remove the digest pin to let the action manage the Runtime tag.",
+            }
+        else:
+            plan["runtime"] = resolve_runtime(rt["tag"], target, max_scope)
+            plan["runtime"]["image_repo"] = rt.get("image_repo", "")
 
     if include_providers:
         for p in current.get("providers", []):
@@ -265,8 +312,10 @@ def main() -> int:
     plan["overall_tier"] = overall
     plan["no_update"] = overall == "none"
 
-    # Majors are advisory-only: never auto-author a major migration.
-    plan["author_changes"] = overall in ("patch", "minor")
+    runtime_tier = (plan["runtime"] or {}).get("tier", "none")
+    # Never auto-author an *Airflow* major (runtime jump). Provider majors are
+    # authored. Everything patch/minor is authored.
+    plan["author_changes"] = overall != "none" and runtime_tier != "major"
     plan["needs_migration"] = overall in ("minor", "major")
 
     held = [c for c in ([plan["runtime"]] if plan["runtime"] else []) + plan["providers"]
@@ -274,9 +323,9 @@ def main() -> int:
     plan["scope_exceeded"] = bool(held)
 
     advisory = ""
-    if overall == "major":
-        rt_af = (plan.get("runtime") or {}).get("current_airflow") or "your current version"
-        rt_t = (plan.get("runtime") or {}).get("target_airflow") or "the next major"
+    if runtime_tier == "major":
+        rt_af = plan["runtime"].get("current_airflow") or "your current version"
+        rt_t = plan["runtime"].get("target_airflow") or "the next major"
         advisory = (
             f"A major Airflow upgrade is available ({rt_af} -> {rt_t}). Major "
             "migrations are not auto-authored by this action — run the guided "

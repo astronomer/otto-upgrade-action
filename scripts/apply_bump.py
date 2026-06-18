@@ -25,10 +25,11 @@ def bump_dockerfile(project_path: str, current_tag: str, target_tag: str) -> boo
         return False
     with open(path, encoding="utf-8") as fh:
         text = fh.read()
-    # Replace the tag only on FROM lines that carry the current tag, so we never
-    # touch an unrelated `:current_tag` substring elsewhere in the file.
+    # Replace the tag only on FROM lines that carry the current tag, anchored at
+    # the end of the tag token (not `\b`, which — since `-` is a non-word char —
+    # would let a current tag of `3.2` match the `3.2` prefix of `3.2-3`).
     pattern = re.compile(
-        r"(?P<head>^\s*FROM\s+\S*runtime\s*:\s*)" + re.escape(current_tag) + r"\b",
+        r"(?P<head>^\s*FROM\s+\S*runtime\s*:\s*)" + re.escape(current_tag) + r"(?=[\s@\"']|$)",
         re.IGNORECASE | re.MULTILINE,
     )
     new_text, n = pattern.subn(lambda m: m.group("head") + target_tag, text)

@@ -26,6 +26,14 @@ def test_detect_quay_runtime_tag(tmp_path):
     assert rt["image_repo"].endswith("astro-runtime")
 
 
+def test_detect_digest_pinned(tmp_path):
+    df = "FROM astrocrpublic.azurecr.io/runtime:3.2-3@sha256:abc123def456\n"
+    p = _project(tmp_path, df, "")
+    rt = dv.detect_runtime(p)
+    assert rt["tag"] == "3.2-3"
+    assert rt["digest"] == "sha256:abc123def456"
+
+
 def test_detect_last_from_wins_multistage(tmp_path):
     df = (
         "FROM quay.io/astronomer/astro-runtime:9.0.0 AS base\n"
@@ -63,6 +71,13 @@ def test_bump_dockerfile_swaps_only_the_tag(tmp_path):
 def test_bump_dockerfile_idempotent(tmp_path):
     p = _project(tmp_path, "FROM astrocrpublic.azurecr.io/runtime:3.2-3\n", "")
     assert apply_bump.bump_dockerfile(p, "3.1-12", "3.2-3") is False  # current tag absent
+
+
+def test_bump_dockerfile_partial_tag_not_matched(tmp_path):
+    # A current tag of "3.2" must NOT match the "3.2" prefix of "3.2-3".
+    p = _project(tmp_path, "FROM astrocrpublic.azurecr.io/runtime:3.2-3\n", "")
+    assert apply_bump.bump_dockerfile(p, "3.2", "9.9") is False
+    assert (tmp_path / "Dockerfile").read_text() == "FROM astrocrpublic.azurecr.io/runtime:3.2-3\n"
 
 
 def test_bump_requirements_preserves_extras_and_comments(tmp_path):

@@ -11,11 +11,22 @@ permissions:
   contents: write          # push the upgrade branch
   pull-requests: write     # open/update the PR
 
+# One upgrade run at a time — the rolling PR branch is force-pushed each run, so
+# overlapping runs would race. Let an in-progress run finish rather than cancel.
+concurrency:
+  group: otto-airflow-upgrade
+  cancel-in-progress: false
+
 jobs:
   upgrade:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          # Don't leave the write-scoped token in .git/config — the Otto step
+          # (and the import-level verify) run repo code; the action pushes with
+          # an explicit token instead.
+          persist-credentials: false
 
       - uses: astronomer/otto-upgrade-action@v0
         with:

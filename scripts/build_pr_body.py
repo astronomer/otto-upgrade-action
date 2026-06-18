@@ -40,6 +40,16 @@ def main() -> int:
 
     out: list[str] = [MARKER, "## Airflow upgrade", ""]
 
+    # Lead with a clear banner when verification failed, so the PR can't read as
+    # "ready" — the verifier report starts with ❌ only on a genuine code error.
+    if verify.startswith("❌"):
+        out += [
+            "> [!CAUTION]",
+            "> **Verification failed at the target version** — do not merge until the "
+            "failures below are resolved. See the Verification section.",
+            "",
+        ]
+
     overall = plan.get("overall_tier", "none")
     out.append(f"**Scope:** {TIER_BADGE.get(overall, overall)}")
     if plan.get("scope_exceeded"):

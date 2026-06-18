@@ -41,10 +41,20 @@ def test_latest_minor_moves_within_major():
     assert r["tier"] == "minor"
 
 
+def test_runtime_build_patch_same_airflow():
+    # 3.0-9 and 3.0-10 are both Airflow 3.0.5 — a newer Runtime *build* on the
+    # same Airflow (CVE/provider-bundle fix). Must be a patch bump, not a no-op.
+    r = rt.resolve_runtime("3.0-9", target="patch", max_scope="patch")
+    assert r["target_tag"] == "3.0-10"
+    assert r["tier"] == "patch"
+
+
 def test_non_stable_channel_is_ignored():
-    # 3.3-rc (alpha) must never be picked even with target=latest.
+    # 3.3-rc (alpha channel) and 3.3-1 (stable channel but Airflow 3.3.0rc1, a
+    # prerelease Airflow) must never be picked even with target=latest.
     r = rt.resolve_runtime("3.2-1", target="latest", max_scope="major")
     assert r["target_tag"] == "3.2-3"
+    assert "rc" not in (r["target_airflow"] or "")
 
 
 def test_unknown_current_tag_is_skipped_not_crashed():
@@ -138,3 +148,30 @@ def test_no_update_when_current_is_latest(tmp_path, monkeypatch):
     )
     assert plan["no_update"] is True
     assert plan["author_changes"] is False
+
+
+def test_provider_only_major_is_authored(tmp_path, monkeypatch):
+    # Runtime already at latest (no Airflow move), but a provider major is
+    # available with max-scope=major. Provider majors ARE authored — only
+    # *Airflow* majors are advisory-only.
+    plan = _run_plan(
+        tmp_path, monkeypatch,
+        {"runtime": {"tag": "3.2-3", "image_repo": "x/runtime"},
+         "providers": [{"package": "apache-airflow-providers-amazon", "pinned_version": "9.0.0"}]},
+        TARGET="latest", MAX_SCOPE="major",
+    )
+    assert plan["overall_tier"] == "major"
+    assert plan["author_changes"] is True
+    assert plan["advisory"] == ""
+
+
+def test_digest_pinned_runtime_is_refused(tmp_path, monkeypatch):
+    plan = _run_plan(
+        tmp_path, monkeypatch,
+        {"runtime": {"tag": "3.1-5", "image_repo": "x/runtime", "digest": "sha256:deadbeef"},
+         "providers": []},
+        TARGET="latest", MAX_SCOPE="major", INCLUDE_PROVIDERS="false",
+    )
+    assert plan["runtime"]["tier"] == "none"
+    assert "digest-pinned" in plan["runtime"]["note"]
+    assert plan["no_update"] is True

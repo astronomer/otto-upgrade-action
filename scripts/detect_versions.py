@@ -22,15 +22,18 @@ import re
 import sys
 
 # A FROM line whose image path ends in astro-runtime or runtime, capturing the
-# repo (without tag) and the tag. Tolerates a digest-less `:tag`, an optional
-# `AS stage` trailer, and registry prefixes.
+# repo (without tag), the tag, and an optional `@sha256:` digest. Tolerates an
+# `AS stage` trailer and registry prefixes.
 _FROM = re.compile(
-    r"^\s*FROM\s+(?P<repo>\S*?(?:astro-runtime|/runtime|^runtime))\s*:\s*(?P<tag>[\w.\-]+)",
+    r"^\s*FROM\s+(?P<repo>\S*?(?:astro-runtime|/runtime|^runtime))\s*:\s*"
+    r"(?P<tag>[\w.\-]+)(?:@(?P<digest>sha256:[a-fA-F0-9]+))?",
     re.IGNORECASE,
 )
 # Looser fallback: any FROM that mentions runtime and has a :tag.
 _FROM_LOOSE = re.compile(
-    r"^\s*FROM\s+(?P<repo>\S*runtime)\s*:\s*(?P<tag>[\w.\-]+)", re.IGNORECASE
+    r"^\s*FROM\s+(?P<repo>\S*runtime)\s*:\s*"
+    r"(?P<tag>[\w.\-]+)(?:@(?P<digest>sha256:[a-fA-F0-9]+))?",
+    re.IGNORECASE,
 )
 
 # apache-airflow-providers-foo[==1.2.3] with optional extras and env markers.
@@ -53,6 +56,7 @@ def detect_runtime(project_path: str) -> dict | None:
                 found = {  # last FROM wins (multi-stage: the final runtime stage)
                     "image_repo": m.group("repo"),
                     "tag": m.group("tag"),
+                    "digest": m.groupdict().get("digest"),
                     "dockerfile": "Dockerfile",
                 }
     return found

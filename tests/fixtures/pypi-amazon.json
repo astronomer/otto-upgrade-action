@@ -6,6 +6,7 @@
     "9.1.0":   [{ "yanked": false }],
     "9.30.0":  [{ "yanked": false }],
     "9.31.0":  [{ "yanked": true }],
+    "9.32.0":  [],
     "10.0.0":  [{ "yanked": false }],
     "10.1.0rc1": [{ "yanked": false }]
   }

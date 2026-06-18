@@ -85,8 +85,8 @@ outputs:
     description: "'true' when nothing is behind and the action no-ops."
     value: ${{ steps.resolve.outputs.no-update }}
   verify-status:
-    description: "Verification result: passed, failed, or skipped."
-    value: ${{ steps.verify.outputs.status }}
+    description: "Verification result: passed, failed, or skipped (skipped when verification didn't run)."
+    value: ${{ steps.verify.outputs.status || 'skipped' }}
   pr-number:
     description: "Number of the opened/updated PR (empty in dry-run or no-op)."
     value: ${{ steps.open-pr.outputs.pr-number }}
@@ -267,7 +267,6 @@ runs:
         GH_TOKEN: ${{ inputs.github-token }}
         PROJECT_PATH: ${{ inputs.project-path }}
         PLAN_FILE: /tmp/otto-upgrade/plan.json
-        APPLY_FILE: /tmp/otto-upgrade/apply.json
         OTTO_FILE: /tmp/otto-upgrade/result.json
         VERIFY_FILE: /tmp/otto-upgrade/verify-report.md
         ACTION_PATH: ${{ github.action_path }}
@@ -289,3 +288,13 @@ runs:
         if [[ -n "${GITHUB_STEP_SUMMARY:-}" ]]; then
           { echo "# Airflow major upgrade available"; echo; echo "> $advisory"; } >> "$GITHUB_STEP_SUMMARY"
         fi
+
+    - name: Fail run on verification failure
+      # Runs last, AFTER the PR is opened, so a failed verification still ships a
+      # PR (with the failure flagged in its body) but the scheduled run goes red
+      # so the maintainer notices. Merge-gating is the consumer repo's CI job.
+      if: steps.verify.outputs.status == 'failed'
+      shell: bash
+      run: |
+        echo "::error::Verification failed at the target version. A PR was opened with the failure flagged; do not merge until it's resolved."
+        exit 1
