@@ -11,5 +11,9 @@
     "3.2-3":   { "metadata": { "airflowVersion": "3.2.2",  "channel": "stable", "releaseDate": "2026-06-01" } },
     "3.3-1":   { "metadata": { "airflowVersion": "3.3.0rc1", "channel": "stable", "releaseDate": "2026-06-15" } },
     "3.3-rc":  { "metadata": { "airflowVersion": "3.3.0",  "channel": "alpha",  "releaseDate": "2026-06-10" } }
+  },
+  "runtimeVersions": {
+    "2.9-5":  { "metadata": { "airflowVersion": "2.9.3", "channel": "deprecated", "releaseDate": "2024-06-01", "endOfSupport": "2025-12-01" } },
+    "2.8-3":  { "metadata": { "airflowVersion": "2.8.1", "channel": "deprecated", "releaseDate": "2024-01-01" } }
   }
 }

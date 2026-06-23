@@ -194,12 +194,17 @@ unattended. (Provider majors *are* authored — only Airflow majors are advisory
 
 ### 5. Clamped — a bigger jump held back by `max-upgrade-scope`
 
-You set `target: latest` but `max-upgrade-scope: minor`, and the newest Runtime
-is a major jump.
+You set `target: latest` but `max-upgrade-scope: minor`.
 
-The action clamps to the newest in-scope (minor) target and opens that PR, with
-a note: "A larger upgrade was available but held back by `max-upgrade-scope`.
-Raise the input to go further."
+The action clamps to the newest in-scope target, opens that PR, and notes what it
+held back — tailored to *what* was held:
+
+- A **provider** major (or a minor held by a `patch` cap): "A larger upgrade was
+  available but held back by `max-upgrade-scope`. Raise the input to go further."
+  — raising the cap authors it.
+- The **Airflow** major (2→3): raising the cap won't help (a scheduled run never
+  auto-authors an Airflow major), so the note points to the guided upgrade
+  instead — see scenario 4.
 
 ### 6. Nothing to do
 

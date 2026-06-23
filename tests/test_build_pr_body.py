@@ -110,3 +110,28 @@ def test_body_shows_major_advisory(tmp_path, monkeypatch):
             "runtime": None, "providers": []}
     out = _render(tmp_path, monkeypatch, plan, {"files": []})
     assert "major Airflow upgrade is available" in out
+
+
+def test_scope_exceeded_suggests_raising_cap_for_non_major(tmp_path, monkeypatch):
+    # A genuine patch/minor clamp (no Airflow major withheld) keeps the
+    # actionable "raise the cap" hint.
+    plan = {"overall_tier": "minor", "needs_migration": True, "scope_exceeded": True,
+            "held_airflow_major": False, "advisory": "",
+            "runtime": {"current_tag": "3.1-5", "target_tag": "3.1-7", "tier": "patch",
+                        "current_airflow": "3.1.0", "target_airflow": "3.1.2"}, "providers": []}
+    out = _render(tmp_path, monkeypatch, plan, {"files": []})
+    assert "Raise the input to go further" in out
+
+
+def test_scope_exceeded_points_to_guided_upgrade_for_held_major(tmp_path, monkeypatch):
+    # When the withheld jump is an Airflow major, don't tell the user to raise
+    # the cap (it wouldn't help) — point at the guided upgrade instead.
+    plan = {"overall_tier": "minor", "needs_migration": True, "scope_exceeded": True,
+            "held_airflow_major": True,
+            "advisory": "A major Airflow upgrade is available (2.10.5 -> 3.2.2).",
+            "runtime": {"current_tag": "2.10-12", "target_tag": "2.11-1", "tier": "minor",
+                        "current_airflow": "2.10.5", "target_airflow": "2.11.0"}, "providers": []}
+    out = _render(tmp_path, monkeypatch, plan, {"files": []})
+    assert "Raise the input to go further" not in out
+    assert "never auto-authored" in out
+    assert "major Airflow upgrade is available" in out  # Heads up section still present
