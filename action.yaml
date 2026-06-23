@@ -224,11 +224,11 @@ runs:
         echo "::endgroup::"
 
     - name: Set up uv
-      # uv backs two later steps: Otto's airflow-upgrade skill shells out to it
-      # for its mechanical patcher, and verify-level=import builds an ephemeral
-      # target env with it. Install it BEFORE Otto runs (the patcher needs it on
-      # PATH — otherwise it silently no-ops) whenever Otto OR an import-level
-      # verify will run. The verify step reuses this same uv.
+      # uv backs two later steps: Otto's airflow-upgrade skill runs its mechanical
+      # patcher via uv (observed: the skill reports the patcher "could not run"
+      # when uv is absent), and verify-level=import builds an ephemeral target env
+      # with it. Install it BEFORE Otto runs (so the patcher has it on PATH)
+      # whenever Otto OR an import-level verify will run. The verify step reuses it.
       if: >-
         steps.resolve.outputs.author-changes == 'true' &&
         steps.resolve.outputs.no-update != 'true' &&

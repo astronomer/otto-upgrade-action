@@ -192,6 +192,69 @@ def test_provider_airflow_compat_clamp(monkeypatch):
     assert unknown["target"] == "1.36.0"
 
 
+def test_provider_compat_respects_upper_bound(monkeypatch):
+    # The newest release CAPS Airflow below where we're landing (`<2.11`); the
+    # compat check must reject it on the upper bound, not just the floor.
+    pkg = "apache-airflow-providers-foo"
+    listing = {"releases": {v: [{"yanked": False}] for v in ("1.0.0", "1.1.0", "1.2.0")}}
+    specs = {"1.0.0": ["apache-airflow>=2.8.0"], "1.1.0": ["apache-airflow>=2.8.0"],
+             "1.2.0": ["apache-airflow>=2.8.0,<2.11.0"]}
+
+    def fake(url: str):
+        if url.endswith(f"{pkg}/json"):
+            return listing
+        for v, s in specs.items():
+            if url.endswith(f"{pkg}/{v}/json"):
+                return {"info": {"requires_dist": s}}
+        raise AssertionError(f"unexpected URL {url}")
+
+    monkeypatch.setattr(rt, "_http_json", fake)
+    p = rt._provider_latest(pkg, "1.0.0", "minor", target_airflow="2.11.2")
+    assert p["target"] == "1.1.0"          # 1.2.0 caps at <2.11 -> rejected
+    assert "2.11.2" in p["note"]
+
+
+def test_provider_compat_lookup_failure_fails_closed(monkeypatch):
+    # A metadata lookup failure on a candidate must NOT be read as "no
+    # constraint -> compatible"; the candidate is skipped (fail closed).
+    pkg = "apache-airflow-providers-bar"
+    listing = {"releases": {v: [{"yanked": False}] for v in ("1.0.0", "1.1.0")}}
+
+    def fake(url: str):
+        if url.endswith(f"{pkg}/json"):
+            return listing
+        if url.endswith(f"{pkg}/1.1.0/json"):
+            raise OSError("metadata blip")
+        if url.endswith(f"{pkg}/1.0.0/json"):
+            return {"info": {"requires_dist": ["apache-airflow>=2.8.0"]}}
+        raise AssertionError(f"unexpected URL {url}")
+
+    monkeypatch.setattr(rt, "_http_json", fake)
+    p = rt._provider_latest(pkg, "1.0.0", "minor", target_airflow="2.11.2")
+    assert p["target"] == "1.0.0"          # 1.1.0 unknown -> not bumped
+    assert p["tier"] == "none"
+
+
+def test_provider_compat_walk_is_bounded(monkeypatch):
+    # A long release history must not fan out into one PyPI call per release —
+    # the walk is capped at _COMPAT_WALK_LIMIT.
+    pkg = "apache-airflow-providers-many"
+    vers = [f"1.{i}.0" for i in range(20)]
+    listing = {"releases": {v: [{"yanked": False}] for v in vers}}
+    calls = {"n": 0}
+
+    def fake(url: str):
+        if url.endswith(f"{pkg}/json"):
+            return listing
+        calls["n"] += 1
+        return {"info": {"requires_dist": ["apache-airflow>=2.11.0"]}}  # none fit 2.9
+
+    monkeypatch.setattr(rt, "_http_json", fake)
+    p = rt._provider_latest(pkg, "1.0.0", "minor", target_airflow="2.9.0")
+    assert calls["n"] <= rt._COMPAT_WALK_LIMIT     # bounded, not 19
+    assert p["target"] == "1.0.0"                  # nothing compatible -> held
+
+
 def test_provider_compat_clamp_no_compatible_release(monkeypatch):
     # Every candidate above current needs a newer Airflow than we're landing on
     # -> leave the pin untouched rather than ship an incompatible bump.
@@ -247,6 +310,23 @@ def test_major_plan_is_advisory_only(tmp_path, monkeypatch):
     )
     assert plan["overall_tier"] == "major"
     assert plan["author_changes"] is False  # never auto-author a major
+    assert plan["advisory"]
+
+
+def test_held_major_with_no_in_scope_target_is_not_a_silent_no_op(tmp_path, monkeypatch):
+    # target=latest, max-scope=patch on AF2 with no newer same-minor patch: the
+    # runtime resolves to tier=none (nothing authorable), but an Airflow major
+    # WAS held back. That must NOT collapse into a no-op — no_update stays false
+    # so the action still emits the guided-upgrade advisory.
+    plan = _run_plan(
+        tmp_path, monkeypatch,
+        {"runtime": {"tag": "2.10-12", "image_repo": "x/runtime"}, "providers": []},
+        TARGET="latest", MAX_SCOPE="patch", INCLUDE_PROVIDERS="false",
+    )
+    assert plan["runtime"]["tier"] == "none"     # nothing in-scope to author
+    assert plan["author_changes"] is False
+    assert plan["held_airflow_major"] is True
+    assert plan["no_update"] is False            # not a silent no-op
     assert plan["advisory"]
 
 

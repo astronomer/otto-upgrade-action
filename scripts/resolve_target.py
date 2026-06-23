@@ -257,31 +257,80 @@ def resolve_runtime(current_tag: str, target: str, max_scope: str) -> dict[str, 
 # --------------------------------------------------------------------------- #
 # Providers
 # --------------------------------------------------------------------------- #
-def _min_airflow_for(package: str, version: str) -> tuple[int, ...] | None:
-    """Lowest Airflow a provider release supports, as a version tuple.
+# Cap on per-provider compatibility lookups. The compat walk does one PyPI
+# metadata call per candidate version it has to rule out; without a cap a
+# provider with a long release history could fan a single resolve step into
+# dozens of serial HTTP calls. Six covers the realistic "newest few are too new"
+# case; if nothing within the newest few fits the landing Airflow, we hold the
+# pin rather than walk (and bump to) a much older release.
+_COMPAT_WALK_LIMIT = 6
 
-    Reads the provider's per-version PyPI metadata and parses the lower bound of
-    the *core* ``apache-airflow`` requirement from ``requires_dist`` (e.g.
-    ``apache-airflow>=2.11.0``). Returns None when the floor can't be determined
-    (no constraint, lookup failure) — callers treat None as 'no constraint' and
-    don't clamp on it.
+
+def _airflow_satisfies(spec: str, af: tuple[int, ...]) -> bool:
+    """Whether Airflow tuple ``af`` satisfies a PEP 440 specifier string (which
+    may be comma-separated), for the operators apache-airflow pins use:
+    ``>= > <= < == != ~=``. Clauses we can't parse are treated as satisfied, so
+    we never wrongly *block* a bump on a spec we don't understand.
+    """
+    a = (af + (0, 0, 0))[:3]
+    for clause in spec.split(","):
+        m = re.match(r"\s*(>=|<=|==|!=|~=|>|<)\s*([0-9][0-9.]*)", clause)
+        if not m:
+            continue
+        op, raw = m.group(1), m.group(2)
+        v = (version_tuple(raw) + (0, 0, 0))[:3]
+        if (op == ">=" and a < v) or (op == ">" and a <= v) \
+           or (op == "<=" and a > v) or (op == "<" and a >= v) \
+           or (op == "==" and a != v) or (op == "!=" and a == v):
+            return False
+        if op == "~=":  # compatible release: >= v AND < next-up of v's prefix
+            if a < v:
+                return False
+            vt = version_tuple(raw)
+            if len(vt) >= 2:
+                hi = list(vt[:-1])
+                hi[-1] += 1
+                if a >= (tuple(hi) + (0, 0, 0))[:3]:
+                    return False
+    return True
+
+
+def _airflow_specifiers(package: str, version: str) -> list[str] | None:
+    """Unconditional core ``apache-airflow`` version specifiers for a provider
+    release, parsed from its per-version PyPI ``requires_dist``.
+
+    Returns None on a metadata *lookup failure* (caller treats the release as
+    ineligible — fail closed, so a transient PyPI blip can't wave through an
+    incompatible pin). Returns ``[]`` when the release declares no Airflow
+    constraint (compatible with anything). Extras-gated deps (``; extra == ...``)
+    are skipped — they're optional, not an unconditional core requirement.
     """
     try:
         data = _http_json(f"{PYPI_BASE_URL}/{package}/{version}/json")
-    except Exception:  # noqa: BLE001 — network/404; unknown floor, don't clamp
+    except Exception:  # noqa: BLE001 — network/404; caller fails closed on None
         return None
-    floors: list[tuple[int, ...]] = []
+    specs: list[str] = []
     for req in data.get("info", {}).get("requires_dist") or []:
-        # Match the CORE apache-airflow dep only (optionally with extras),
-        # never a provider package. The operator must follow immediately, so
-        # "apache-airflow-providers-foo>=1" (next char '-') can't match.
-        m = re.match(r"^apache-airflow(?:\[[^\]]*\])?\s*([<>=!~].*)$", req.strip())
-        if not m:
+        base, _, marker = req.strip().partition(";")
+        if "extra" in marker:
             continue
-        lb = re.search(r"(?:>=|==|~=)\s*([0-9][0-9.]*)", m.group(1))
-        if lb:
-            floors.append(version_tuple(lb.group(1)))
-    return max(floors) if floors else None
+        # CORE apache-airflow only (optionally with extras), never a provider:
+        # the operator must follow immediately, so "apache-airflow-providers-foo"
+        # (next char '-') and bare "apache-airflow" (no operator) don't match.
+        m = re.match(r"^apache-airflow(?:\[[^\]]*\])?\s*([<>=!~].*)$", base.strip(), re.IGNORECASE)
+        if m:
+            specs.append(m.group(1).strip())
+    return specs
+
+
+def _provider_compatible(package: str, version: str, af: tuple[int, ...]) -> bool | None:
+    """True/False if the release is/ isn't Airflow-compatible; None if unknown
+    (metadata lookup failed). Checks the *full* specifier (lower and upper
+    bounds), not just a minimum."""
+    specs = _airflow_specifiers(package, version)
+    if specs is None:
+        return None
+    return all(_airflow_satisfies(s, af) for s in specs)
 
 
 def _provider_latest(package: str, cur: str, max_scope: str,
@@ -329,11 +378,11 @@ def _provider_latest(package: str, cur: str, max_scope: str,
         target, tier, clamped = cur, "none", False
 
     note = ""
-    # Airflow-compatibility clamp. A newer provider can raise its minimum Airflow
-    # above what this project runs (e.g. common-sql 1.36 requires Airflow 2.11 on
-    # a 2.10 project). When we know the Airflow we're landing on, walk down the
-    # in-scope candidates to the newest release whose floor fits. Skipped when
-    # target_airflow is unknown (digest-pinned / unresolved runtime).
+    # Airflow-compatibility clamp. A newer provider can require a different
+    # Airflow than this project runs (e.g. common-sql 1.36 requires Airflow 2.11
+    # on a 2.10 project). When we know the Airflow we're landing on, walk down the
+    # in-scope candidates to the newest release whose full specifier is satisfied.
+    # Skipped when target_airflow is unknown (digest-pinned / unresolved runtime).
     if target_airflow and version_tuple(target) > cm:
         af_t = (version_tuple(target_airflow) + (0, 0, 0))[:3]
         if max_scope == "patch":
@@ -342,25 +391,26 @@ def _provider_latest(package: str, cur: str, max_scope: str,
             pool = [v for v in stable if version_tuple(v)[0] == cur_major]
         else:
             pool = list(stable)
-        # In-scope, above current, at or below the already-chosen target, newest first.
+        # In-scope, above current, at or below the already-chosen target, newest
+        # first, capped so a long release history can't fan out unbounded lookups.
         candidates = sorted(
-            (v for v in pool
-             if cm < version_tuple(v) <= version_tuple(target)),
+            (v for v in pool if cm < version_tuple(v) <= version_tuple(target)),
             key=version_tuple, reverse=True,
-        )
-        chosen = None
-        for cand in candidates:
-            floor = _min_airflow_for(package, cand)
-            if floor is None or (floor + (0, 0, 0))[:3] <= af_t:
-                chosen = cand
-                break
+        )[:_COMPAT_WALK_LIMIT]
+        # Pick the newest release we can *confirm* compatible. A release whose
+        # metadata we couldn't fetch (None) is skipped, not assumed compatible.
+        chosen = next((v for v in candidates if _provider_compatible(package, v, af_t) is True), None)
         if chosen is None:
-            note = (f"no release compatible with Airflow {target_airflow} within scope; "
-                    f"left at {cur} (the newer pins require a newer Airflow)")
-            target, tier, clamped = cur, "none", clamped
+            # Nothing confirmed compatible within the lookup budget. Hold the pin
+            # rather than risk an incompatible bump. This is a *compatibility*
+            # hold, not a scope clamp — clear `clamped` so it doesn't read as
+            # "raise max-upgrade-scope to go further" (raising it wouldn't help).
+            note = (f"left at {cur}: no in-scope release confirmed compatible with "
+                    f"Airflow {target_airflow} (checked the newest {_COMPAT_WALK_LIMIT})")
+            target, tier, clamped = cur, "none", False
         elif chosen != target:
-            note = (f"held at {chosen} — the newest release compatible with Airflow "
-                    f"{target_airflow}; later versions require a newer Airflow")
+            note = (f"held at {chosen} — newest release compatible with Airflow "
+                    f"{target_airflow}; later versions require a different Airflow")
             target = chosen
             tier = tier_between(cur, target)
             clamped = True
@@ -434,11 +484,17 @@ def main() -> int:
         if TIER_ORDER.get(t, -1) > TIER_ORDER[overall]:
             overall = t
     plan["overall_tier"] = overall
-    plan["no_update"] = overall == "none"
 
     runtime = plan["runtime"] or {}
     runtime_tier = runtime.get("tier", "none")
     held_airflow_major = bool(runtime.get("held_major"))
+    # A held Airflow major is advisory-only, never authored — but it is NOT
+    # "nothing to do": the action must still surface the guided-upgrade advisory.
+    # Excluding it here keeps the run from collapsing into a silent no-op (the
+    # advisory step is gated on no-update != true). When the clamp held a major
+    # but nothing in-scope was authorable, overall is "none" yet no_update stays
+    # false so the advisory is shown.
+    plan["no_update"] = overall == "none" and not held_airflow_major
     # Never auto-author an *Airflow* major (runtime jump). Provider majors are
     # authored. Everything patch/minor is authored.
     plan["author_changes"] = overall != "none" and runtime_tier != "major"
