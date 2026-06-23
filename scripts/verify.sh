@@ -127,16 +127,33 @@ echo "::group::Import check (apache-airflow==${af_pin:-from-requirements})"
 # (alembic plugin setup, etc.) goes to stdout/stderr and stays in the CI log
 # only — it must not leak into the PR body.
 import_report="$WORKDIR/import-report.md"
-rm -f "$import_report"
-set +e
+
 # Strip secrets from the subprocess: it imports repository DAG code, which we
 # treat as untrusted. It must not be able to read the Astro token or any GitHub
 # token from its environment.
-out=$(IMPORT_REPORT="$import_report" \
-  env -u ASTRO_TOKEN -u ASTRO_API_TOKEN -u GH_TOKEN -u GITHUB_TOKEN \
-  timeout 600 uv run --no-project "${with_args[@]}" -- \
-  python3 "$ACTION_PATH/scripts/import_check.py" "${roots[@]}" 2>"$WORKDIR/import-setup.err")
+run_import() {
+  IMPORT_REPORT="$import_report" \
+    env -u ASTRO_TOKEN -u ASTRO_API_TOKEN -u GH_TOKEN -u GITHUB_TOKEN \
+    timeout 600 uv run --no-project "$@" "${with_args[@]}" -- \
+    python3 "$ACTION_PATH/scripts/import_check.py" "${roots[@]}"
+}
+
+# Attempt 1 — wheels only (--no-build). Avoids compiling source distributions
+# that need system build deps the runner lacks (e.g. apache-hdfs -> hdfs[kerberos]
+# -> gssapi -> krb5-config), which would otherwise fail env setup and force a
+# needless 'skipped'. rc 0 = imported clean, rc 3 = genuine DAG import error —
+# both are real verdicts. Anything else is an env-build failure (e.g. a dep with
+# no wheel under --no-build); fall through and retry allowing source builds.
+rm -f "$import_report"
+set +e
+out=$(run_import --no-build 2>"$WORKDIR/import-setup.err")
 rc=$?
+if [[ "$rc" -ne 0 && "$rc" -ne 3 ]]; then
+  echo "wheels-only env build failed (exit $rc); retrying with source builds allowed."
+  rm -f "$import_report"
+  out=$(run_import 2>"$WORKDIR/import-setup.err")
+  rc=$?
+fi
 set -e
 echo "$out"
 echo "::endgroup::"

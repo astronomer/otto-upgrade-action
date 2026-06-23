@@ -223,6 +223,18 @@ runs:
         echo "Astro CLI ${CLI_VERSION} bundles Otto with headless structured output."
         echo "::endgroup::"
 
+    - name: Set up uv
+      # uv backs two later steps: Otto's airflow-upgrade skill shells out to it
+      # for its mechanical patcher, and verify-level=import builds an ephemeral
+      # target env with it. Install it BEFORE Otto runs (the patcher needs it on
+      # PATH — otherwise it silently no-ops) whenever Otto OR an import-level
+      # verify will run. The verify step reuses this same uv.
+      if: >-
+        steps.resolve.outputs.author-changes == 'true' &&
+        steps.resolve.outputs.no-update != 'true' &&
+        (steps.auth.outputs.enabled == 'true' || inputs.verify-level == 'import')
+      uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39  # v8.2.0
+
     - name: Build Otto prompt
       if: steps.auth.outputs.enabled == 'true'
       shell: bash
@@ -247,16 +259,6 @@ runs:
         WORKDIR: /tmp/otto-upgrade
         INPUT_MODEL: ${{ inputs.model }}
       run: bash "$GITHUB_ACTION_PATH/scripts/run-otto.sh"
-
-    - name: Set up uv (for import-level verification)
-      # verify-level=import builds an ephemeral env at the target version via uv.
-      # Provision it here so the check actually runs instead of silently
-      # reporting 'skipped' when the runner has no uv (the common case).
-      if: >-
-        steps.resolve.outputs.author-changes == 'true' &&
-        steps.resolve.outputs.no-update != 'true' &&
-        inputs.verify-level == 'import'
-      uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39  # v8.2.0
 
     - name: Verify upgrade
       id: verify

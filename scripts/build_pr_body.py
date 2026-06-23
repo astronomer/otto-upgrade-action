@@ -53,10 +53,20 @@ def main() -> int:
     overall = plan.get("overall_tier", "none")
     out.append(f"**Scope:** {TIER_BADGE.get(overall, overall)}")
     if plan.get("scope_exceeded"):
-        out.append(
-            "\n> A larger upgrade was available but held back by `max-upgrade-scope`. "
-            "Raise the input to go further."
-        )
+        if plan.get("held_airflow_major"):
+            # The withheld jump is an Airflow major — never auto-authored by a
+            # scheduled run, even at max-upgrade-scope: major. Don't tell the user
+            # to raise the cap; the Heads up section points them to the guided
+            # upgrade instead.
+            out.append(
+                "\n> A newer **Airflow major** is available but is never auto-authored "
+                "by a scheduled run — see **Heads up** below for the guided upgrade."
+            )
+        else:
+            out.append(
+                "\n> A larger upgrade was available but held back by `max-upgrade-scope`. "
+                "Raise the input to go further."
+            )
     out.append("")
 
     # Version table.
