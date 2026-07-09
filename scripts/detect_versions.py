@@ -36,12 +36,20 @@ _FROM_LOOSE = re.compile(
     re.IGNORECASE,
 )
 
-# apache-airflow-providers-foo[==1.2.3] with optional extras and env markers.
-_PROVIDER = re.compile(
-    r"^\s*(?P<pkg>apache-airflow-providers-[a-z0-9\-]+)"
+# Requirement name token (PEP 508 name grammar), with optional extras and an
+# optional exact pin. The provider check happens on the PEP 503-normalized
+# form, so `common.sql`, `common_sql`, and `Common-SQL` — which pip all treat
+# as the same package — resolve to the provider they actually install.
+_REQ_NAME = re.compile(
+    r"^\s*(?P<name>[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?)"
     r"(?:\[[^\]]*\])?"
     r"\s*(?:==\s*(?P<ver>[\w.\-]+))?"
 )
+
+
+def normalize_name(name: str) -> str:
+    """PEP 503 normalization: runs of ``-``/``_``/``.`` collapse to ``-``, lowercased."""
+    return re.sub(r"[-_.]+", "-", name).lower()
 
 
 def detect_runtime(project_path: str) -> dict | None:
@@ -65,6 +73,7 @@ def detect_runtime(project_path: str) -> dict | None:
 def detect_providers(project_path: str) -> list[dict]:
     req = os.path.join(project_path, "requirements.txt")
     out: list[dict] = []
+    by_pkg: dict[str, dict] = {}
     if not os.path.isfile(req):
         return out
     with open(req, encoding="utf-8") as fh:
@@ -72,16 +81,31 @@ def detect_providers(project_path: str) -> list[dict]:
             line = raw.split("#", 1)[0].strip()
             if not line:
                 continue
-            m = _PROVIDER.match(line)
+            m = _REQ_NAME.match(line)
             if not m:
                 continue
-            out.append(
-                {
-                    "package": m.group("pkg"),
-                    "pinned_version": m.group("ver"),  # None when unpinned
-                    "spec_file": "requirements.txt",
-                }
-            )
+            pkg = normalize_name(m.group("name"))
+            if not pkg.startswith("apache-airflow-providers-"):
+                continue
+            entry = {
+                "package": pkg,
+                "spec_name": m.group("name"),  # exact spelling in the file
+                "pinned_version": m.group("ver"),  # None when unpinned
+                "spec_file": "requirements.txt",
+            }
+            prev = by_pkg.get(pkg)
+            if prev is None:
+                by_pkg[pkg] = entry
+                out.append(entry)
+            elif prev["pinned_version"] != entry["pinned_version"]:
+                # Two spellings of the same package with different pins. pip
+                # resolves this by accident (last wins); never pick a side —
+                # drop the pin so the resolver skips it and the PR surfaces it.
+                prev["pinned_version"] = None
+                prev["note"] = (
+                    "duplicate entries with conflicting pins "
+                    f"(`{prev['spec_name']}`, `{entry['spec_name']}`); skipped"
+                )
     return out
 
 

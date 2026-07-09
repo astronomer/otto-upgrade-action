@@ -464,15 +464,20 @@ def main() -> int:
     if include_providers:
         for p in current.get("providers", []):
             if not p.get("pinned_version"):
-                plan["providers"].append(
-                    {"package": p["package"], "current": None, "target": None,
-                     "tier": "none", "clamped": False,
-                     "note": "unpinned; skipped (can only bump exact pins safely)"}
-                )
-                continue
-            plan["providers"].append(
-                _provider_latest(p["package"], p["pinned_version"], max_scope, af_for_providers)
-            )
+                # Detection may already carry a reason (e.g. duplicate entries
+                # with conflicting pins); default to the plain unpinned note.
+                entry = {"package": p["package"], "current": None, "target": None,
+                         "tier": "none", "clamped": False,
+                         "note": p.get("note")
+                         or "unpinned; skipped (can only bump exact pins safely)"}
+            else:
+                entry = _provider_latest(p["package"], p["pinned_version"], max_scope,
+                                         af_for_providers)
+            if p.get("spec_name"):
+                # Original requirements.txt spelling — the PR body shows it when
+                # it differs from the normalized package name.
+                entry["spec_name"] = p["spec_name"]
+            plan["providers"].append(entry)
 
     # Roll up.
     tiers = []

@@ -40,6 +40,14 @@ def bump_dockerfile(project_path: str, current_tag: str, target_tag: str) -> boo
     return True
 
 
+def _pkg_pattern(package: str) -> str:
+    """Regex matching any spelling of ``package`` that PEP 503-normalizes to it:
+    each ``-`` in the normalized name matches a run of ``-``/``_``/``.``, so a
+    typo'd `common.sql` line still gets its pin bumped. The trailing ``==``
+    anchor in the caller prevents prefix false-matches (`common-sqlx`)."""
+    return r"[-_.]+".join(re.escape(part) for part in package.split("-"))
+
+
 def bump_requirements(project_path: str, providers: list[dict]) -> list[dict]:
     path = os.path.join(project_path, "requirements.txt")
     changed: list[dict] = []
@@ -52,19 +60,24 @@ def bump_requirements(project_path: str, providers: list[dict]) -> list[dict]:
     }
     if not targets:
         return changed
+    patterns = {
+        pkg: re.compile(
+            rf"^(?P<pre>\s*{_pkg_pattern(pkg)}(?:\[[^\]]*\])?\s*==\s*)"
+            r"(?P<ver>[\w.\-]+)(?P<post>.*)$",
+            re.IGNORECASE,
+        )
+        for pkg in targets
+    }
     with open(path, encoding="utf-8") as fh:
         lines = fh.readlines()
     for i, raw in enumerate(lines):
         code = raw.split("#", 1)[0]
         for pkg, target in targets.items():
-            # Match `pkg[extras]==x.y.z` and swap only the version, preserving
-            # extras, markers, trailing comment, and newline.
-            m = re.match(
-                rf"^(?P<pre>\s*{re.escape(pkg)}(?:\[[^\]]*\])?\s*==\s*)"
-                r"(?P<ver>[\w.\-]+)(?P<post>.*)$",
-                code,
-            )
-            if not m:
+            # Match `pkg[extras]==x.y.z` (any PEP 503-equivalent spelling) and
+            # swap only the version, preserving the user's spelling, extras,
+            # markers, trailing comment, and newline.
+            m = patterns[pkg].match(code)
+            if not m or m.group("ver") == target:
                 continue
             comment = raw[len(code):]
             lines[i] = f"{m.group('pre')}{target}{m.group('post')}{comment}"
