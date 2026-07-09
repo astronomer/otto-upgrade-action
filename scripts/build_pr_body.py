@@ -37,16 +37,37 @@ def main() -> int:
     otto = _load("OTTO_FILE")
     verify_path = os.environ.get("VERIFY_FILE")
     verify = open(verify_path).read().strip() if verify_path and os.path.isfile(verify_path) else ""
+    # The authoritative outcome comes from verify.sh's status file — several
+    # skipped-path reports don't start with ℹ️, so sniffing the report emoji
+    # misses them. The sniff remains only as a fallback for callers that don't
+    # wire the status file.
+    status_path = os.environ.get("VERIFY_STATUS_FILE")
+    verify_status = (
+        open(status_path).read().strip()
+        if status_path and os.path.isfile(status_path) else ""
+    )
+    if not verify_status and verify:
+        verify_status = {"✅": "passed", "❌": "failed", "ℹ": "skipped"}.get(verify.lstrip()[:1], "")
 
     out: list[str] = [MARKER, "## Airflow upgrade", ""]
 
-    # Lead with a clear banner when verification failed, so the PR can't read as
-    # "ready" — the verifier report starts with ❌ only on a genuine code error.
-    if verify.startswith("❌"):
+    # Lead with a clear banner whenever the PR is not verified-green: a failure
+    # must not read as "ready", and a SKIP must not hide in the collapsed
+    # details — un-run verification looked exactly like success in the field.
+    if verify_status == "failed":
         out += [
             "> [!CAUTION]",
-            "> **Verification failed at the target version** — do not merge until the "
-            "failures below are resolved. See the Verification section.",
+            "> **Verification failed: new import failures at the target version** — "
+            "do not merge until the failures below are resolved. See the "
+            "Verification section.",
+            "",
+        ]
+    elif verify_status == "skipped":
+        out += [
+            "> [!WARNING]",
+            "> **Verification did not run** — DAG imports at the target version were "
+            "NOT checked. See the Verification section for why; review the changes "
+            "manually, or fix the blocker and re-run.",
             "",
         ]
 
@@ -80,10 +101,12 @@ def main() -> int:
         )
     for p in plan.get("providers", []):
         if p.get("current") and p.get("target") and p["current"] != p["target"]:
+            spec = p.get("spec_name") or ""
+            spelled = f"pinned as `{spec}`" if spec and spec != p["package"] else ""
             rows.append(
                 f"| `{p['package'].replace('apache-airflow-providers-', '')}` "
                 f"| `{p['current']}` | `{p['target']}` "
-                f"| {TIER_BADGE.get(p['tier'], p['tier'])} | |"
+                f"| {TIER_BADGE.get(p['tier'], p['tier'])} | {spelled} |"
             )
     if rows:
         out += ["| Component | From | To | Tier | Notes |", "| --- | --- | --- | --- | --- |", *rows, ""]
@@ -127,11 +150,10 @@ def main() -> int:
         ]
 
     # Verification — collapsible, with the outcome in the summary line so the
-    # detail (and any Airflow import-time noise) stays tucked away. A failure is
-    # already surfaced loudly by the banner at the top of the body.
+    # detail (and any Airflow import-time noise) stays tucked away. Failure and
+    # skip are already surfaced loudly by the banners at the top of the body.
     if verify:
-        label = {"✅": "passed", "❌": "failed", "ℹ": "skipped"}.get(verify.lstrip()[:1], "")
-        summary = f"Verification — {label}" if label else "Verification"
+        summary = f"Verification — {verify_status}" if verify_status else "Verification"
         out += [
             "<details>",
             f"<summary><b>{summary}</b></summary>",

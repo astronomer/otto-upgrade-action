@@ -37,6 +37,7 @@ export PYTHONPYCACHEPREFIX="$WORKDIR/pycache"
 report="$WORKDIR/verify-report.md"
 status="skipped"
 
+worktree_top=""
 # Invoked indirectly via `trap ... EXIT` below; shellcheck can't see that, so it
 # flags the function as never-invoked (SC2329, v0.11+) and its body as
 # unreachable (SC2317, v0.9). Both are false positives for a trap handler.
@@ -44,6 +45,10 @@ status="skipped"
 emit() {
   echo "$status" > "$WORKDIR/verify-status.txt"
   if [[ -n "${GITHUB_OUTPUT:-}" ]]; then echo "status=$status" >> "$GITHUB_OUTPUT"; fi
+  if [[ -n "$worktree_top" && -d "$WORKDIR/baseline" ]]; then
+    git -C "$worktree_top" worktree remove --force "$WORKDIR/baseline" 2>/dev/null || true
+    rm -rf "$WORKDIR/baseline"
+  fi
 }
 trap emit EXIT
 
@@ -55,12 +60,15 @@ done
 if [[ ${#roots[@]} -eq 0 ]]; then
   status="skipped"
   echo "No dags/include/plugins directories under \`$PROJECT_PATH\` — nothing to verify." > "$report"
+  echo "::warning::Verification skipped: no dags/include/plugins directories under '$PROJECT_PATH'."
   exit 0
 fi
 
 if [[ "$VERIFY_LEVEL" == "none" ]]; then
   status="skipped"
   echo "Verification disabled (\`verify-level: none\`)." > "$report"
+  # A deliberate opt-out, not an unexpected gap — notice, not warning.
+  echo "::notice::Verification disabled (verify-level: none)."
   exit 0
 fi
 
@@ -97,11 +105,13 @@ if [[ -z "$af_pin" ]]; then
   # failure). Report skipped; syntax already passed.
   status="skipped"
   echo "ℹ️ Import check skipped: the runtime wasn't bumped and its Airflow version is unknown (e.g. digest-pinned), so there's no target to import against. Syntax check passed." > "$report"
+  echo "::warning::Verification skipped: no resolvable target Airflow version — imports were NOT checked."
   exit 0
 fi
 if ! command -v uv >/dev/null 2>&1; then
   status="skipped"
   echo "ℹ️ Import check skipped: \`uv\` not available to build the target env. Syntax check passed." > "$report"
+  echo "::warning::Verification skipped: uv is not available — imports were NOT checked."
   exit 0
 fi
 
@@ -119,6 +129,24 @@ fi
 if [[ ${#with_args[@]} -eq 0 ]]; then
   status="skipped"
   echo "ℹ️ Import check skipped: no requirements.txt and no resolvable Airflow pin. Syntax check passed." > "$report"
+  echo "::warning::Verification skipped: nothing to build a target env from — imports were NOT checked."
+  exit 0
+fi
+
+# Import only what Airflow itself imports: DAG files under dags/ (safe-mode
+# heuristic + .airflowignore inside import_check.py) and plugin modules under
+# plugins/. include/ is deliberately absent — Airflow never imports it directly,
+# and importing it standalone produced false failures on helper scripts.
+import_args=(--project-root "$PROJECT_PATH")
+[[ -d "$PROJECT_PATH/dags" ]] && import_args+=(--dags-root "$PROJECT_PATH/dags")
+[[ -d "$PROJECT_PATH/plugins" ]] && import_args+=(--plugins-root "$PROJECT_PATH/plugins")
+if [[ "${af_pin%%.*}" == "2" ]]; then
+  import_args+=(--ignore-syntax regexp)  # .airflowignore default syntax on AF2
+fi
+if [[ ${#import_args[@]} -le 2 ]]; then
+  status="skipped"
+  echo "ℹ️ Import check skipped: no dags/ or plugins/ under \`$PROJECT_PATH\` to import. Syntax check passed." > "$report"
+  echo "::warning::Verification skipped: no dags/ or plugins/ to import."
   exit 0
 fi
 
@@ -132,10 +160,10 @@ import_report="$WORKDIR/import-report.md"
 # treat as untrusted. It must not be able to read the Astro token or any GitHub
 # token from its environment.
 run_import() {
-  IMPORT_REPORT="$import_report" \
+  IMPORT_REPORT="$import_report" IMPORT_JSON="$WORKDIR/import-failures.json" \
     env -u ASTRO_TOKEN -u ASTRO_API_TOKEN -u GH_TOKEN -u GITHUB_TOKEN \
     timeout 600 uv run --no-project "$@" "${with_args[@]}" -- \
-    python3 "$ACTION_PATH/scripts/import_check.py" "${roots[@]}"
+    python3 "$ACTION_PATH/scripts/import_check.py" "${import_args[@]}"
 }
 
 # Attempt 1 — wheels only (--no-build). Avoids compiling source distributions
@@ -169,8 +197,78 @@ elif [[ "$rc" -eq 3 ]]; then
   # env-build failure exits 1/2 — which must NOT be read as a code defect, so
   # we key the hard fail on 3 specifically (otherwise a provider that's too new
   # for the resolver's cutoff, a registry blip, etc. would red the run).
-  status="failed"
-  clean_report > "$report"
+  #
+  # Before failing the run, re-run the SAME check at the current (pre-upgrade)
+  # state — a git worktree at HEAD with the pre-bump requirements and the
+  # current Airflow. Failures present on both sides are pre-existing project
+  # issues (field-verified: env-dependent dbt DAGs fail identically on both),
+  # not upgrade breakage; only NEW failures fail verification.
+  baseline_note=""
+  current_af=$(jq -r '.runtime.current_airflow // empty' "$PLAN_FILE")
+
+  # Called right below inside `set +e`; the EXIT trap makes shellcheck think
+  # everything after it is unreachable.
+  # shellcheck disable=SC2317
+  run_baseline() {
+    if [[ -z "$current_af" ]]; then
+      baseline_note="the current Airflow version is unknown"; return 1
+    fi
+    local toplevel prefix bproj brc
+    toplevel=$(git -C "$PROJECT_PATH" rev-parse --show-toplevel 2>/dev/null) \
+      || { baseline_note="the project is not a git checkout"; return 1; }
+    prefix=$(git -C "$PROJECT_PATH" rev-parse --show-prefix 2>/dev/null)
+    # verify runs before open-pr.sh commits, so HEAD is the pre-upgrade state.
+    git -C "$toplevel" worktree add --detach "$WORKDIR/baseline" HEAD >/dev/null 2>&1 \
+      || { baseline_note="a baseline worktree could not be created"; return 1; }
+    worktree_top="$toplevel"
+    bproj="$WORKDIR/baseline/${prefix%/}"; bproj="${bproj%/}"
+    local bargs=(--project-root "$bproj")
+    [[ -d "$bproj/dags" ]] && bargs+=(--dags-root "$bproj/dags")
+    [[ -d "$bproj/plugins" ]] && bargs+=(--plugins-root "$bproj/plugins")
+    [[ "${current_af%%.*}" == "2" ]] && bargs+=(--ignore-syntax regexp)
+    local bwith=()
+    [[ -f "$bproj/requirements.txt" ]] && bwith+=(--with-requirements "$bproj/requirements.txt")
+    bwith+=(--with "apache-airflow==$current_af")
+    run_baseline_import() {
+      IMPORT_JSON="$WORKDIR/baseline-failures.json" IMPORT_REPORT="" \
+        env -u ASTRO_TOKEN -u ASTRO_API_TOKEN -u GH_TOKEN -u GITHUB_TOKEN \
+        timeout 600 uv run --no-project "$@" "${bwith[@]}" -- \
+        python3 "$ACTION_PATH/scripts/import_check.py" "${bargs[@]}" \
+        >/dev/null 2>>"$WORKDIR/baseline-setup.err"
+    }
+    rm -f "$WORKDIR/baseline-failures.json"
+    run_baseline_import --no-build
+    brc=$?
+    if [[ "$brc" -ne 0 && "$brc" -ne 3 ]]; then
+      rm -f "$WORKDIR/baseline-failures.json"
+      run_baseline_import
+      brc=$?
+    fi
+    if [[ ("$brc" -ne 0 && "$brc" -ne 3) || ! -s "$WORKDIR/baseline-failures.json" ]]; then
+      baseline_note="the current-version env could not be built (exit $brc)"; return 1
+    fi
+    return 0
+  }
+
+  set +e
+  run_baseline
+  baseline_ok=$?
+  if [[ "$baseline_ok" -eq 0 ]]; then
+    cmp_out=$(python3 "$ACTION_PATH/scripts/compare_failures.py" \
+      "$WORKDIR/import-failures.json" "$WORKDIR/baseline-failures.json")
+    cmp_rc=$?
+    printf '%s\n' "$cmp_out" > "$report"
+    if [[ "$cmp_rc" -eq 3 ]]; then status="failed"; else status="passed"; fi
+  else
+    # No baseline to compare against — keep the strict behavior and say why.
+    status="failed"
+    {
+      clean_report
+      echo
+      echo "_Baseline comparison unavailable (${baseline_note}); all failures are shown — some may pre-date this upgrade._"
+    } > "$report"
+  fi
+  set -e
 else
   # Anything else (1/2 uv resolution, 124 timeout, …) is infra, not a code defect.
   status="skipped"
@@ -181,5 +279,6 @@ else
     tail -n 20 "$WORKDIR/import-setup.err" 2>/dev/null || true
     echo '```'
   } > "$report"
+  echo "::warning::Verification skipped: the target env could not be built (exit $rc) — imports were NOT checked."
 fi
 exit 0

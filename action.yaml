@@ -282,6 +282,7 @@ runs:
         PLAN_FILE: /tmp/otto-upgrade/plan.json
         OTTO_FILE: /tmp/otto-upgrade/result.json
         VERIFY_FILE: /tmp/otto-upgrade/verify-report.md
+        VERIFY_STATUS_FILE: /tmp/otto-upgrade/verify-status.txt
         ACTION_PATH: ${{ github.action_path }}
         WORKDIR: /tmp/otto-upgrade
         BASE_BRANCH: ${{ inputs.base-branch }}
@@ -312,5 +313,5 @@ runs:
       if: steps.verify.outputs.status == 'failed' && inputs.dry-run != 'true'
       shell: bash
       run: |
-        echo "::error::Verification failed at the target version. A PR was opened with the failure flagged; do not merge until it's resolved."
+        echo "::error::Verification found NEW failures at the target version (pre-existing issues alone never fail the run). A PR was opened with the failures flagged; do not merge until they're resolved."
         exit 1
