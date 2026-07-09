@@ -53,14 +53,50 @@ def test_mixed_reports_both_and_fails(tmp_path):
     assert "1 pre-existing import issue" in r.stdout
 
 
-def test_changed_exception_class_stays_preexisting(tmp_path):
-    # Same file failing with a different error at the target: root cause almost
-    # always predates the upgrade — annotate, don't fail.
+def test_changed_class_to_import_family_escalates_to_new(tmp_path):
+    # A file that failed for an unrelated env reason at the current version but
+    # hits a moved/removed import at the target IS upgrade breakage — the
+    # pre-existing failure must not mask it.
     r = _run(tmp_path,
-             [_fail("dags/flaky.py", "ImportError", "ImportError: cannot import name 'y'")],
+             [_fail("dags/etl.py", "ModuleNotFoundError",
+                    "ModuleNotFoundError: No module named 'airflow.providers.foo'")],
+             [_fail("dags/etl.py", "OperationalError", "OperationalError: db unreachable")])
+    assert r.returncode == 3
+    assert "1 NEW import failure" in r.stdout
+    assert "the import failure is new" in r.stdout
+
+
+def test_changed_non_import_class_stays_preexisting(tmp_path):
+    # Env-dependent flapping (a TypeError becoming a ValueError) still predates
+    # the upgrade — annotate, don't fail.
+    r = _run(tmp_path,
+             [_fail("dags/flaky.py", "ValueError", "ValueError: bad profile")],
              [_fail("dags/flaky.py", "TypeError", "TypeError: fspath None")])
     assert r.returncode == 0
     assert "error changed at the target version" in r.stdout
+
+
+def test_dunder_messages_render_as_code_spans(tmp_path):
+    # `__init__` in a raw message renders as bold on GitHub; the report must
+    # code-span messages (and neutralize inner backticks).
+    msg = "ImportError: cannot import name 'x' from 'pkg' (pkg/__init__.py) `hint`"
+    r = _run(tmp_path, [_fail("dags/a.py", "ImportError", msg)], [])
+    assert "`ImportError: cannot import name" in r.stdout
+    assert "__init__" in r.stdout
+    assert "`hint`" not in r.stdout  # inner backticks downgraded
+
+
+def test_internal_error_fails_closed(tmp_path):
+    # Malformed input must exit 3 (we're only invoked when the target run found
+    # real failures) — never crash to an exit code the caller reads as a pass.
+    t = tmp_path / "target.json"
+    b = tmp_path / "baseline.json"
+    t.write_text("{not json")
+    b.write_text("{}")
+    r = subprocess.run([sys.executable, str(SCRIPT), str(t), str(b)],
+                       capture_output=True, text=True)
+    assert r.returncode == 3
+    assert "Baseline comparison error" in r.stdout
 
 
 def test_fixed_by_upgrade_reported(tmp_path):

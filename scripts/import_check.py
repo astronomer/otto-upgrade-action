@@ -173,7 +173,9 @@ def main(argv: list[str] | None = None) -> int:
 
     if failures:
         lines = [f"❌ {len(failures)} of {count} DAG file(s) failed to import at the target version:", ""]
-        lines += [f"  - `{f['path']}`: {f['msg']}" for f in failures]
+        # Code-span the message so `__init__`/`__future__` don't render as bold
+        # on GitHub; inner backticks are downgraded so they can't break the span.
+        lines += [f"  - `{f['path']}`: `{f['msg'].replace(chr(96), chr(39))}`" for f in failures]
         rc = 3
     else:
         lines = [f"✅ All {count} DAG file(s) import cleanly at the target version."]

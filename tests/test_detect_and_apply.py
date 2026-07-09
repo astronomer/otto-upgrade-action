@@ -102,6 +102,61 @@ def test_detect_duplicate_spellings_conflicting_pins_skipped(tmp_path):
     assert "common.sql" in prov["note"] and "common-sql" in prov["note"]
 
 
+def test_detect_wildcard_pin_treated_as_unpinned(tmp_path):
+    # ==1.2.* is a valid wildcard specifier; splicing a resolved version in
+    # front of the leftover '*' would write an invalid requirement. Skip it.
+    p = _project(tmp_path, "", "apache-airflow-providers-amazon==1.2.*\n")
+    (prov,) = dv.detect_providers(p)
+    assert prov["pinned_version"] is None
+
+
+def test_detect_local_segment_pin_treated_as_unpinned(tmp_path):
+    p = _project(tmp_path, "", "apache-airflow-providers-amazon==1.2.3+local\n")
+    (prov,) = dv.detect_providers(p)
+    assert prov["pinned_version"] is None
+
+
+def test_detect_hash_pinned_line_skipped_with_note(tmp_path):
+    p = _project(tmp_path, "",
+                 "apache-airflow-providers-amazon==9.0.0 --hash=sha256:abc123\n")
+    (prov,) = dv.detect_providers(p)
+    assert prov["pinned_version"] is None
+    assert "hash-pinned" in prov["note"]
+
+
+def test_detect_bom_does_not_hide_first_line(tmp_path):
+    p = _project(tmp_path, "", "﻿apache-airflow-providers-amazon==9.0.0\n")
+    (prov,) = dv.detect_providers(p)
+    assert prov["pinned_version"] == "9.0.0"
+
+
+def test_detect_extras_with_leading_space(tmp_path):
+    # PEP 508 permits whitespace before the extras bracket.
+    p = _project(tmp_path, "", "apache-airflow-providers-amazon [s3fs]==9.0.0\n")
+    (prov,) = dv.detect_providers(p)
+    assert prov["pinned_version"] == "9.0.0"
+
+
+def test_detect_unpinned_plus_pinned_adopts_the_pin(tmp_path):
+    # pip resolves the pair deterministically to the pin — not a conflict.
+    reqs = (
+        "apache-airflow-providers-amazon\n"
+        "apache-airflow-providers-amazon==9.0.0\n"
+    )
+    p = _project(tmp_path, "", reqs)
+    (prov,) = dv.detect_providers(p)
+    assert prov["pinned_version"] == "9.0.0"
+    assert "note" not in prov
+
+
+def test_bump_requirements_wildcard_line_untouched(tmp_path):
+    reqs = "apache-airflow-providers-amazon==1.2.*\n"
+    p = _project(tmp_path, "", reqs)
+    providers = [{"package": "apache-airflow-providers-amazon", "current": "1.2.", "target": "9.0.0"}]
+    assert apply_bump.bump_requirements(p, providers) == []
+    assert (tmp_path / "requirements.txt").read_text() == reqs
+
+
 def test_detect_duplicate_spellings_same_pin_collapsed(tmp_path):
     reqs = (
         "apache-airflow-providers-common.sql==1.30.2\n"

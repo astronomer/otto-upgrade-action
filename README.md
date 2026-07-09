@@ -223,11 +223,14 @@ upgrade. A real run **requires** a token (the migration is Otto's job).
 
 ### 8. Verification fails at the target
 
-A DAG won't import at the bumped version (a provider dropped a class you use).
+A DAG won't import at the bumped version (a provider dropped a class you use),
+and the failure is **new** — it doesn't occur at your current versions.
 
 The PR **still opens** (so you see the proposed upgrade and the failure
-together), its body leads with a ⚠️ "verification failed" banner, and the
-scheduled run goes **red** so you notice. Merge-gating stays with your repo's CI.
+together), its body leads with a red "Verification failed" caution banner, and
+the scheduled run goes **red** so you notice. Merge-gating stays with your
+repo's CI. Import failures that already exist at your current versions are
+listed as pre-existing and don't fail the run.
 
 </details>
 
@@ -295,7 +298,7 @@ the safe cadence: **`patch` + `patch`**.
 The `verify-level` input controls the post-upgrade check:
 
 - `syntax` — byte-compile every DAG (fast, no network).
-- `import` (default) — additionally import every DAG inside an ephemeral env built
+- `import` (default) — additionally import the discovered DAG and plugin files inside an ephemeral env built
   from your project's (bumped) `requirements.txt` plus the target Airflow. Catches
   the failure mode upgrades actually cause: a moved/removed import or renamed call site.
 - `none` — skip.

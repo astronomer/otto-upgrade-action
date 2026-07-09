@@ -41,7 +41,7 @@ inputs:
   verify-level:
     required: false
     default: "import"
-    description: "Post-upgrade verification: 'syntax' (byte-compile DAGs), 'import' (additionally import every DAG against the target Airflow + providers), or 'none'. Verification only ever fails on a genuine code error; env/setup problems report 'skipped'."
+    description: "Post-upgrade verification: 'syntax' (byte-compile the project's Python files), 'import' (additionally import the discovered DAG + plugin files against the target Airflow + providers), or 'none'. 'import' fails only on a NEW import failure the upgrade introduces — failures that already occur at your current versions are reported but don't fail the run; env/setup problems report 'skipped'."
   base-branch:
     required: false
     default: ""

@@ -59,14 +59,14 @@ for d in dags include plugins; do
 done
 if [[ ${#roots[@]} -eq 0 ]]; then
   status="skipped"
-  echo "No dags/include/plugins directories under \`$PROJECT_PATH\` — nothing to verify." > "$report"
+  echo "ℹ️ No dags/include/plugins directories under \`$PROJECT_PATH\` — nothing to verify." > "$report"
   echo "::warning::Verification skipped: no dags/include/plugins directories under '$PROJECT_PATH'."
   exit 0
 fi
 
 if [[ "$VERIFY_LEVEL" == "none" ]]; then
   status="skipped"
-  echo "Verification disabled (\`verify-level: none\`)." > "$report"
+  echo "ℹ️ Verification disabled (\`verify-level: none\`)." > "$report"
   # A deliberate opt-out, not an unexpected gap — notice, not warning.
   echo "::notice::Verification disabled (verify-level: none)."
   exit 0
@@ -140,14 +140,17 @@ fi
 import_args=(--project-root "$PROJECT_PATH")
 [[ -d "$PROJECT_PATH/dags" ]] && import_args+=(--dags-root "$PROJECT_PATH/dags")
 [[ -d "$PROJECT_PATH/plugins" ]] && import_args+=(--plugins-root "$PROJECT_PATH/plugins")
-if [[ "${af_pin%%.*}" == "2" ]]; then
-  import_args+=(--ignore-syntax regexp)  # .airflowignore default syntax on AF2
-fi
 if [[ ${#import_args[@]} -le 2 ]]; then
   status="skipped"
   echo "ℹ️ Import check skipped: no dags/ or plugins/ under \`$PROJECT_PATH\` to import. Syntax check passed." > "$report"
   echo "::warning::Verification skipped: no dags/ or plugins/ to import."
   exit 0
+fi
+# AFTER the no-roots guard: appending this first would pad the array past the
+# length check and send a rootless AF2 project into a pointless env build that
+# reports "passed" over zero files.
+if [[ "${af_pin%%.*}" == "2" ]]; then
+  import_args+=(--ignore-syntax regexp)  # .airflowignore default syntax on AF2
 fi
 
 echo "::group::Import check (apache-airflow==${af_pin:-from-requirements})"
@@ -217,6 +220,10 @@ elif [[ "$rc" -eq 3 ]]; then
     toplevel=$(git -C "$PROJECT_PATH" rev-parse --show-toplevel 2>/dev/null) \
       || { baseline_note="the project is not a git checkout"; return 1; }
     prefix=$(git -C "$PROJECT_PATH" rev-parse --show-prefix 2>/dev/null)
+    # A stale registration from a hard-killed prior run (self-hosted WORKDIR
+    # reuse) would fail the add and needlessly degrade to strict mode.
+    git -C "$toplevel" worktree prune 2>/dev/null || true
+    rm -rf "$WORKDIR/baseline"
     # verify runs before open-pr.sh commits, so HEAD is the pre-upgrade state.
     git -C "$toplevel" worktree add --detach "$WORKDIR/baseline" HEAD >/dev/null 2>&1 \
       || { baseline_note="a baseline worktree could not be created"; return 1; }
@@ -258,7 +265,20 @@ elif [[ "$rc" -eq 3 ]]; then
       "$WORKDIR/import-failures.json" "$WORKDIR/baseline-failures.json")
     cmp_rc=$?
     printf '%s\n' "$cmp_out" > "$report"
-    if [[ "$cmp_rc" -eq 3 ]]; then status="failed"; else status="passed"; fi
+    # Fail CLOSED: we are only here because the target run found real import
+    # failures, so a comparison-tool crash must never read as a pass.
+    case "$cmp_rc" in
+      0) status="passed" ;;
+      3) status="failed" ;;
+      *)
+        status="failed"
+        {
+          clean_report
+          echo
+          echo "_Baseline comparison failed (exit $cmp_rc); all target failures are shown — some may pre-date this upgrade._"
+        } > "$report"
+        ;;
+    esac
   else
     # No baseline to compare against — keep the strict behavior and say why.
     status="failed"

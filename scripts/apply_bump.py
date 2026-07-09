@@ -60,10 +60,13 @@ def bump_requirements(project_path: str, providers: list[dict]) -> list[dict]:
     }
     if not targets:
         return changed
+    # The `(?=[\s;]|$)` boundary mirrors detect_versions: a wildcard or
+    # local-segment pin never matches, so a partially-captured version can't be
+    # spliced into an invalid requirement.
     patterns = {
         pkg: re.compile(
-            rf"^(?P<pre>\s*{_pkg_pattern(pkg)}(?:\[[^\]]*\])?\s*==\s*)"
-            r"(?P<ver>[\w.\-]+)(?P<post>.*)$",
+            rf"^(?P<pre>\s*{_pkg_pattern(pkg)}(?:\s*\[[^\]]*\])?\s*==\s*)"
+            r"(?P<ver>[\w.\-]+)(?=[\s;]|$)(?P<post>.*)$",
             re.IGNORECASE,
         )
         for pkg in targets

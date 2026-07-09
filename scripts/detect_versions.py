@@ -40,10 +40,14 @@ _FROM_LOOSE = re.compile(
 # optional exact pin. The provider check happens on the PEP 503-normalized
 # form, so `common.sql`, `common_sql`, and `Common-SQL` — which pip all treat
 # as the same package — resolve to the provider they actually install.
+# The pin must end at whitespace, a marker, or EOL: a wildcard (`==1.2.*`) or
+# local-segment (`==1.2.3+foo`) pin is treated as UNPINNED rather than partially
+# captured — splicing a new version in front of the leftover suffix would write
+# an invalid requirement into the PR.
 _REQ_NAME = re.compile(
     r"^\s*(?P<name>[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?)"
-    r"(?:\[[^\]]*\])?"
-    r"\s*(?:==\s*(?P<ver>[\w.\-]+))?"
+    r"(?:\s*\[[^\]]*\])?"
+    r"\s*(?:==\s*(?P<ver>[\w.\-]+)(?=[\s;]|$))?"
 )
 
 
@@ -76,7 +80,7 @@ def detect_providers(project_path: str) -> list[dict]:
     by_pkg: dict[str, dict] = {}
     if not os.path.isfile(req):
         return out
-    with open(req, encoding="utf-8") as fh:
+    with open(req, encoding="utf-8-sig") as fh:  # -sig: a BOM must not hide line 1
         for raw in fh:
             line = raw.split("#", 1)[0].strip()
             if not line:
@@ -93,19 +97,31 @@ def detect_providers(project_path: str) -> list[dict]:
                 "pinned_version": m.group("ver"),  # None when unpinned
                 "spec_file": "requirements.txt",
             }
+            if m.group("ver") and "--hash" in line:
+                # Bumping only the version would leave a stale hash and an
+                # uninstallable file under --require-hashes. Skip and say why.
+                entry["pinned_version"] = None
+                entry["note"] = "hash-pinned; skipped (bumping the version would stale the `--hash`)"
             prev = by_pkg.get(pkg)
             if prev is None:
                 by_pkg[pkg] = entry
                 out.append(entry)
-            elif prev["pinned_version"] != entry["pinned_version"]:
-                # Two spellings of the same package with different pins. pip
-                # resolves this by accident (last wins); never pick a side —
-                # drop the pin so the resolver skips it and the PR surfaces it.
-                prev["pinned_version"] = None
-                prev["note"] = (
-                    "duplicate entries with conflicting pins "
-                    f"(`{prev['spec_name']}`, `{entry['spec_name']}`); skipped"
+            elif (entry["pinned_version"] and not prev["pinned_version"]
+                  and "note" not in prev):
+                # Unpinned line + pinned line: pip resolves that pair to the
+                # pin deterministically — adopt the pinned entry.
+                prev.update(entry)
+            elif (entry["pinned_version"] and prev["pinned_version"]
+                  and entry["pinned_version"] != prev["pinned_version"]):
+                # Same package pinned twice at different versions. pip's
+                # last-wins here is an accident; never pick a side — drop the
+                # pin so the resolver skips it and the PR surfaces it.
+                conflict = (
+                    f"`{prev['spec_name']}=={prev['pinned_version']}`, "
+                    f"`{entry['spec_name']}=={entry['pinned_version']}`"
                 )
+                prev["pinned_version"] = None
+                prev["note"] = f"duplicate entries with conflicting pins ({conflict}); skipped"
     return out
 
 
