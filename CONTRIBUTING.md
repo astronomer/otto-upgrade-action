@@ -26,3 +26,20 @@ act -j dry-run                                           # e2e dry-run locally (
   fully unit-testable.
 - Don't commit secrets. The version-resolution path is intentionally
   unauthenticated.
+
+## Releasing
+
+Consumers pin `@v0`, and `v0` only moves when a release is cut — merged-but-
+untagged fixes are invisible to every user (this bit us: `v0` sat on the
+initial commit while fixes accumulated on `main` for weeks). On every merge to
+`main` that changes behavior:
+
+1. Tag a semver release on the merge commit: `git tag vX.Y.Z <sha>`.
+2. Move the floating major tag: `git tag -f v0 <sha>`.
+3. Push both: `git push origin vX.Y.Z && git push -f origin v0`.
+4. `gh release create vX.Y.Z` with notes covering everything since the last
+   tag (check `git log <last-tag>..main` — enumerate earlier unreleased
+   merges too, since `@v0` consumers jump straight between releases).
+5. Validate before tagging: the release must point at a commit that has passed
+   a real end-to-end run (not just CI unit tests) — `@v0` consumers receive it
+   unreviewed on their next scheduled run.
