@@ -181,26 +181,20 @@ if [[ "$VERIFY_LEVEL" == "parse" ]]; then
   tail -n 40 "$WORKDIR/parse-target.log"
   echo "::endgroup::"
 
-  if [[ "$target_rc" -eq 2 ]]; then
-    status="skipped"
-    {
-      echo "ℹ️ Image-level verification could not run (\`astro dev parse\` produced no recognizable result$([[ "$target_run_rc" -eq 124 ]] && echo ', timed out')); imports were NOT checked."
-      echo
-      echo '```'
-      tail -n 15 "$WORKDIR/parse-target.log"
-      echo '```'
-    } > "$report"
-    echo "::warning::Verification skipped: astro dev parse did not produce a result — imports were NOT checked."
-    exit 0
-  fi
-
+  # Both "harness produced no verdict" classes degrade to the import-level
+  # check rather than reporting nothing: rc 5 = the project's integrity test is
+  # incompatible with the target Airflow; rc 2 = the run never completed
+  # (timeout, unrecognized output). Only genuine verdicts (0/3/4) stay here.
   if [[ "$target_rc" -eq 5 ]]; then
-    # The integrity test itself is incompatible with the target Airflow (a
-    # cause the shim above didn't cover) — the DAGs were never tested in the
-    # image. Degrade to the import-level check rather than reporting nothing.
     cause=$(jq -r '.collection_error // empty' "$WORKDIR/import-failures.json" 2>/dev/null)
     fallback_note="ℹ️ Image-level verification could not run: the project's \`.astro/test_dag_integrity_default.py\` fails to start at the target Airflow${cause:+ (\`${cause}\`)}. Regenerate it with an updated Astro CLI (\`astro dev init\`). Results below come from the import-level fallback."
     echo "::warning::verify-level parse: the project's DAG integrity test is incompatible with the target Airflow; falling back to import-level verification."
+    VERIFY_LEVEL="import"
+  elif [[ "$target_rc" -eq 2 ]]; then
+    reason="produced no recognizable result"
+    [[ "$target_run_rc" -eq 124 ]] && reason="timed out before completing"
+    fallback_note="ℹ️ Image-level verification could not run (\`astro dev parse\` ${reason}). Results below come from the import-level fallback."
+    echo "::warning::verify-level parse: astro dev parse ${reason}; falling back to import-level verification."
     VERIFY_LEVEL="import"
   fi
 fi
@@ -249,10 +243,25 @@ if [[ "$VERIFY_LEVEL" == "parse" ]]; then
         echo '```'
       } > "$report"
       echo "::warning::Verification skipped: neither the current nor the target image builds."
-    else
+    elif [[ "$baseline_rc" == "0" || "$baseline_rc" == "3" || "$baseline_rc" == "5" ]]; then
+      # 0/3/5 all mean the current image BUILT (5 = built, then the integrity
+      # test died at collection), so the build verdict exists and the blame is
+      # honest.
       status="failed"
       {
         echo "❌ **The project does not build at the target Runtime image** (\`${tgt_tag:-Dockerfile}\`). Dependency resolution failed while installing your requirements into the image. Your current image builds cleanly, so this is caused by the upgrade — usually a project pin that conflicts with packages bundled in the newer Runtime:"
+        echo
+        echo '```'
+        printf '%s\n' "$build_excerpt"
+        echo '```'
+      } > "$report"
+    else
+      # No baseline build verdict (worktree failed, baseline parse timed out
+      # or was unrecognized). Fail closed, but never claim the current image
+      # builds — we don't know.
+      status="failed"
+      {
+        echo "❌ **The project does not build at the target Runtime image** (\`${tgt_tag:-Dockerfile}\`). Dependency resolution failed while installing your requirements into the image. The current image could not be verified in this environment, so this failure may or may not pre-date the upgrade:"
         echo
         echo '```'
         printf '%s\n' "$build_excerpt"

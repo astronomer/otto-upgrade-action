@@ -45,6 +45,28 @@ _BLOCKING_PIN = re.compile(
 )
 
 
+def _blocking_pin_for(err: str, pkg: str) -> str | None:
+    """The user pin gating ``pkg``, from uv's error text.
+
+    A multi-conflict error carries several "you require X==..." clauses; the
+    first can belong to an unrelated conflict. In uv's derivations the gating
+    pin FOLLOWS the offender's mention ("Because <offender>... and you require
+    <pin>"), so take the first clause after the offender; fall back to the
+    first clause anywhere when none follows.
+    """
+    anchor = err.find(pkg)
+    fallback = None
+    for m in _BLOCKING_PIN.finditer(err):
+        pin = m.group("pin")
+        if pin.startswith(pkg):
+            continue
+        if anchor >= 0 and m.start() >= anchor:
+            return pin
+        if fallback is None:
+            fallback = pin
+    return fallback
+
+
 def compile_requirements(project_path: str) -> tuple[int, str]:
     req = os.path.join(project_path, "requirements.txt")
     proc = subprocess.run(  # noqa: S603 — fixed argv, no shell
@@ -91,22 +113,26 @@ def main() -> int:
     blocking: dict[str, str] = {}
     pools: dict[str, list[str]] = {}
     adjusted: set[str] = set()
+    exhausted: set[str] = set()
 
     rc, err = compile_requirements(project_path)
     for _ in range(_MAX_COMPILES):
         if rc == 0:
             break
         offender = next((p for p in bumped
-                         if f"{p['package']}=={live[p['package']]}" in err), None)
+                         if p["package"] not in exhausted
+                         and f"{p['package']}=={live[p['package']]}" in err), None)
         if offender is None:
             offender = next((p for p in bumped
-                             if p["package"] in err and live[p["package"]] != p["current"]), None)
+                             if p["package"] not in exhausted
+                             and p["package"] in err
+                             and live[p["package"]] != p["current"]), None)
         if offender is None:
             break  # not attributable to a bump we made — verification's problem
         pkg = offender["package"]
-        m = _BLOCKING_PIN.search(err)
-        if m and not m.group("pin").startswith(pkg):
-            blocking.setdefault(pkg, m.group("pin"))
+        pin = _blocking_pin_for(err, pkg)
+        if pin:
+            blocking.setdefault(pkg, pin)
         if pkg not in pools:
             pools[pkg] = in_scope_versions(pkg, offender["current"], original[pkg])
         pool = pools[pkg]
@@ -114,7 +140,11 @@ def main() -> int:
             pool.pop(0)
         nxt = pool.pop(0) if pool else offender["current"]
         if nxt == live[pkg]:
-            break  # can't move further down
+            # This offender is walked all the way back; a multi-conflict error
+            # may still name another bumped provider — move on to it rather
+            # than abandoning the whole reconciliation.
+            exhausted.add(pkg)
+            continue
         apply_bump.bump_requirements(
             project_path, [{"package": pkg, "current": live[pkg], "target": nxt}])
         live[pkg] = nxt
@@ -144,17 +174,10 @@ def main() -> int:
         summary["adjustments"].append(
             {"package": pkg, "from": orig, "to": final, "blocking_pin": blk})
 
-    # Re-roll the plan aggregates the same way resolve_target does.
-    tiers = []
-    if plan.get("runtime"):
-        tiers.append(plan["runtime"].get("tier", "none"))
-    tiers += [p.get("tier", "none") for p in plan.get("providers", [])]
-    overall = "none"
-    for t in tiers:
-        if rt.TIER_ORDER.get(t, -1) > rt.TIER_ORDER[overall]:
-            overall = t
-    plan["overall_tier"] = overall
-    plan["needs_migration"] = overall in ("minor", "major")
+    # One source of truth for ALL derived aggregates (overall_tier, no_update,
+    # author_changes, needs_migration, scope_exceeded, advisory) — a partial
+    # re-roll here previously left the others stale after a walk-back.
+    rt.roll_up(plan)
 
     with open(plan_file, "w", encoding="utf-8") as fh:
         json.dump(plan, fh, indent=2)

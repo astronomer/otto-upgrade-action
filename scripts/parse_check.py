@@ -31,7 +31,10 @@ import sys
 
 BUILD_MARKER = "an error was encountered while building the image"
 _COLLECTED = re.compile(r"^collected (\d+) items?")
-_SUMMARY = re.compile(r"=+ .*\b(\d+) passed.*=+|=+ .*\b(\d+) failed.*=+")
+# pytest's closing summary line — its presence is the evidence the run FINISHED.
+# A timeout kill mid-run leaves "collected N items" with no summary; that must
+# never read as a verdict (a green "all N import cleanly" over untested DAGs).
+_SUMMARY = re.compile(r"^=+ .*\b(passed|failed|error|no tests ran)\b.* in [0-9.]+s? =+", re.MULTILINE)
 _FAILED_LINE = re.compile(r"^FAILED .*::test_file_imports\[(?P<path>[^\]]+)\]")
 _EXC_HEAD = re.compile(r"^E\s+Exception: (?P<path>\S+) failed to import with message")
 _EXC_CLASS = re.compile(r"^([A-Za-z_][A-Za-z0-9_.]*(?:Error|Exception|Warning))\b")
@@ -94,8 +97,11 @@ def parse_output(text: str) -> tuple[int, dict]:
                 "msg": "failed to import (see the CI log for the traceback)",
             }
 
-    recognized = checked > 0 or _CLEAN in text or failures
-    if not recognized:
+    # A verdict requires evidence the run COMPLETED, not merely started:
+    # the astro clean marker or pytest's closing summary line. "collected N
+    # items" alone is what a timeout kill leaves behind.
+    completed = _CLEAN in text or _SUMMARY.search(text) is not None
+    if not completed:
         return 2, {"checked": 0, "failures": []}
     return (3 if failures else 0), {"checked": checked, "failures": sorted(
         failures.values(), key=lambda f: f["path"])}

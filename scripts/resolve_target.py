@@ -419,6 +419,63 @@ def _provider_latest(package: str, cur: str, max_scope: str,
             "clamped": clamped, "available_latest": latest, "note": note}
 
 
+def roll_up(plan: dict) -> None:
+    """Recompute every derived aggregate from the runtime + provider entries.
+
+    The single source of truth for plan finalization: called here after the
+    plan is built, and again by co_resolve.py after reconciling pins. A partial
+    re-roll (only some fields) leaves the others stale and contradictory —
+    e.g. `author_changes` still true after every bump was walked back.
+    """
+    tiers = []
+    if plan["runtime"]:
+        tiers.append(plan["runtime"]["tier"])
+    tiers += [p["tier"] for p in plan["providers"]]
+    overall = "none"
+    for t in tiers:
+        if TIER_ORDER.get(t, -1) > TIER_ORDER[overall]:
+            overall = t
+    plan["overall_tier"] = overall
+
+    runtime = plan["runtime"] or {}
+    runtime_tier = runtime.get("tier", "none")
+    held_airflow_major = bool(runtime.get("held_major"))
+    # A held Airflow major is advisory-only, never authored — but it is NOT
+    # "nothing to do": the action must still surface the guided-upgrade advisory.
+    # Excluding it here keeps the run from collapsing into a silent no-op (the
+    # advisory step is gated on no-update != true). When the clamp held a major
+    # but nothing in-scope was authorable, overall is "none" yet no_update stays
+    # false so the advisory is shown.
+    plan["no_update"] = overall == "none" and not held_airflow_major
+    # Never auto-author an *Airflow* major (runtime jump). Provider majors are
+    # authored. Everything patch/minor is authored.
+    plan["author_changes"] = overall != "none" and runtime_tier != "major"
+    plan["needs_migration"] = overall in ("minor", "major")
+
+    held = [c for c in ([plan["runtime"]] if plan["runtime"] else []) + plan["providers"]
+            if c.get("clamped")]
+    plan["scope_exceeded"] = bool(held)
+    # True when the withheld jump is specifically an Airflow major — which a
+    # scheduled run never authors even if max-upgrade-scope is raised. The PR
+    # body uses this to point at the guided upgrade instead of "raise the cap".
+    plan["held_airflow_major"] = held_airflow_major
+
+    advisory = ""
+    if runtime_tier == "major" or held_airflow_major:
+        rt_af = runtime.get("current_airflow") or "your current version"
+        # When the major was held back by the scope cap, the authored move is a
+        # smaller jump; point at the major we declined (uncapped_target_airflow).
+        rt_t = (runtime.get("uncapped_target_airflow") if held_airflow_major
+                else runtime.get("target_airflow")) or "the next major"
+        advisory = (
+            f"A major Airflow upgrade is available ({rt_af} -> {rt_t}). Major "
+            "migrations are not auto-authored by this action — run the guided "
+            "upgrade (`astro otto`, Airflow upgrade workflow) and review the "
+            "breaking changes interactively."
+        )
+    plan["advisory"] = advisory
+
+
 def main() -> int:
     current = json.load(open(os.environ["CURRENT_FILE"]))
     target = os.environ.get("TARGET", "latest-minor")
@@ -479,54 +536,7 @@ def main() -> int:
                 entry["spec_name"] = p["spec_name"]
             plan["providers"].append(entry)
 
-    # Roll up.
-    tiers = []
-    if plan["runtime"]:
-        tiers.append(plan["runtime"]["tier"])
-    tiers += [p["tier"] for p in plan["providers"]]
-    overall = "none"
-    for t in tiers:
-        if TIER_ORDER.get(t, -1) > TIER_ORDER[overall]:
-            overall = t
-    plan["overall_tier"] = overall
-
-    runtime = plan["runtime"] or {}
-    runtime_tier = runtime.get("tier", "none")
-    held_airflow_major = bool(runtime.get("held_major"))
-    # A held Airflow major is advisory-only, never authored — but it is NOT
-    # "nothing to do": the action must still surface the guided-upgrade advisory.
-    # Excluding it here keeps the run from collapsing into a silent no-op (the
-    # advisory step is gated on no-update != true). When the clamp held a major
-    # but nothing in-scope was authorable, overall is "none" yet no_update stays
-    # false so the advisory is shown.
-    plan["no_update"] = overall == "none" and not held_airflow_major
-    # Never auto-author an *Airflow* major (runtime jump). Provider majors are
-    # authored. Everything patch/minor is authored.
-    plan["author_changes"] = overall != "none" and runtime_tier != "major"
-    plan["needs_migration"] = overall in ("minor", "major")
-
-    held = [c for c in ([plan["runtime"]] if plan["runtime"] else []) + plan["providers"]
-            if c.get("clamped")]
-    plan["scope_exceeded"] = bool(held)
-    # True when the withheld jump is specifically an Airflow major — which a
-    # scheduled run never authors even if max-upgrade-scope is raised. The PR
-    # body uses this to point at the guided upgrade instead of "raise the cap".
-    plan["held_airflow_major"] = held_airflow_major
-
-    advisory = ""
-    if runtime_tier == "major" or held_airflow_major:
-        rt_af = runtime.get("current_airflow") or "your current version"
-        # When the major was held back by the scope cap, the authored move is a
-        # smaller jump; point at the major we declined (uncapped_target_airflow).
-        rt_t = (runtime.get("uncapped_target_airflow") if held_airflow_major
-                else runtime.get("target_airflow")) or "the next major"
-        advisory = (
-            f"A major Airflow upgrade is available ({rt_af} -> {rt_t}). Major "
-            "migrations are not auto-authored by this action — run the guided "
-            "upgrade (`astro otto`, Airflow upgrade workflow) and review the "
-            "breaking changes interactively."
-        )
-    plan["advisory"] = advisory
+    roll_up(plan)
 
     json.dump(plan, sys.stdout, indent=2)
     sys.stdout.write("\n")

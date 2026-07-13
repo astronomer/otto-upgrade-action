@@ -14,20 +14,39 @@ only invokes this when the target run found real failures, so a crash here
 must fail closed, never read as a pass.
 
 Classification is by project-root-relative path — both runs emit those, so the
-two checkouts compare directly. A path failing on both sides with a different
-exception class stays pre-existing (annotated, not failing) — the root cause
-almost always predates the upgrade — EXCEPT when the target error is
-import-family (ImportError/ModuleNotFoundError/AttributeError) and the
-baseline's wasn't: a moved or removed import surfacing behind an unrelated
-pre-existing failure is exactly the upgrade signal this tool exists to catch.
+two checkouts compare directly. A path failing on both sides normally stays
+pre-existing (annotated, not failing) — the root cause almost always predates
+the upgrade. The exception is the import family (ImportError /
+ModuleNotFoundError), the one error class that IS the upgrade signal: a
+failure escalates to NEW when the target error enters that family from a
+different class, or stays in it but names a different symbol/module (baseline
+"cannot import name 'Foo'" vs target "... 'Bar'" is a new break hiding behind
+an old one). Symbols are compared by the quoted names in the message, so
+version-dependent path noise around them doesn't cause false escalation.
+AttributeError is deliberately NOT in the family: it is overwhelmingly an
+env-dependent parse-time error, and escalating it re-reds exactly the
+both-sides-broken class this comparison exists to suppress.
 """
 
 from __future__ import annotations
 
 import json
+import re
 import sys
 
-_IMPORT_FAMILY = {"ImportError", "ModuleNotFoundError", "AttributeError"}
+_IMPORT_FAMILY = {"ImportError", "ModuleNotFoundError"}
+_QUOTED = re.compile(r"'([^']+)'")
+
+
+def _import_break_is_new(target: dict, baseline: dict) -> bool:
+    if target.get("exc_class") not in _IMPORT_FAMILY:
+        return False
+    if baseline.get("exc_class") != target.get("exc_class"):
+        return True
+    names_t = set(_QUOTED.findall(target.get("msg", "")))
+    names_b = set(_QUOTED.findall(baseline.get("msg", "")))
+    # Same class, same quoted names (or none extractable) → same root cause.
+    return bool(names_t or names_b) and names_t != names_b
 
 
 def _code(msg: str) -> str:
@@ -51,10 +70,10 @@ def main() -> int:
         b = baseline_by_path.get(path)
         if b is None:
             new.append(f)
-        elif (f.get("exc_class") != b.get("exc_class")
-              and f.get("exc_class") in _IMPORT_FAMILY):
-            # Escalate: an import-family error that wasn't there before is
-            # upgrade breakage even if the file already failed differently.
+        elif _import_break_is_new(f, b):
+            # Escalate: an import failure that wasn't there before — new class,
+            # or the same class naming a different symbol — is upgrade breakage
+            # even though the file already failed for another reason.
             f = dict(f, escalated=True)
             new.append(f)
         else:
@@ -72,7 +91,7 @@ def main() -> int:
             note = ""
             if f.get("escalated"):
                 note = (" _(this file also fails this check at your current "
-                        "versions, but with a non-import error — the import "
+                        "versions, but with a different error — this import "
                         "failure is new)_")
             lines.append(f"  - `{f['path']}`: {_code(f['msg'])}{note}")
         lines.append("")

@@ -63,7 +63,44 @@ def test_changed_class_to_import_family_escalates_to_new(tmp_path):
              [_fail("dags/etl.py", "OperationalError", "OperationalError: db unreachable")])
     assert r.returncode == 3
     assert "1 NEW import failure" in r.stdout
-    assert "the import failure is new" in r.stdout
+    assert "this import failure is new" in r.stdout
+
+
+def test_same_class_different_symbol_escalates(tmp_path):
+    # Baseline already fails on a missing 'Foo'; the upgrade breaks 'Bar' in
+    # the same file with the same exception class. The new break must not hide
+    # behind the old one.
+    r = _run(tmp_path,
+             [_fail("dags/etl.py", "ImportError",
+                    "ImportError: cannot import name 'Bar' from 'pkg' (py3.14/pkg/__init__.py)")],
+             [_fail("dags/etl.py", "ImportError",
+                    "ImportError: cannot import name 'Foo' from 'pkg' (py3.13/pkg/__init__.py)")])
+    assert r.returncode == 3
+    assert "1 NEW import failure" in r.stdout
+
+
+def test_same_class_same_symbol_with_path_noise_stays_preexisting(tmp_path):
+    # The same missing module reported from two different image paths (python
+    # 3.13 vs 3.14) is one pre-existing root cause, not a new break.
+    r = _run(tmp_path,
+             [_fail("dags/etl.py", "ModuleNotFoundError",
+                    "ModuleNotFoundError: No module named 'config'")],
+             [_fail("dags/etl.py", "ModuleNotFoundError",
+                    "ModuleNotFoundError: No module named 'config'")])
+    assert r.returncode == 0
+    assert "pre-existing" in r.stdout
+
+
+def test_attribute_error_change_stays_preexisting(tmp_path):
+    # AttributeError is overwhelmingly env-dependent parse-time breakage, not
+    # a moved-import signal — escalating it re-reds the both-sides-broken
+    # class this comparison exists to suppress.
+    r = _run(tmp_path,
+             [_fail("dags/flaky.py", "AttributeError",
+                    "AttributeError: 'NoneType' object has no attribute 'get'")],
+             [_fail("dags/flaky.py", "OperationalError", "OperationalError: db unreachable")])
+    assert r.returncode == 0
+    assert "error changed at the target version" in r.stdout
 
 
 def test_changed_non_import_class_stays_preexisting(tmp_path):

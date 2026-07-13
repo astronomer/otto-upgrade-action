@@ -130,5 +130,59 @@ def test_overall_tier_rerolled_when_all_bumps_held(tmp_path, monkeypatch):
     ("no pin mentioned here", None),
 ])
 def test_blocking_pin_extraction(stderr, expected):
-    m = co_resolve._BLOCKING_PIN.search(stderr)
-    assert (m.group("pin") if m else None) == expected
+    assert co_resolve._blocking_pin_for(
+        stderr, "apache-airflow-providers-common-ai") == expected
+
+
+def test_blocking_pin_picks_clause_nearest_the_offender():
+    # A multi-conflict error carries clauses for unrelated pins; the advice
+    # must name the pin gating THIS provider, not the first clause in the text.
+    err = (
+        "Because somelib requires x and you require otherlib==2.0, ...\n"
+        "Because apache-airflow-providers-common-ai==0.6.0 requires\n"
+        "pydantic-ai-slim>=2.0.0 and you require pydantic-ai-slim[openai]==1.107.0, ...\n"
+    )
+    assert co_resolve._blocking_pin_for(
+        err, "apache-airflow-providers-common-ai") == "pydantic-ai-slim[openai]==1.107.0"
+
+
+def test_multi_conflict_walks_second_offender_after_first_exhausts(tmp_path, monkeypatch):
+    # Offender A has no candidates (held at current); the same error also names
+    # bumped offender B, which IS resolvable — B must still be walked instead
+    # of the loop abandoning after A.
+    plan = _plan()
+    plan["providers"].append(
+        {"package": "apache-airflow-providers-snowflake", "current": "6.8.0",
+         "target": "6.14.0", "tier": "minor", "clamped": False, "note": ""})
+    plan_file = _project(
+        tmp_path,
+        "apache-airflow-providers-common-ai==0.6.0\n"
+        "apache-airflow-providers-snowflake==6.14.0\n"
+        "pydantic-ai-slim[openai]==1.107.0\n",
+        plan,
+    )
+    err_a_bumped = (
+        "you require pydantic-ai-slim[openai]==1.107.0 and "
+        "apache-airflow-providers-common-ai==0.6.0 are incompatible; "
+        "apache-airflow-providers-snowflake==6.14.0 is also unsatisfiable"
+    )
+    err_a_held = err_a_bumped.replace("common-ai==0.6.0", "common-ai==0.5.0")
+    pools = {"apache-airflow-providers-common-ai": [],
+             "apache-airflow-providers-snowflake": ["6.10.0"]}
+    monkeypatch.setattr(co_resolve, "in_scope_versions",
+                        lambda pkg, *_a: list(pools[pkg]))
+    calls = iter([
+        (1, err_a_bumped),  # initial: A walked 0.6.0 -> current (empty pool)
+        (1, err_a_held),    # still failing, A now named AT current -> exhausted
+        (0, ""),            # after B walked -> resolves
+    ])
+    monkeypatch.setattr(co_resolve, "compile_requirements", lambda _p: next(calls))
+    monkeypatch.setenv("PROJECT_PATH", str(tmp_path))
+    monkeypatch.setenv("PLAN_FILE", str(tmp_path / "plan.json"))
+    assert co_resolve.main() == 0
+    updated = json.loads(plan_file.read_text())
+    by_pkg = {p["package"]: p for p in updated["providers"]}
+    assert by_pkg["apache-airflow-providers-common-ai"]["target"] == "0.5.0"  # held
+    assert by_pkg["apache-airflow-providers-snowflake"]["target"] == "6.10.0"  # walked
+    reqs = (tmp_path / "requirements.txt").read_text()
+    assert "apache-airflow-providers-snowflake==6.10.0" in reqs

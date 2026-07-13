@@ -149,6 +149,22 @@ def test_passed_verification_gets_no_banner(tmp_path, monkeypatch):
     assert "Verification — passed" in out
 
 
+def test_intermediate_hold_note_renders_in_table(tmp_path, monkeypatch):
+    # A provider held at an intermediate co-resolving version carries its
+    # explanation (and the raise-this-pin advice) in `note`; the Not-changed
+    # section excludes bumped rows, so the table cell must show it.
+    plan = {"overall_tier": "minor", "needs_migration": True, "scope_exceeded": False,
+            "advisory": "", "runtime": None,
+            "providers": [{"package": "apache-airflow-providers-common-ai",
+                           "current": "0.3.0", "target": "0.4.2", "tier": "minor",
+                           "note": "held at 0.4.2 — newest version that resolves together "
+                                   "with your pins; 0.6.0 conflicts with your "
+                                   "`pydantic-ai-slim[openai]==1.107.0` pin"}]}
+    out = _render(tmp_path, monkeypatch, plan, {"files": []})
+    assert "held at 0.4.2" in out
+    assert "pydantic-ai-slim" in out
+
+
 def test_body_shows_major_advisory(tmp_path, monkeypatch):
     plan = {"overall_tier": "major", "needs_migration": True, "scope_exceeded": False,
             "advisory": "A major Airflow upgrade is available (2.10.5 -> 3.2.2).",

@@ -103,10 +103,14 @@ def main() -> int:
         if p.get("current") and p.get("target") and p["current"] != p["target"]:
             spec = p.get("spec_name") or ""
             spelled = f"pinned as `{spec}`" if spec and spec != p["package"] else ""
+            # A provider held at an intermediate version carries its
+            # explanation (and the raise-this-pin advice) in `note` — it must
+            # surface here, since the Not-changed section excludes bumped rows.
+            notes = "; ".join(x for x in (spelled, p.get("note") or "") if x)
             rows.append(
                 f"| `{p['package'].replace('apache-airflow-providers-', '')}` "
                 f"| `{p['current']}` | `{p['target']}` "
-                f"| {TIER_BADGE.get(p['tier'], p['tier'])} | {spelled} |"
+                f"| {TIER_BADGE.get(p['tier'], p['tier'])} | {notes} |"
             )
     if rows:
         out += ["| Component | From | To | Tier | Notes |", "| --- | --- | --- | --- | --- |", *rows, ""]

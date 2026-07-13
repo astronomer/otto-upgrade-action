@@ -75,11 +75,11 @@ outputs:
     description: "Resolved target Runtime tag."
     value: ${{ steps.resolve.outputs.target-runtime }}
   overall-scope:
-    description: "Largest tier across the resolved plan: patch, minor, major, or none."
-    value: ${{ steps.resolve.outputs.overall-tier }}
+    description: "Largest tier across the resolved plan (after pin reconciliation): patch, minor, major, or none."
+    value: ${{ steps.reconcile.outputs.overall-tier || steps.resolve.outputs.overall-tier }}
   no-update:
     description: "'true' when nothing is behind and the action no-ops."
-    value: ${{ steps.resolve.outputs.no-update }}
+    value: ${{ steps.reconcile.outputs.no-update || steps.resolve.outputs.no-update }}
   verify-status:
     description: "Verification result: passed, failed, or skipped (skipped when verification didn't run)."
     value: ${{ steps.verify.outputs.status || 'skipped' }}
@@ -244,11 +244,14 @@ runs:
       uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39  # v8.2.0
 
     - name: Reconcile provider bumps with project pins
+      id: reconcile
       # A bumped provider can be unsatisfiable next to the user's own pins.
       # Walk it back to the newest co-resolving version (plan note explains
       # which pin blocks the newer one) BEFORE the prompt is built, so Otto and
       # the PR see the final pin set. Best-effort: without uv this is skipped
-      # and verification remains the backstop.
+      # and verification remains the backstop. Re-emits the plan aggregates —
+      # a walk-back can shrink the overall tier, and the resolve step's
+      # outputs were captured before reconciliation.
       if: >-
         steps.resolve.outputs.author-changes == 'true' &&
         steps.resolve.outputs.no-update != 'true'
@@ -258,14 +261,21 @@ runs:
         PLAN_FILE: /tmp/otto-upgrade/plan.json
       run: |
         set -euo pipefail
-        if ! command -v uv >/dev/null 2>&1; then
+        if command -v uv >/dev/null 2>&1; then
+          python3 "$GITHUB_ACTION_PATH/scripts/co_resolve.py" > /tmp/otto-upgrade/co-resolve.json
+          echo "::group::Pin reconciliation"
+          cat /tmp/otto-upgrade/co-resolve.json
+          echo "::endgroup::"
+        else
           echo "uv unavailable; skipping pin reconciliation (verification will catch conflicts)."
-          exit 0
         fi
-        python3 "$GITHUB_ACTION_PATH/scripts/co_resolve.py" > /tmp/otto-upgrade/co-resolve.json
-        echo "::group::Pin reconciliation"
-        cat /tmp/otto-upgrade/co-resolve.json
-        echo "::endgroup::"
+        P=/tmp/otto-upgrade/plan.json
+        {
+          echo "overall-tier=$(jq -r '.overall_tier' "$P")"
+          echo "needs-migration=$(jq -r '.needs_migration' "$P")"
+          echo "no-update=$(jq -r '.no_update' "$P")"
+          echo "author-changes=$(jq -r '.author_changes' "$P")"
+        } >> "$GITHUB_OUTPUT"
 
     - name: Build Otto prompt
       if: steps.auth.outputs.enabled == 'true'

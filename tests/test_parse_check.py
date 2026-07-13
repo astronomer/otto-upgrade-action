@@ -116,6 +116,20 @@ def test_unrecognized_output_is_infra(tmp_path):
     assert rc == 2
 
 
+def test_timeout_truncated_run_is_not_a_verdict(tmp_path):
+    # A `timeout` kill mid-pytest leaves "collected N items" and progress dots
+    # but no closing summary. That must never read as a pass — it's what a
+    # green "all N import cleanly" over untested DAGs looks like.
+    truncated = (
+        "Checking your DAGs for errors…\n"
+        "============================= test session starts ==============================\n"
+        "collected 37 items\n\n"
+        ".astro/test_dag_integrity_default.py ...........\n"
+    )
+    rc, result, *_ = _run(tmp_path, truncated)
+    assert rc == 2
+
+
 def test_failed_line_without_e_block_still_reported(tmp_path):
     # If pytest output formatting changes and the E-block regex misses, the
     # short-summary FAILED line must still produce an entry (fail-closed).
