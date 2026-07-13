@@ -40,6 +40,14 @@ def bump_dockerfile(project_path: str, current_tag: str, target_tag: str) -> boo
     return True
 
 
+def _pkg_pattern(package: str) -> str:
+    """Regex matching any spelling of ``package`` that PEP 503-normalizes to it:
+    each ``-`` in the normalized name matches a run of ``-``/``_``/``.``, so a
+    typo'd `common.sql` line still gets its pin bumped. The trailing ``==``
+    anchor in the caller prevents prefix false-matches (`common-sqlx`)."""
+    return r"[-_.]+".join(re.escape(part) for part in package.split("-"))
+
+
 def bump_requirements(project_path: str, providers: list[dict]) -> list[dict]:
     path = os.path.join(project_path, "requirements.txt")
     changed: list[dict] = []
@@ -52,19 +60,30 @@ def bump_requirements(project_path: str, providers: list[dict]) -> list[dict]:
     }
     if not targets:
         return changed
-    with open(path, encoding="utf-8") as fh:
+    # The `(?=[\s;]|$)` boundary mirrors detect_versions: a wildcard or
+    # local-segment pin never matches, so a partially-captured version can't be
+    # spliced into an invalid requirement.
+    patterns = {
+        pkg: re.compile(
+            rf"^(?P<pre>\s*{_pkg_pattern(pkg)}(?:\s*\[[^\]]*\])?\s*==\s*)"
+            r"(?P<ver>[\w.\-]+)(?=[\s;]|$)(?P<post>.*)$",
+            re.IGNORECASE,
+        )
+        for pkg in targets
+    }
+    # newline="" preserves the file's own line endings — universal-newline mode
+    # would rewrite a CRLF requirements.txt entirely to LF, turning a one-pin
+    # bump into a whole-file diff (this module's contract is byte-for-byte).
+    with open(path, encoding="utf-8", newline="") as fh:
         lines = fh.readlines()
     for i, raw in enumerate(lines):
         code = raw.split("#", 1)[0]
         for pkg, target in targets.items():
-            # Match `pkg[extras]==x.y.z` and swap only the version, preserving
-            # extras, markers, trailing comment, and newline.
-            m = re.match(
-                rf"^(?P<pre>\s*{re.escape(pkg)}(?:\[[^\]]*\])?\s*==\s*)"
-                r"(?P<ver>[\w.\-]+)(?P<post>.*)$",
-                code,
-            )
-            if not m:
+            # Match `pkg[extras]==x.y.z` (any PEP 503-equivalent spelling) and
+            # swap only the version, preserving the user's spelling, extras,
+            # markers, trailing comment, and newline.
+            m = patterns[pkg].match(code)
+            if not m or m.group("ver") == target:
                 continue
             comment = raw[len(code):]
             lines[i] = f"{m.group('pre')}{target}{m.group('post')}{comment}"
@@ -72,7 +91,7 @@ def bump_requirements(project_path: str, providers: list[dict]) -> list[dict]:
                 lines[i] += "\n"
             changed.append({"package": pkg, "from": m.group("ver"), "to": target})
     if changed:
-        with open(path, "w", encoding="utf-8") as fh:
+        with open(path, "w", encoding="utf-8", newline="") as fh:
             fh.writelines(lines)
     return changed
 

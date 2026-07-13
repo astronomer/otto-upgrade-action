@@ -82,6 +82,20 @@ def is_prerelease(v: str) -> bool:
     return bool(_PRERELEASE.search(v.split("+", 1)[0]))
 
 
+def stable_release_versions(releases: dict) -> list[str]:
+    """Installable stable versions from a PyPI ``releases`` mapping.
+
+    The single definition of "installable": not a prerelease, and at least one
+    non-yanked artifact. Used for target selection here and for the
+    conflict walk in co_resolve.py — the two must never disagree about which
+    versions exist.
+    """
+    return [
+        ver for ver, files in releases.items()
+        if not is_prerelease(ver) and files and not all(f.get("yanked") for f in files)
+    ]
+
+
 def tier_between(cur: str, tgt: str) -> str:
     """patch / minor / major between two Airflow (or semver) versions."""
     c = (version_tuple(cur) + (0, 0, 0))[:3]
@@ -341,15 +355,7 @@ def _provider_latest(package: str, cur: str, max_scope: str,
         return {"package": package, "current": cur, "target": cur, "tier": "none",
                 "clamped": False, "note": f"PyPI lookup failed: {exc}"}
 
-    releases = data.get("releases", {})
-    stable = []
-    for ver, files in releases.items():
-        if is_prerelease(ver):
-            continue
-        # No artifacts, or every artifact yanked -> not installable; skip.
-        if not files or all(f.get("yanked") for f in files):
-            continue
-        stable.append(ver)
+    stable = stable_release_versions(data.get("releases", {}))
     if not stable:
         return {"package": package, "current": cur, "target": cur, "tier": "none",
                 "clamped": False, "note": "no stable releases found"}
@@ -419,62 +425,14 @@ def _provider_latest(package: str, cur: str, max_scope: str,
             "clamped": clamped, "available_latest": latest, "note": note}
 
 
-def main() -> int:
-    current = json.load(open(os.environ["CURRENT_FILE"]))
-    target = os.environ.get("TARGET", "latest-minor")
-    max_scope = os.environ.get("MAX_SCOPE", "minor")
-    include_providers = os.environ.get("INCLUDE_PROVIDERS", "true").lower() == "true"
+def roll_up(plan: dict) -> None:
+    """Recompute every derived aggregate from the runtime + provider entries.
 
-    if target not in VALID_TARGETS:
-        print(f"::error::invalid TARGET '{target}' (expected one of {sorted(VALID_TARGETS)})",
-              file=sys.stderr)
-        return 2
-    if max_scope not in TIER_ORDER:
-        print(f"::error::invalid MAX_SCOPE '{max_scope}'", file=sys.stderr)
-        return 2
-
-    plan: dict[str, Any] = {"runtime": None, "providers": []}
-
-    rt = current.get("runtime")
-    if rt and rt.get("tag"):
-        if rt.get("digest"):
-            # A digest-pinned FROM resolves by digest and ignores the tag, so
-            # bumping the tag wouldn't change the built image. We don't bump it —
-            # but we still resolve the current Airflow version from the tag so
-            # Otto gets a real currentVersion and verify can import against it
-            # (the providers can still move; only the runtime is pinned).
-            plan["runtime"] = {
-                "current_tag": rt["tag"], "current_airflow": airflow_for_tag(rt["tag"]),
-                "target_tag": rt["tag"], "tier": "none", "clamped": False,
-                "image_repo": rt.get("image_repo", ""),
-                "note": "FROM line is digest-pinned (@sha256:...); the Runtime tag is "
-                "not auto-bumped. Remove the digest pin to let the action manage it.",
-            }
-        else:
-            plan["runtime"] = resolve_runtime(rt["tag"], target, max_scope)
-            plan["runtime"]["image_repo"] = rt.get("image_repo", "")
-
-    # The Airflow providers must stay compatible with: the version we're landing
-    # on if the runtime moves, else the current Airflow (provider-only bumps).
-    af_for_providers = None
-    if plan["runtime"]:
-        af_for_providers = (plan["runtime"].get("target_airflow")
-                            or plan["runtime"].get("current_airflow"))
-
-    if include_providers:
-        for p in current.get("providers", []):
-            if not p.get("pinned_version"):
-                plan["providers"].append(
-                    {"package": p["package"], "current": None, "target": None,
-                     "tier": "none", "clamped": False,
-                     "note": "unpinned; skipped (can only bump exact pins safely)"}
-                )
-                continue
-            plan["providers"].append(
-                _provider_latest(p["package"], p["pinned_version"], max_scope, af_for_providers)
-            )
-
-    # Roll up.
+    The single source of truth for plan finalization: called here after the
+    plan is built, and again by co_resolve.py after reconciling pins. A partial
+    re-roll (only some fields) leaves the others stale and contradictory —
+    e.g. `author_changes` still true after every bump was walked back.
+    """
     tiers = []
     if plan["runtime"]:
         tiers.append(plan["runtime"]["tier"])
@@ -522,6 +480,69 @@ def main() -> int:
             "breaking changes interactively."
         )
     plan["advisory"] = advisory
+
+
+def main() -> int:
+    current = json.load(open(os.environ["CURRENT_FILE"]))
+    target = os.environ.get("TARGET", "latest-minor")
+    max_scope = os.environ.get("MAX_SCOPE", "minor")
+    include_providers = os.environ.get("INCLUDE_PROVIDERS", "true").lower() == "true"
+
+    if target not in VALID_TARGETS:
+        print(f"::error::invalid TARGET '{target}' (expected one of {sorted(VALID_TARGETS)})",
+              file=sys.stderr)
+        return 2
+    if max_scope not in TIER_ORDER:
+        print(f"::error::invalid MAX_SCOPE '{max_scope}'", file=sys.stderr)
+        return 2
+
+    plan: dict[str, Any] = {"runtime": None, "providers": []}
+
+    rt = current.get("runtime")
+    if rt and rt.get("tag"):
+        if rt.get("digest"):
+            # A digest-pinned FROM resolves by digest and ignores the tag, so
+            # bumping the tag wouldn't change the built image. We don't bump it —
+            # but we still resolve the current Airflow version from the tag so
+            # Otto gets a real currentVersion and verify can import against it
+            # (the providers can still move; only the runtime is pinned).
+            plan["runtime"] = {
+                "current_tag": rt["tag"], "current_airflow": airflow_for_tag(rt["tag"]),
+                "target_tag": rt["tag"], "tier": "none", "clamped": False,
+                "image_repo": rt.get("image_repo", ""),
+                "note": "FROM line is digest-pinned (@sha256:...); the Runtime tag is "
+                "not auto-bumped. Remove the digest pin to let the action manage it.",
+            }
+        else:
+            plan["runtime"] = resolve_runtime(rt["tag"], target, max_scope)
+            plan["runtime"]["image_repo"] = rt.get("image_repo", "")
+
+    # The Airflow providers must stay compatible with: the version we're landing
+    # on if the runtime moves, else the current Airflow (provider-only bumps).
+    af_for_providers = None
+    if plan["runtime"]:
+        af_for_providers = (plan["runtime"].get("target_airflow")
+                            or plan["runtime"].get("current_airflow"))
+
+    if include_providers:
+        for p in current.get("providers", []):
+            if not p.get("pinned_version"):
+                # Detection may already carry a reason (e.g. duplicate entries
+                # with conflicting pins); default to the plain unpinned note.
+                entry = {"package": p["package"], "current": None, "target": None,
+                         "tier": "none", "clamped": False,
+                         "note": p.get("note")
+                         or "unpinned; skipped (can only bump exact pins safely)"}
+            else:
+                entry = _provider_latest(p["package"], p["pinned_version"], max_scope,
+                                         af_for_providers)
+            if p.get("spec_name"):
+                # Original requirements.txt spelling — the PR body shows it when
+                # it differs from the normalized package name.
+                entry["spec_name"] = p["spec_name"]
+            plan["providers"].append(entry)
+
+    roll_up(plan)
 
     json.dump(plan, sys.stdout, indent=2)
     sys.stdout.write("\n")

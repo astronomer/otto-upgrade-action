@@ -48,3 +48,21 @@ def test_provider_only_prompt_still_names_skill(tmp_path):
     prompt = _run(tmp_path, plan)
     assert "airflow-upgrade skill" in prompt
     assert "amazon 9.0.0 -> 9.30.0" in (tmp_path / "upgrade-context.md").read_text()
+
+
+def test_prompt_declares_headless_and_fences_followups(tmp_path):
+    # Field finding: without this, Otto records "uv is not installed" and
+    # "no Airflow instance connected, run astro dev restart + af dags errors"
+    # as scary PR checkboxes. Both framings must appear in prompt AND context.
+    plan = {"runtime": {"current_airflow": "3.2.1", "target_airflow": "3.2.2",
+                        "current_tag": "3.2-3", "target_tag": "3.2-5", "tier": "patch"},
+            "providers": []}
+    prompt = _run(tmp_path, plan)
+    context = (tmp_path / "upgrade-context.md").read_text()
+    assert "headless CI" in prompt
+    assert "no Airflow instance" in prompt
+    assert "limitations OUT of manual_followups" in prompt
+    assert "## Environment (headless CI)" in context
+    assert "skip them" in context
+    # Legitimate followups stay: the fence names what IS allowed.
+    assert "platform or" in context and "control-plane steps" in context

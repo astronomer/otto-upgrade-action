@@ -3,6 +3,7 @@
 
 import apply_bump
 import detect_versions as dv
+import pytest
 
 
 def _project(tmp_path, dockerfile: str, requirements: str):
@@ -63,6 +64,110 @@ def test_detect_providers_pins_and_unpinned(tmp_path):
     assert "pandas" not in " ".join(provs)
 
 
+@pytest.mark.parametrize(
+    ("spelling", "expected_pkg"),
+    [
+        ("apache-airflow-providers-common.sql", "apache-airflow-providers-common-sql"),
+        ("apache-airflow-providers-common_sql", "apache-airflow-providers-common-sql"),
+        ("Apache-Airflow-Providers-Common.SQL", "apache-airflow-providers-common-sql"),
+        ("apache_airflow_providers_amazon", "apache-airflow-providers-amazon"),
+    ],
+)
+def test_detect_pep503_equivalent_spellings(tmp_path, spelling, expected_pkg):
+    # pip treats `.`/`_`/`-` and case as identical in package names (PEP 503);
+    # a typo'd spelling must be detected as the provider it actually installs.
+    p = _project(tmp_path, "", f"{spelling}==1.30.2\n")
+    (prov,) = dv.detect_providers(p)
+    assert prov["package"] == expected_pkg
+    assert prov["pinned_version"] == "1.30.2"
+    assert prov["spec_name"] == spelling  # original spelling preserved
+
+
+def test_detect_pep503_typo_with_extras(tmp_path):
+    p = _project(tmp_path, "", "apache-airflow-providers-common.sql[pandas]==1.2.0\n")
+    (prov,) = dv.detect_providers(p)
+    assert prov["package"] == "apache-airflow-providers-common-sql"
+    assert prov["pinned_version"] == "1.2.0"
+
+
+def test_detect_duplicate_spellings_conflicting_pins_skipped(tmp_path):
+    reqs = (
+        "apache-airflow-providers-common.sql==1.30.2\n"
+        "apache-airflow-providers-common-sql==1.32.0\n"
+    )
+    p = _project(tmp_path, "", reqs)
+    (prov,) = dv.detect_providers(p)  # collapsed to one entry
+    assert prov["pinned_version"] is None  # never pick a side
+    assert "conflicting pins" in prov["note"]
+    assert "common.sql" in prov["note"] and "common-sql" in prov["note"]
+
+
+def test_detect_wildcard_pin_treated_as_unpinned(tmp_path):
+    # ==1.2.* is a valid wildcard specifier; splicing a resolved version in
+    # front of the leftover '*' would write an invalid requirement. Skip it.
+    p = _project(tmp_path, "", "apache-airflow-providers-amazon==1.2.*\n")
+    (prov,) = dv.detect_providers(p)
+    assert prov["pinned_version"] is None
+
+
+def test_detect_local_segment_pin_treated_as_unpinned(tmp_path):
+    p = _project(tmp_path, "", "apache-airflow-providers-amazon==1.2.3+local\n")
+    (prov,) = dv.detect_providers(p)
+    assert prov["pinned_version"] is None
+
+
+def test_detect_hash_pinned_line_skipped_with_note(tmp_path):
+    p = _project(tmp_path, "",
+                 "apache-airflow-providers-amazon==9.0.0 --hash=sha256:abc123\n")
+    (prov,) = dv.detect_providers(p)
+    assert prov["pinned_version"] is None
+    assert "hash-pinned" in prov["note"]
+
+
+def test_detect_bom_does_not_hide_first_line(tmp_path):
+    p = _project(tmp_path, "", "﻿apache-airflow-providers-amazon==9.0.0\n")
+    (prov,) = dv.detect_providers(p)
+    assert prov["pinned_version"] == "9.0.0"
+
+
+def test_detect_extras_with_leading_space(tmp_path):
+    # PEP 508 permits whitespace before the extras bracket.
+    p = _project(tmp_path, "", "apache-airflow-providers-amazon [s3fs]==9.0.0\n")
+    (prov,) = dv.detect_providers(p)
+    assert prov["pinned_version"] == "9.0.0"
+
+
+def test_detect_unpinned_plus_pinned_adopts_the_pin(tmp_path):
+    # pip resolves the pair deterministically to the pin — not a conflict.
+    reqs = (
+        "apache-airflow-providers-amazon\n"
+        "apache-airflow-providers-amazon==9.0.0\n"
+    )
+    p = _project(tmp_path, "", reqs)
+    (prov,) = dv.detect_providers(p)
+    assert prov["pinned_version"] == "9.0.0"
+    assert "note" not in prov
+
+
+def test_bump_requirements_wildcard_line_untouched(tmp_path):
+    reqs = "apache-airflow-providers-amazon==1.2.*\n"
+    p = _project(tmp_path, "", reqs)
+    providers = [{"package": "apache-airflow-providers-amazon", "current": "1.2.", "target": "9.0.0"}]
+    assert apply_bump.bump_requirements(p, providers) == []
+    assert (tmp_path / "requirements.txt").read_text() == reqs
+
+
+def test_detect_duplicate_spellings_same_pin_collapsed(tmp_path):
+    reqs = (
+        "apache-airflow-providers-common.sql==1.30.2\n"
+        "apache-airflow-providers-common-sql==1.30.2\n"
+    )
+    p = _project(tmp_path, "", reqs)
+    (prov,) = dv.detect_providers(p)
+    assert prov["pinned_version"] == "1.30.2"
+    assert "note" not in prov
+
+
 # --- patching -------------------------------------------------------------- #
 def test_bump_dockerfile_swaps_only_the_tag(tmp_path):
     p = _project(tmp_path, "FROM astrocrpublic.azurecr.io/runtime:3.1-12\n", "")
@@ -98,3 +203,54 @@ def test_bump_requirements_noop_when_target_equals_current(tmp_path):
     p = _project(tmp_path, "", reqs)
     providers = [{"package": "apache-airflow-providers-amazon", "current": "9.0.0", "target": "9.0.0"}]
     assert apply_bump.bump_requirements(p, providers) == []
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        "apache-airflow-providers-common.sql==1.30.2  # keep me",
+        "apache-airflow-providers-common_sql==1.30.2  # keep me",
+        "Apache-Airflow-Providers-Common.SQL==1.30.2  # keep me",
+        "apache-airflow-providers-common.sql[pandas]==1.30.2  # keep me",
+    ],
+)
+def test_bump_requirements_pep503_spelling_preserved(tmp_path, line):
+    # The plan carries the normalized name; the file keeps the user's spelling —
+    # only the version changes.
+    p = _project(tmp_path, "", line + "\n")
+    providers = [{"package": "apache-airflow-providers-common-sql",
+                  "current": "1.30.2", "target": "1.36.0"}]
+    changed = apply_bump.bump_requirements(p, providers)
+    assert changed == [{"package": "apache-airflow-providers-common-sql",
+                        "from": "1.30.2", "to": "1.36.0"}]
+    assert (tmp_path / "requirements.txt").read_text() == line.replace("1.30.2", "1.36.0") + "\n"
+
+
+def test_bump_requirements_preserves_crlf_line_endings(tmp_path):
+    # A CRLF requirements.txt must not be rewritten wholesale to LF — the bump
+    # is byte-for-byte except the version.
+    (tmp_path / "requirements.txt").write_bytes(
+        b"apache-airflow-providers-amazon==9.0.0\r\npandas\r\n")
+    providers = [{"package": "apache-airflow-providers-amazon", "current": "9.0.0", "target": "9.30.0"}]
+    assert apply_bump.bump_requirements(str(tmp_path), providers) != []
+    raw = (tmp_path / "requirements.txt").read_bytes()
+    assert raw == b"apache-airflow-providers-amazon==9.30.0\r\npandas\r\n"
+
+
+def test_bump_requirements_second_run_reports_nothing(tmp_path):
+    # File-level idempotency also means the summary is empty on a re-run — a
+    # from==to rewrite must not be reported as a change.
+    p = _project(tmp_path, "", "apache-airflow-providers-amazon==9.0.0\n")
+    providers = [{"package": "apache-airflow-providers-amazon", "current": "9.0.0", "target": "9.30.0"}]
+    assert apply_bump.bump_requirements(p, providers) != []
+    assert apply_bump.bump_requirements(p, providers) == []
+
+
+def test_bump_requirements_pep503_no_prefix_false_match(tmp_path):
+    # `common-sql` must not match the `common-sql` prefix of another package,
+    # and `common` must not match inside `common-sql`.
+    reqs = "apache-airflow-providers-common-sql==1.30.2\n"
+    p = _project(tmp_path, "", reqs)
+    providers = [{"package": "apache-airflow-providers-common", "current": "1.0.0", "target": "2.0.0"}]
+    assert apply_bump.bump_requirements(p, providers) == []
+    assert (tmp_path / "requirements.txt").read_text() == reqs

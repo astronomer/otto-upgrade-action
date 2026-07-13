@@ -40,8 +40,8 @@ inputs:
     description: "Also bump pinned 'apache-airflow-providers-*' entries in requirements.txt. Unpinned providers are reported but never changed."
   verify-level:
     required: false
-    default: "import"
-    description: "Post-upgrade verification: 'syntax' (byte-compile DAGs), 'import' (additionally import every DAG against the target Airflow + providers), or 'none'. Verification only ever fails on a genuine code error; env/setup problems report 'skipped'."
+    default: "parse"
+    description: "Post-upgrade verification: 'parse' (default — build the project's Docker image at the target Runtime and run Astro's DAG integrity tests inside it; catches image-build failures and verifies DAGs in the production-faithful environment; needs Docker, falls back to 'import' without it), 'import' (import the discovered DAG + plugin files in a PyPI-built env), 'syntax' (byte-compile only), or 'none'. Verification fails only on a NEW failure the upgrade introduces — failures that already occur at your current versions are reported but don't fail the run; env/setup problems report 'skipped'."
   base-branch:
     required: false
     default: ""
@@ -75,11 +75,11 @@ outputs:
     description: "Resolved target Runtime tag."
     value: ${{ steps.resolve.outputs.target-runtime }}
   overall-scope:
-    description: "Largest tier across the resolved plan: patch, minor, major, or none."
-    value: ${{ steps.resolve.outputs.overall-tier }}
+    description: "Largest tier across the resolved plan (after pin reconciliation): patch, minor, major, or none."
+    value: ${{ steps.reconcile.outputs.overall-tier || steps.resolve.outputs.overall-tier }}
   no-update:
     description: "'true' when nothing is behind and the action no-ops."
-    value: ${{ steps.resolve.outputs.no-update }}
+    value: ${{ steps.reconcile.outputs.no-update || steps.resolve.outputs.no-update }}
   verify-status:
     description: "Verification result: passed, failed, or skipped (skipped when verification didn't run)."
     value: ${{ steps.verify.outputs.status || 'skipped' }}
@@ -189,7 +189,14 @@ runs:
 
     - name: Install Astro CLI
       id: install
-      if: steps.auth.outputs.enabled == 'true'
+      # Needed by the Otto migration step AND by verify-level 'parse' (astro
+      # dev parse builds + tests the image), which runs even in tokenless
+      # dry-runs.
+      if: >-
+        steps.auth.outputs.enabled == 'true' ||
+        (steps.resolve.outputs.author-changes == 'true' &&
+         steps.resolve.outputs.no-update != 'true' &&
+         inputs.verify-level == 'parse')
       uses: astronomer/setup-astro-cli@d8de1c738a79b83c057d185202557c894e33d2f7  # v0.0.1
       with:
         version: ${{ inputs.astro-cli-version }}
@@ -232,8 +239,43 @@ runs:
       if: >-
         steps.resolve.outputs.author-changes == 'true' &&
         steps.resolve.outputs.no-update != 'true' &&
-        (steps.auth.outputs.enabled == 'true' || inputs.verify-level == 'import')
+        (steps.auth.outputs.enabled == 'true' ||
+         inputs.verify-level == 'import' || inputs.verify-level == 'parse')
       uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39  # v8.2.0
+
+    - name: Reconcile provider bumps with project pins
+      id: reconcile
+      # A bumped provider can be unsatisfiable next to the user's own pins.
+      # Walk it back to the newest co-resolving version (plan note explains
+      # which pin blocks the newer one) BEFORE the prompt is built, so Otto and
+      # the PR see the final pin set. Best-effort: without uv this is skipped
+      # and verification remains the backstop. Re-emits the plan aggregates —
+      # a walk-back can shrink the overall tier, and the resolve step's
+      # outputs were captured before reconciliation.
+      if: >-
+        steps.resolve.outputs.author-changes == 'true' &&
+        steps.resolve.outputs.no-update != 'true'
+      shell: bash
+      env:
+        PROJECT_PATH: ${{ inputs.project-path }}
+        PLAN_FILE: /tmp/otto-upgrade/plan.json
+      run: |
+        set -euo pipefail
+        if command -v uv >/dev/null 2>&1; then
+          python3 "$GITHUB_ACTION_PATH/scripts/co_resolve.py" > /tmp/otto-upgrade/co-resolve.json
+          echo "::group::Pin reconciliation"
+          cat /tmp/otto-upgrade/co-resolve.json
+          echo "::endgroup::"
+        else
+          echo "uv unavailable; skipping pin reconciliation (verification will catch conflicts)."
+        fi
+        P=/tmp/otto-upgrade/plan.json
+        {
+          echo "overall-tier=$(jq -r '.overall_tier' "$P")"
+          echo "needs-migration=$(jq -r '.needs_migration' "$P")"
+          echo "no-update=$(jq -r '.no_update' "$P")"
+          echo "author-changes=$(jq -r '.author_changes' "$P")"
+        } >> "$GITHUB_OUTPUT"
 
     - name: Build Otto prompt
       if: steps.auth.outputs.enabled == 'true'
@@ -282,6 +324,7 @@ runs:
         PLAN_FILE: /tmp/otto-upgrade/plan.json
         OTTO_FILE: /tmp/otto-upgrade/result.json
         VERIFY_FILE: /tmp/otto-upgrade/verify-report.md
+        VERIFY_STATUS_FILE: /tmp/otto-upgrade/verify-status.txt
         ACTION_PATH: ${{ github.action_path }}
         WORKDIR: /tmp/otto-upgrade
         BASE_BRANCH: ${{ inputs.base-branch }}
@@ -312,5 +355,5 @@ runs:
       if: steps.verify.outputs.status == 'failed' && inputs.dry-run != 'true'
       shell: bash
       run: |
-        echo "::error::Verification failed at the target version. A PR was opened with the failure flagged; do not merge until it's resolved."
+        echo "::error::Verification found NEW failures at the target version (pre-existing issues alone never fail the run). A PR was opened with the failures flagged; do not merge until they're resolved."
         exit 1

@@ -7,7 +7,7 @@ import json
 import build_pr_body as bpb
 
 
-def _render(tmp_path, monkeypatch, plan, apply, otto=None, verify=None):
+def _render(tmp_path, monkeypatch, plan, apply, otto=None, verify=None, verify_status=None):
     plan_f = tmp_path / "plan.json"
     apply_f = tmp_path / "apply.json"
     plan_f.write_text(json.dumps(plan))
@@ -22,6 +22,10 @@ def _render(tmp_path, monkeypatch, plan, apply, otto=None, verify=None):
         v_f = tmp_path / "verify.md"
         v_f.write_text(verify)
         monkeypatch.setenv("VERIFY_FILE", str(v_f))
+    if verify_status is not None:
+        s_f = tmp_path / "verify-status.txt"
+        s_f.write_text(verify_status + "\n")
+        monkeypatch.setenv("VERIFY_STATUS_FILE", str(s_f))
     buf = io.StringIO()
     with contextlib.redirect_stdout(buf):
         bpb.main()
@@ -102,6 +106,63 @@ def test_verification_is_collapsible_with_status(tmp_path, monkeypatch):
     out_ok = _render(tmp_path, monkeypatch, plan, {"files": []},
                      verify="✅ All 3 DAG file(s) import cleanly.")
     assert "Verification — passed" in out_ok
+
+
+def test_skipped_verification_gets_warning_banner(tmp_path, monkeypatch):
+    # An un-run verification must be as loud as a failed one — in the field the
+    # collapsed "skipped" read as success. This report deliberately does NOT
+    # start with ℹ️ (the emoji sniff misses it); the status file is what counts.
+    plan = {"overall_tier": "minor", "needs_migration": True, "scope_exceeded": False,
+            "advisory": "", "runtime": {"current_tag": "3.1-12", "target_tag": "3.2-5",
+                                        "tier": "minor", "current_airflow": "3.1.0",
+                                        "target_airflow": "3.2.2"}, "providers": []}
+    out = _render(tmp_path, monkeypatch, plan, {"files": []},
+                  verify="Verification disabled (`verify-level: none`).",
+                  verify_status="skipped")
+    assert "> [!WARNING]" in out
+    assert "Verification did not run" in out
+    assert "NOT checked" in out
+    assert "Verification — skipped" in out
+
+
+def test_failed_banner_keyed_on_status_file(tmp_path, monkeypatch):
+    plan = {"overall_tier": "minor", "needs_migration": True, "scope_exceeded": False,
+            "advisory": "", "runtime": {"current_tag": "3.1-12", "target_tag": "3.2-5",
+                                        "tier": "minor", "current_airflow": "3.1.0",
+                                        "target_airflow": "3.2.2"}, "providers": []}
+    out = _render(tmp_path, monkeypatch, plan, {"files": []},
+                  verify="❌ 1 NEW import failure(s) at the target version:\n  - `dags/x.py`: boom",
+                  verify_status="failed")
+    assert "> [!CAUTION]" in out
+    assert "new import failures at the target version" in out
+
+
+def test_passed_verification_gets_no_banner(tmp_path, monkeypatch):
+    plan = {"overall_tier": "minor", "needs_migration": True, "scope_exceeded": False,
+            "advisory": "", "runtime": {"current_tag": "3.1-12", "target_tag": "3.2-5",
+                                        "tier": "minor", "current_airflow": "3.1.0",
+                                        "target_airflow": "3.2.2"}, "providers": []}
+    out = _render(tmp_path, monkeypatch, plan, {"files": []},
+                  verify="✅ No new import failures at the target version (12 file(s) checked).",
+                  verify_status="passed")
+    assert "[!WARNING]" not in out and "[!CAUTION]" not in out
+    assert "Verification — passed" in out
+
+
+def test_intermediate_hold_note_renders_in_table(tmp_path, monkeypatch):
+    # A provider held at an intermediate co-resolving version carries its
+    # explanation (and the raise-this-pin advice) in `note`; the Not-changed
+    # section excludes bumped rows, so the table cell must show it.
+    plan = {"overall_tier": "minor", "needs_migration": True, "scope_exceeded": False,
+            "advisory": "", "runtime": None,
+            "providers": [{"package": "apache-airflow-providers-common-ai",
+                           "current": "0.3.0", "target": "0.4.2", "tier": "minor",
+                           "note": "held at 0.4.2 — newest version that resolves together "
+                                   "with your pins; 0.6.0 conflicts with your "
+                                   "`pydantic-ai-slim[openai]==1.107.0` pin"}]}
+    out = _render(tmp_path, monkeypatch, plan, {"files": []})
+    assert "held at 0.4.2" in out
+    assert "pydantic-ai-slim" in out
 
 
 def test_body_shows_major_advisory(tmp_path, monkeypatch):
