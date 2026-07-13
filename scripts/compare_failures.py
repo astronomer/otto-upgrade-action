@@ -34,6 +34,8 @@ import json
 import re
 import sys
 
+from report_fmt import code_span
+
 _IMPORT_FAMILY = {"ImportError", "ModuleNotFoundError"}
 _QUOTED = re.compile(r"'([^']+)'")
 
@@ -47,13 +49,6 @@ def _import_break_is_new(target: dict, baseline: dict) -> bool:
     names_b = set(_QUOTED.findall(baseline.get("msg", "")))
     # Same class, same quoted names (or none extractable) → same root cause.
     return bool(names_t or names_b) and names_t != names_b
-
-
-def _code(msg: str) -> str:
-    """Render an error message as a code span so `__init__`/`__future__` don't
-    turn into bold on GitHub. Backticks inside the message would break the
-    span, so they are downgraded to quotes first."""
-    return f"`{msg.replace('`', chr(39))}`"
 
 
 def main() -> int:
@@ -93,7 +88,7 @@ def main() -> int:
                 note = (" _(this file also fails this check at your current "
                         "versions, but with a different error — this import "
                         "failure is new)_")
-            lines.append(f"  - `{f['path']}`: {_code(f['msg'])}{note}")
+            lines.append(f"  - `{f['path']}`: {code_span(f['msg'])}{note}")
         lines.append("")
     else:
         lines += [
@@ -114,7 +109,7 @@ def main() -> int:
             note = ""
             if baseline_by_path[f["path"]].get("exc_class") != f.get("exc_class"):
                 note = " _(error changed at the target version)_"
-            lines.append(f"  - `{f['path']}`: {_code(f['msg'])}{note}")
+            lines.append(f"  - `{f['path']}`: {code_span(f['msg'])}{note}")
         lines.append("")
     if fixed:
         lines += [

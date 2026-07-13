@@ -125,21 +125,44 @@ fi
 # integrity suite inside it. This is the production-faithful check: env vars,
 # bundled providers, and the parse harness match a deployment, so a DAG that
 # parses on Astro parses here.
-if [[ "$VERIFY_LEVEL" == "parse" ]]; then
-  parse_prereq=""
-  if ! command -v astro >/dev/null 2>&1; then
-    parse_prereq="the Astro CLI is not available"
-  elif ! docker info >/dev/null 2>&1; then
-    parse_prereq="Docker is not available"
-  fi
-  if [[ -n "$parse_prereq" ]]; then
-    fallback_note="ℹ️ Image-level verification (\`verify-level: parse\`) could not run: ${parse_prereq}. Results below come from the import-level fallback — a PyPI approximation of the Runtime image."
-    echo "::warning::verify-level parse unavailable (${parse_prereq}); falling back to import-level verification."
-    VERIFY_LEVEL="import"
-  fi
-fi
 
-if [[ "$VERIFY_LEVEL" == "parse" ]]; then
+# Strip secrets: the build and the in-image pytest execute repository code.
+run_parse() {
+  ( cd "$1" &&
+    env -u ASTRO_TOKEN -u ASTRO_API_TOKEN -u GH_TOKEN -u GITHUB_TOKEN \
+    timeout 1800 astro dev parse ) > "$2" 2>&1
+}
+
+# Known astro-cli template incompatibility: the generated integrity test
+# calls DagBag(include_examples=False), an argument Airflow >= 3.3 removed —
+# pytest then dies at collection and no DAG gets tested. Patch the throwaway
+# copies only (never the user's tree); the CLI's own current template still
+# carries the bad call, so regeneration can't fix it either.
+shim_integrity_test() {
+  local f="$1/.astro/test_dag_integrity_default.py"
+  if [[ -f "$f" ]]; then
+    sed -i.bak 's/DagBag(include_examples=False)/DagBag()/' "$f" && rm -f "$f.bak"
+  fi
+}
+
+# The whole image-level flow. Every genuine verdict (pass, new failures, image
+# build failure) sets status/report and exits the script. A harness-level miss
+# — no Astro CLI or Docker, the integrity test incompatible with the target,
+# a parse that never completed — sets fallback_note and returns 1, and the
+# caller's single demotion site drops to the import level.
+verify_parse_level() {
+  local prereq=""
+  if ! command -v astro >/dev/null 2>&1; then
+    prereq="the Astro CLI is not available"
+  elif ! docker info >/dev/null 2>&1; then
+    prereq="Docker is not available"
+  fi
+  if [[ -n "$prereq" ]]; then
+    fallback_note="ℹ️ Image-level verification (\`verify-level: parse\`) could not run: ${prereq}. Results below come from the import-level fallback — a PyPI approximation of the Runtime image."
+    echo "::warning::verify-level parse unavailable (${prereq}); falling back to import-level verification."
+    return 1
+  fi
+
   tgt_tag=$(jq -r '.runtime.target_tag // empty' "$PLAN_FILE")
 
   # Parse runs on a COPY: the build and any astro-generated files must never
@@ -147,27 +170,11 @@ if [[ "$VERIFY_LEVEL" == "parse" ]]; then
   parse_target_dir="$WORKDIR/parse-target"
   rm -rf "$parse_target_dir"
   mkdir -p "$parse_target_dir"
-  rsync -a --exclude .git "$PROJECT_PATH/" "$parse_target_dir/"
-
-  # Strip secrets: the build and the in-image pytest execute repository code.
-  run_parse() {
-    ( cd "$1" &&
-      env -u ASTRO_TOKEN -u ASTRO_API_TOKEN -u GH_TOKEN -u GITHUB_TOKEN \
-      timeout 1800 astro dev parse ) > "$2" 2>&1
-  }
-
-  # Known astro-cli template incompatibility: the generated integrity test
-  # calls DagBag(include_examples=False), an argument Airflow >= 3.3 removed —
-  # pytest then dies at collection and no DAG gets tested. Patch the throwaway
-  # copies only (never the user's tree); the CLI's own current template still
-  # carries the bad call, so regeneration can't fix it either.
-  shim_integrity_test() {
-    local f="$1/.astro/test_dag_integrity_default.py"
-    if [[ -f "$f" ]]; then
-      sed -i.bak 's/DagBag(include_examples=False)/DagBag()/' "$f" && rm -f "$f.bak"
-    fi
-  }
-
+  if ! rsync -a --exclude .git "$PROJECT_PATH/" "$parse_target_dir/"; then
+    fallback_note="ℹ️ Image-level verification could not run (the project copy failed). Results below come from the import-level fallback."
+    echo "::warning::verify-level parse: project copy failed; falling back to import-level verification."
+    return 1
+  fi
   shim_integrity_test "$parse_target_dir"
 
   echo "::group::Image parse (target Runtime ${tgt_tag:-per project Dockerfile})"
@@ -189,17 +196,14 @@ if [[ "$VERIFY_LEVEL" == "parse" ]]; then
     cause=$(jq -r '.collection_error // empty' "$WORKDIR/import-failures.json" 2>/dev/null)
     fallback_note="ℹ️ Image-level verification could not run: the project's \`.astro/test_dag_integrity_default.py\` fails to start at the target Airflow${cause:+ (\`${cause}\`)}. Regenerate it with an updated Astro CLI (\`astro dev init\`). Results below come from the import-level fallback."
     echo "::warning::verify-level parse: the project's DAG integrity test is incompatible with the target Airflow; falling back to import-level verification."
-    VERIFY_LEVEL="import"
+    return 1
   elif [[ "$target_rc" -eq 2 ]]; then
-    reason="produced no recognizable result"
+    local reason="produced no recognizable result"
     [[ "$target_run_rc" -eq 124 ]] && reason="timed out before completing"
     fallback_note="ℹ️ Image-level verification could not run (\`astro dev parse\` ${reason}). Results below come from the import-level fallback."
     echo "::warning::verify-level parse: astro dev parse ${reason}; falling back to import-level verification."
-    VERIFY_LEVEL="import"
+    return 1
   fi
-fi
-
-if [[ "$VERIFY_LEVEL" == "parse" ]]; then
 
   if [[ "$target_rc" -eq 0 ]]; then
     status="passed"
@@ -296,6 +300,12 @@ if [[ "$VERIFY_LEVEL" == "parse" ]]; then
     } > "$report"
   fi
   exit 0
+}
+
+if [[ "$VERIFY_LEVEL" == "parse" ]] && ! verify_parse_level; then
+  # The single demotion site: every parse-level fallback path lands here with
+  # fallback_note already explaining why (emit() leads the report with it).
+  VERIFY_LEVEL="import"
 fi
 
 # --- import (target Airflow + the project's full deps) --------------------- #

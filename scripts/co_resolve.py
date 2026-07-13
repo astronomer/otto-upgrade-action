@@ -83,14 +83,10 @@ def in_scope_versions(package: str, above: str, below: str) -> list[str]:
         data = rt._http_json(f"{rt.PYPI_BASE_URL}/{package}/json")  # noqa: SLF001
     except Exception:  # noqa: BLE001 — no candidates just means "hold at current"
         return []
-    pool = []
-    for ver, files in data.get("releases", {}).items():
-        if rt.is_prerelease(ver):
-            continue
-        if not files or all(f.get("yanked") for f in files):
-            continue
-        if rt.version_tuple(above) < rt.version_tuple(ver) < rt.version_tuple(below):
-            pool.append(ver)
+    pool = [
+        ver for ver in rt.stable_release_versions(data.get("releases", {}))
+        if rt.version_tuple(above) < rt.version_tuple(ver) < rt.version_tuple(below)
+    ]
     return sorted(pool, key=rt.version_tuple, reverse=True)
 
 

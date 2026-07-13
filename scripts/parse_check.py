@@ -29,6 +29,8 @@ import os
 import re
 import sys
 
+from report_fmt import failure
+
 BUILD_MARKER = "an error was encountered while building the image"
 _COLLECTED = re.compile(r"^collected (\d+) items?")
 # pytest's closing summary line — its presence is the evidence the run FINISHED.
@@ -81,21 +83,14 @@ def parse_output(text: str) -> tuple[int, dict]:
             i += 1
         msg = block[-1] if block else "failed to import (see the CI log for the traceback)"
         cm = _EXC_CLASS.match(msg)
-        failures[path] = {
-            "path": path,
-            "exc_class": cm.group(1).rsplit(".", 1)[-1] if cm else "",
-            "msg": msg,
-        }
+        failures[path] = failure(path, cm.group(1).rsplit(".", 1)[-1] if cm else "", msg)
     # The short-summary FAILED lines are the authoritative list of failing
     # files; make sure each has an entry even if its E-block wasn't matched.
     for line in lines:
         m = _FAILED_LINE.match(line.strip())
         if m and m.group("path") not in failures:
-            failures[m.group("path")] = {
-                "path": m.group("path"),
-                "exc_class": "",
-                "msg": "failed to import (see the CI log for the traceback)",
-            }
+            failures[m.group("path")] = failure(
+                m.group("path"), "", "failed to import (see the CI log for the traceback)")
 
     # A verdict requires evidence the run COMPLETED, not merely started:
     # the astro clean marker or pytest's closing summary line. "collected N

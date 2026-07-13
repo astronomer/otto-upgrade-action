@@ -55,6 +55,8 @@ import re
 import sys
 import traceback
 
+from report_fmt import code_span, failure
+
 
 def might_contain_dag(path: str) -> bool:
     """Airflow's safe-mode discovery heuristic (Airflow 3 form)."""
@@ -122,7 +124,7 @@ def _import_one(project_root: str, path: str) -> dict | None:
         return None
     except Exception as exc:  # noqa: BLE001 — any import-time error is the signal
         msg = traceback.format_exc().strip().splitlines()[-1]
-        return {"path": rel, "exc_class": type(exc).__name__, "msg": msg}
+        return failure(rel, type(exc).__name__, msg)
     finally:
         # Drop project-local modules this file pulled in, so one file's import
         # state can't mask or cause another file's failure. Third-party modules
@@ -173,9 +175,7 @@ def main(argv: list[str] | None = None) -> int:
 
     if failures:
         lines = [f"❌ {len(failures)} of {count} DAG file(s) failed to import at the target version:", ""]
-        # Code-span the message so `__init__`/`__future__` don't render as bold
-        # on GitHub; inner backticks are downgraded so they can't break the span.
-        lines += [f"  - `{f['path']}`: `{f['msg'].replace(chr(96), chr(39))}`" for f in failures]
+        lines += [f"  - `{f['path']}`: {code_span(f['msg'])}" for f in failures]
         rc = 3
     else:
         lines = [f"✅ All {count} DAG file(s) import cleanly at the target version."]

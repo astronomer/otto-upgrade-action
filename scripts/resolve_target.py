@@ -82,6 +82,20 @@ def is_prerelease(v: str) -> bool:
     return bool(_PRERELEASE.search(v.split("+", 1)[0]))
 
 
+def stable_release_versions(releases: dict) -> list[str]:
+    """Installable stable versions from a PyPI ``releases`` mapping.
+
+    The single definition of "installable": not a prerelease, and at least one
+    non-yanked artifact. Used for target selection here and for the
+    conflict walk in co_resolve.py — the two must never disagree about which
+    versions exist.
+    """
+    return [
+        ver for ver, files in releases.items()
+        if not is_prerelease(ver) and files and not all(f.get("yanked") for f in files)
+    ]
+
+
 def tier_between(cur: str, tgt: str) -> str:
     """patch / minor / major between two Airflow (or semver) versions."""
     c = (version_tuple(cur) + (0, 0, 0))[:3]
@@ -341,15 +355,7 @@ def _provider_latest(package: str, cur: str, max_scope: str,
         return {"package": package, "current": cur, "target": cur, "tier": "none",
                 "clamped": False, "note": f"PyPI lookup failed: {exc}"}
 
-    releases = data.get("releases", {})
-    stable = []
-    for ver, files in releases.items():
-        if is_prerelease(ver):
-            continue
-        # No artifacts, or every artifact yanked -> not installable; skip.
-        if not files or all(f.get("yanked") for f in files):
-            continue
-        stable.append(ver)
+    stable = stable_release_versions(data.get("releases", {}))
     if not stable:
         return {"package": package, "current": cur, "target": cur, "tier": "none",
                 "clamped": False, "note": "no stable releases found"}
