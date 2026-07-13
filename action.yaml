@@ -243,6 +243,30 @@ runs:
          inputs.verify-level == 'import' || inputs.verify-level == 'parse')
       uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39  # v8.2.0
 
+    - name: Reconcile provider bumps with project pins
+      # A bumped provider can be unsatisfiable next to the user's own pins.
+      # Walk it back to the newest co-resolving version (plan note explains
+      # which pin blocks the newer one) BEFORE the prompt is built, so Otto and
+      # the PR see the final pin set. Best-effort: without uv this is skipped
+      # and verification remains the backstop.
+      if: >-
+        steps.resolve.outputs.author-changes == 'true' &&
+        steps.resolve.outputs.no-update != 'true'
+      shell: bash
+      env:
+        PROJECT_PATH: ${{ inputs.project-path }}
+        PLAN_FILE: /tmp/otto-upgrade/plan.json
+      run: |
+        set -euo pipefail
+        if ! command -v uv >/dev/null 2>&1; then
+          echo "uv unavailable; skipping pin reconciliation (verification will catch conflicts)."
+          exit 0
+        fi
+        python3 "$GITHUB_ACTION_PATH/scripts/co_resolve.py" > /tmp/otto-upgrade/co-resolve.json
+        echo "::group::Pin reconciliation"
+        cat /tmp/otto-upgrade/co-resolve.json
+        echo "::endgroup::"
+
     - name: Build Otto prompt
       if: steps.auth.outputs.enabled == 'true'
       shell: bash

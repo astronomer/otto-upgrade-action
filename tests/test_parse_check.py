@@ -88,6 +88,29 @@ def test_build_failure_detected(tmp_path):
     assert result["failures"] == []
 
 
+COLLECTION_ERROR_RUN = """\
+Checking your DAGs for errors…
+============================= test session starts ==============================
+collected 0 items / 1 error
+==================================== ERRORS ====================================
+.astro/test_dag_integrity_default.py:106: in get_import_errors
+=========================== short test summary info ============================
+ERROR .astro/test_dag_integrity_default.py - TypeError: DagBag.__init__() got an unexpected keyword argument
+!!!!!!!!!!!!!!!!!!!! Interrupted: 1 error during collection !!!!!!!!!!!!!!!!!!!!
+========================= 2 warnings, 1 error in 1.83s =========================
+Error: something went wrong while parsing your DAGs: failed to execute cmd: exit status 2
+"""
+
+
+def test_collection_error_detected_with_cause(tmp_path):
+    # The repo's committed integrity test can be incompatible with the target
+    # Airflow (real case: DagBag signature change in 3.3). The DAGs were never
+    # tested — this must not read as pass, fail, OR unrecognized.
+    rc, result, *_ = _run(tmp_path, COLLECTION_ERROR_RUN)
+    assert rc == 5
+    assert "DagBag.__init__()" in result["collection_error"]
+
+
 def test_unrecognized_output_is_infra(tmp_path):
     rc, result, *_ = _run(tmp_path, "docker daemon not running\n")
     assert rc == 2

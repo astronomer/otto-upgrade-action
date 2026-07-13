@@ -156,6 +156,20 @@ if [[ "$VERIFY_LEVEL" == "parse" ]]; then
       timeout 1800 astro dev parse ) > "$2" 2>&1
   }
 
+  # Known astro-cli template incompatibility: the generated integrity test
+  # calls DagBag(include_examples=False), an argument Airflow >= 3.3 removed —
+  # pytest then dies at collection and no DAG gets tested. Patch the throwaway
+  # copies only (never the user's tree); the CLI's own current template still
+  # carries the bad call, so regeneration can't fix it either.
+  shim_integrity_test() {
+    local f="$1/.astro/test_dag_integrity_default.py"
+    if [[ -f "$f" ]]; then
+      sed -i.bak 's/DagBag(include_examples=False)/DagBag()/' "$f" && rm -f "$f.bak"
+    fi
+  }
+
+  shim_integrity_test "$parse_target_dir"
+
   echo "::group::Image parse (target Runtime ${tgt_tag:-per project Dockerfile})"
   set +e
   run_parse "$parse_target_dir" "$WORKDIR/parse-target.log"
@@ -180,6 +194,19 @@ if [[ "$VERIFY_LEVEL" == "parse" ]]; then
     exit 0
   fi
 
+  if [[ "$target_rc" -eq 5 ]]; then
+    # The integrity test itself is incompatible with the target Airflow (a
+    # cause the shim above didn't cover) — the DAGs were never tested in the
+    # image. Degrade to the import-level check rather than reporting nothing.
+    cause=$(jq -r '.collection_error // empty' "$WORKDIR/import-failures.json" 2>/dev/null)
+    fallback_note="ℹ️ Image-level verification could not run: the project's \`.astro/test_dag_integrity_default.py\` fails to start at the target Airflow${cause:+ (\`${cause}\`)}. Regenerate it with an updated Astro CLI (\`astro dev init\`). Results below come from the import-level fallback."
+    echo "::warning::verify-level parse: the project's DAG integrity test is incompatible with the target Airflow; falling back to import-level verification."
+    VERIFY_LEVEL="import"
+  fi
+fi
+
+if [[ "$VERIFY_LEVEL" == "parse" ]]; then
+
   if [[ "$target_rc" -eq 0 ]]; then
     status="passed"
     checked=$(jq -r '.checked' "$WORKDIR/import-failures.json")
@@ -193,6 +220,7 @@ if [[ "$VERIFY_LEVEL" == "parse" ]]; then
   baseline_made=$?
   baseline_rc=""
   if [[ "$baseline_made" -eq 0 ]]; then
+    shim_integrity_test "$baseline_dir"
     echo "::group::Image parse (baseline: current Runtime)"
     run_parse "$baseline_dir" "$WORKDIR/parse-baseline.log"
     IMPORT_JSON="$WORKDIR/baseline-failures.json" \
