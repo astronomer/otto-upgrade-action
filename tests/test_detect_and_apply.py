@@ -226,6 +226,17 @@ def test_bump_requirements_pep503_spelling_preserved(tmp_path, line):
     assert (tmp_path / "requirements.txt").read_text() == line.replace("1.30.2", "1.36.0") + "\n"
 
 
+def test_bump_requirements_preserves_crlf_line_endings(tmp_path):
+    # A CRLF requirements.txt must not be rewritten wholesale to LF — the bump
+    # is byte-for-byte except the version.
+    (tmp_path / "requirements.txt").write_bytes(
+        b"apache-airflow-providers-amazon==9.0.0\r\npandas\r\n")
+    providers = [{"package": "apache-airflow-providers-amazon", "current": "9.0.0", "target": "9.30.0"}]
+    assert apply_bump.bump_requirements(str(tmp_path), providers) != []
+    raw = (tmp_path / "requirements.txt").read_bytes()
+    assert raw == b"apache-airflow-providers-amazon==9.30.0\r\npandas\r\n"
+
+
 def test_bump_requirements_second_run_reports_nothing(tmp_path):
     # File-level idempotency also means the summary is empty on a re-run — a
     # from==to rewrite must not be reported as a change.

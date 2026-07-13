@@ -116,6 +116,16 @@ def test_unrecognized_output_is_infra(tmp_path):
     assert rc == 2
 
 
+def test_long_run_summary_with_hms_suffix_is_recognized(tmp_path):
+    # pytest switches the summary duration format at 60s: "in 62.50s (0:01:02)".
+    # Missing that form silently disabled parse-level verdicts for any project
+    # whose in-image suite runs over a minute.
+    text = FAILING_RUN.replace("in 17.71s", "in 62.50s (0:01:02)")
+    rc, result, *_ = _run(tmp_path, text)
+    assert rc == 3
+    assert result["failures"][0]["path"] == "dags/format_probe.py"
+
+
 def test_timeout_truncated_run_is_not_a_verdict(tmp_path):
     # A `timeout` kill mid-pytest leaves "collected N items" and progress dots
     # but no closing summary. That must never read as a pass — it's what a

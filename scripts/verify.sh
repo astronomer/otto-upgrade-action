@@ -127,9 +127,13 @@ fi
 # parses on Astro parses here.
 
 # Strip secrets: the build and the in-image pytest execute repository code.
+# NO_COLOR/PY_COLORS: a runner exporting FORCE_COLOR would make the in-image
+# pytest emit ANSI codes that defeat parse_check's line-anchored patterns —
+# the one path where scraping could mis-read a completed run.
 run_parse() {
   ( cd "$1" &&
     env -u ASTRO_TOKEN -u ASTRO_API_TOKEN -u GH_TOKEN -u GITHUB_TOKEN \
+    NO_COLOR=1 PY_COLORS=0 FORCE_COLOR=0 \
     timeout 1800 astro dev parse ) > "$2" 2>&1
 }
 
@@ -141,7 +145,12 @@ run_parse() {
 shim_integrity_test() {
   local f="$1/.astro/test_dag_integrity_default.py"
   if [[ -f "$f" ]]; then
-    sed -i.bak 's/DagBag(include_examples=False)/DagBag()/' "$f" && rm -f "$f.bak"
+    # Tolerate whitespace and additional kwargs; a template reflow must not
+    # silently no-op the shim.
+    sed -i.bak -E 's/DagBag\(\s*include_examples\s*=\s*False\s*,?\s*/DagBag(/' "$f" && rm -f "$f.bak"
+    if grep -qE 'include_examples\s*=\s*False' "$f"; then
+      echo "::warning::integrity-test shim did not take effect (template shape changed?); a collection failure at Airflow >= 3.3 will fall back to import-level verification."
+    fi
   fi
 }
 

@@ -71,7 +71,10 @@ def bump_requirements(project_path: str, providers: list[dict]) -> list[dict]:
         )
         for pkg in targets
     }
-    with open(path, encoding="utf-8") as fh:
+    # newline="" preserves the file's own line endings — universal-newline mode
+    # would rewrite a CRLF requirements.txt entirely to LF, turning a one-pin
+    # bump into a whole-file diff (this module's contract is byte-for-byte).
+    with open(path, encoding="utf-8", newline="") as fh:
         lines = fh.readlines()
     for i, raw in enumerate(lines):
         code = raw.split("#", 1)[0]
@@ -88,7 +91,7 @@ def bump_requirements(project_path: str, providers: list[dict]) -> list[dict]:
                 lines[i] += "\n"
             changed.append({"package": pkg, "from": m.group("ver"), "to": target})
     if changed:
-        with open(path, "w", encoding="utf-8") as fh:
+        with open(path, "w", encoding="utf-8", newline="") as fh:
             fh.writelines(lines)
     return changed
 

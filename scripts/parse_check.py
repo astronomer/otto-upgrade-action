@@ -36,7 +36,13 @@ _COLLECTED = re.compile(r"^collected (\d+) items?")
 # pytest's closing summary line — its presence is the evidence the run FINISHED.
 # A timeout kill mid-run leaves "collected N items" with no summary; that must
 # never read as a verdict (a green "all N import cleanly" over untested DAGs).
-_SUMMARY = re.compile(r"^=+ .*\b(passed|failed|error|no tests ran)\b.* in [0-9.]+s? =+", re.MULTILINE)
+# Runs >= 60s append "(H:MM:SS)" after the seconds (pytest's
+# format_session_duration), so the duration suffix is optional and nothing is
+# anchored after it.
+_SUMMARY = re.compile(
+    r"^=+ .*\b(passed|failed|error|no tests ran)\b.* in [0-9.]+s(?: \([0-9:]+\))?",
+    re.MULTILINE,
+)
 _FAILED_LINE = re.compile(r"^FAILED .*::test_file_imports\[(?P<path>[^\]]+)\]")
 _EXC_HEAD = re.compile(r"^E\s+Exception: (?P<path>\S+) failed to import with message")
 _EXC_CLASS = re.compile(r"^([A-Za-z_][A-Za-z0-9_.]*(?:Error|Exception|Warning))\b")

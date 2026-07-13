@@ -37,7 +37,9 @@ import sys
 from report_fmt import code_span
 
 _IMPORT_FAMILY = {"ImportError", "ModuleNotFoundError"}
-_QUOTED = re.compile(r"'([^']+)'")
+# CPython quotes symbols with single quotes, but don't bet escalation on it —
+# accept double quotes and backticks too (matched pairs via the backreference).
+_QUOTED = re.compile(r"""(['"`])([^'"`]+)\1""")
 
 
 def _import_break_is_new(target: dict, baseline: dict) -> bool:
@@ -45,8 +47,8 @@ def _import_break_is_new(target: dict, baseline: dict) -> bool:
         return False
     if baseline.get("exc_class") != target.get("exc_class"):
         return True
-    names_t = set(_QUOTED.findall(target.get("msg", "")))
-    names_b = set(_QUOTED.findall(baseline.get("msg", "")))
+    names_t = {m.group(2) for m in _QUOTED.finditer(target.get("msg", ""))}
+    names_b = {m.group(2) for m in _QUOTED.finditer(baseline.get("msg", ""))}
     # Same class, same quoted names (or none extractable) → same root cause.
     return bool(names_t or names_b) and names_t != names_b
 

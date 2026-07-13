@@ -119,9 +119,11 @@ def main() -> int:
                          if p["package"] not in exhausted
                          and f"{p['package']}=={live[p['package']]}" in err), None)
         if offender is None:
+            # Word-boundary match: a bare substring would let `...common-ai`
+            # claim an error that actually names `...common-ai-foo`.
             offender = next((p for p in bumped
                              if p["package"] not in exhausted
-                             and p["package"] in err
+                             and re.search(rf"{re.escape(p['package'])}(?![\w.-])", err)
                              and live[p["package"]] != p["current"]), None)
         if offender is None:
             break  # not attributable to a bump we made — verification's problem

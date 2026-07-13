@@ -91,6 +91,14 @@ def test_same_class_same_symbol_with_path_noise_stays_preexisting(tmp_path):
     assert "pre-existing" in r.stdout
 
 
+def test_double_quoted_symbols_still_compared(tmp_path):
+    # Symbol extraction must not depend on CPython's single-quote convention.
+    r = _run(tmp_path,
+             [_fail("dags/etl.py", "ImportError", 'ImportError: cannot import name "Bar"')],
+             [_fail("dags/etl.py", "ImportError", 'ImportError: cannot import name "Foo"')])
+    assert r.returncode == 3
+
+
 def test_attribute_error_change_stays_preexisting(tmp_path):
     # AttributeError is overwhelmingly env-dependent parse-time breakage, not
     # a moved-import signal — escalating it re-reds the both-sides-broken
