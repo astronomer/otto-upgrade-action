@@ -297,18 +297,32 @@ the safe cadence: **`patch` + `patch`**.
 
 The `verify-level` input controls the post-upgrade check:
 
-- `syntax` — byte-compile every DAG (fast, no network).
-- `import` (default) — additionally import the discovered DAG and plugin files inside an ephemeral env built
-  from your project's (bumped) `requirements.txt` plus the target Airflow. Catches
-  the failure mode upgrades actually cause: a moved/removed import or renamed call site.
+- `syntax` — byte-compile every Python file under `dags/`, `include/`, and
+  `plugins/` (fast, no network).
+- `import` (default) — additionally import the files Airflow would actually
+  discover — DAG files under `dags/` that pass Airflow's safe-mode heuristic
+  (honoring `.airflowignore`) plus plugin modules under `plugins/` — inside an
+  ephemeral env built from your project's (bumped) `requirements.txt` plus the
+  target Airflow. `include/` is byte-compiled but never imported directly,
+  exactly like production. Catches the failure mode upgrades actually cause: a
+  moved/removed import or renamed call site.
 - `none` — skip.
 
 At `import`, the action provisions `uv` itself (you don't need a separate setup
-step). Verification only ever reports **failed** on a genuine code error — a real
-DAG import error. If the target env can't be provisioned (no network, resolver
-cutoff, timeout) it reports **skipped**, so infra flakiness never masquerades as a
-broken upgrade. The DAG-import subprocess runs with the Astro and GitHub tokens
-stripped from its environment.
+step). Verification reports **failed** only when the upgrade introduces a
+**new** import failure — one that doesn't already occur at your current
+versions. When a DAG fails at the target, the action re-runs the same check at
+your current versions (a git worktree of the pre-upgrade state); a DAG that
+already fails the check for an unrelated, usually environment-dependent reason
+(a parse-time connection lookup, a missing dbt profile, a metadata-DB read) is
+listed as **pre-existing** and does **not** fail the run. Pre-existing entries
+describe this check's CI environment, not your production — an env-dependent
+DAG can parse perfectly on your deployment and still be unparseable in a bare
+harness. If the target env can't be provisioned (no network, resolver cutoff,
+timeout) it reports **skipped** — loudly, with a warning banner on the PR — so
+infra flakiness never masquerades as a broken upgrade and an un-run
+verification never reads as success. The DAG-import subprocesses run with the
+Astro and GitHub tokens stripped from their environment.
 
 ## The rolling PR
 

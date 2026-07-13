@@ -71,8 +71,9 @@ def main() -> int:
         for f in new:
             note = ""
             if f.get("escalated"):
-                note = (" _(this file also fails at your current versions, but "
-                        "with a non-import error — the import failure is new)_")
+                note = (" _(this file also fails this check at your current "
+                        "versions, but with a non-import error — the import "
+                        "failure is new)_")
             lines.append(f"  - `{f['path']}`: {_code(f['msg'])}{note}")
         lines.append("")
     else:
@@ -83,8 +84,11 @@ def main() -> int:
         ]
     if pre:
         lines += [
-            f"⚠️ {len(pre)} pre-existing import issue(s) — these fail at your "
-            "current versions too and are not caused by this upgrade:",
+            f"⚠️ {len(pre)} pre-existing import issue(s) — these fail **in this "
+            "check's environment** at your current versions too, so they are not "
+            "caused by this upgrade. This is usually an environment-dependent DAG "
+            "(one that needs runtime variables, connections, or a metadata DB to "
+            "parse), not a broken DAG:",
             "",
         ]
         for f in pre:
