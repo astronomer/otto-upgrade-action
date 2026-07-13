@@ -40,8 +40,8 @@ inputs:
     description: "Also bump pinned 'apache-airflow-providers-*' entries in requirements.txt. Unpinned providers are reported but never changed."
   verify-level:
     required: false
-    default: "import"
-    description: "Post-upgrade verification: 'syntax' (byte-compile the project's Python files), 'import' (additionally import the discovered DAG + plugin files against the target Airflow + providers), or 'none'. 'import' fails only on a NEW import failure the upgrade introduces — failures that already occur at your current versions are reported but don't fail the run; env/setup problems report 'skipped'."
+    default: "parse"
+    description: "Post-upgrade verification: 'parse' (default — build the project's Docker image at the target Runtime and run Astro's DAG integrity tests inside it; catches image-build failures and verifies DAGs in the production-faithful environment; needs Docker, falls back to 'import' without it), 'import' (import the discovered DAG + plugin files in a PyPI-built env), 'syntax' (byte-compile only), or 'none'. Verification fails only on a NEW failure the upgrade introduces — failures that already occur at your current versions are reported but don't fail the run; env/setup problems report 'skipped'."
   base-branch:
     required: false
     default: ""
@@ -189,7 +189,14 @@ runs:
 
     - name: Install Astro CLI
       id: install
-      if: steps.auth.outputs.enabled == 'true'
+      # Needed by the Otto migration step AND by verify-level 'parse' (astro
+      # dev parse builds + tests the image), which runs even in tokenless
+      # dry-runs.
+      if: >-
+        steps.auth.outputs.enabled == 'true' ||
+        (steps.resolve.outputs.author-changes == 'true' &&
+         steps.resolve.outputs.no-update != 'true' &&
+         inputs.verify-level == 'parse')
       uses: astronomer/setup-astro-cli@d8de1c738a79b83c057d185202557c894e33d2f7  # v0.0.1
       with:
         version: ${{ inputs.astro-cli-version }}
@@ -232,7 +239,8 @@ runs:
       if: >-
         steps.resolve.outputs.author-changes == 'true' &&
         steps.resolve.outputs.no-update != 'true' &&
-        (steps.auth.outputs.enabled == 'true' || inputs.verify-level == 'import')
+        (steps.auth.outputs.enabled == 'true' ||
+         inputs.verify-level == 'import' || inputs.verify-level == 'parse')
       uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39  # v8.2.0
 
     - name: Build Otto prompt

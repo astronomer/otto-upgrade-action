@@ -273,8 +273,8 @@ running it on a schedule instead of remembering to check.
   Runtime tag and providers first.
 - **Airflow major migrations (2→3)** — advisory-only here; use the guided upgrade
   (`astro otto`) and review breaking changes interactively.
-- **Repos with untrusted DAG authors** — `verify-level: import` runs repo code to
-  import it; prefer `verify-level: syntax` there.
+- **Repos with untrusted DAG authors** — `verify-level: parse` and `import` run
+  repo code to verify it; prefer `verify-level: syntax` there.
 - **You merge slowly and dislike a long-lived PR updating under you** — the rolling
   PR advances to newer targets over time. Merge promptly, or pin `target: patch`
   to keep it on the calmest cadence.
@@ -297,32 +297,42 @@ the safe cadence: **`patch` + `patch`**.
 
 The `verify-level` input controls the post-upgrade check:
 
+- `parse` (default) — build the project's Docker image at the **target
+  Runtime** (with your bumped `requirements.txt`) and run Astro's DAG
+  integrity tests inside it, exactly as `astro dev parse` does. This is the
+  production-faithful check: dependency resolution happens against the
+  image's constraints and bundled packages (a pin that resolves on PyPI can
+  still be unsatisfiable in the image — that surfaces here as a **failed**
+  build, before you merge), and DAGs parse with the environment a deployment
+  actually provides (`AIRFLOW_HOME`, bundled providers, a metadata DB), so a
+  DAG that parses on Astro parses here. Needs Docker; without it the action
+  falls back to `import` and says so on the PR. To exempt a known-unparseable
+  DAG, list it in `.astro/dag_integrity_exceptions.txt`.
+- `import` — import the files Airflow would discover — DAG files under
+  `dags/` passing Airflow's safe-mode heuristic (honoring `.airflowignore`)
+  plus plugin modules under `plugins/` — inside an ephemeral `uv` env built
+  from your (bumped) `requirements.txt` plus the target Airflow from PyPI.
+  Faster and Docker-free, but an approximation of the image.
 - `syntax` — byte-compile every Python file under `dags/`, `include/`, and
   `plugins/` (fast, no network).
-- `import` (default) — additionally import the files Airflow would actually
-  discover — DAG files under `dags/` that pass Airflow's safe-mode heuristic
-  (honoring `.airflowignore`) plus plugin modules under `plugins/` — inside an
-  ephemeral env built from your project's (bumped) `requirements.txt` plus the
-  target Airflow. `include/` is byte-compiled but never imported directly,
-  exactly like production. Catches the failure mode upgrades actually cause: a
-  moved/removed import or renamed call site.
 - `none` — skip.
 
-At `import`, the action provisions `uv` itself (you don't need a separate setup
-step). Verification reports **failed** only when the upgrade introduces a
-**new** import failure — one that doesn't already occur at your current
-versions. When a DAG fails at the target, the action re-runs the same check at
-your current versions (a git worktree of the pre-upgrade state); a DAG that
-already fails the check for an unrelated, usually environment-dependent reason
-(a parse-time connection lookup, a missing dbt profile, a metadata-DB read) is
-listed as **pre-existing** and does **not** fail the run. Pre-existing entries
-describe this check's CI environment, not your production — an env-dependent
-DAG can parse perfectly on your deployment and still be unparseable in a bare
-harness. If the target env can't be provisioned (no network, resolver cutoff,
-timeout) it reports **skipped** — loudly, with a warning banner on the PR — so
-infra flakiness never masquerades as a broken upgrade and an un-run
-verification never reads as success. The DAG-import subprocesses run with the
-Astro and GitHub tokens stripped from their environment.
+The action provisions `uv` and the Astro CLI itself (you don't need separate
+setup steps). Verification reports **failed** only when the upgrade introduces
+a **new** failure — one that doesn't already occur at your current versions.
+When the target check fails, the action re-runs the same check at your current
+versions (a git worktree of the pre-upgrade state, built at your current
+image); anything failing on both sides is listed as **pre-existing** and does
+**not** fail the run. At `import` level, pre-existing entries describe the
+check's CI environment, not your production — an env-dependent DAG can parse
+perfectly on your deployment and still be unparseable in a bare harness (at
+`parse` level this class largely disappears, because the image provides the
+real environment). If the check itself can't run (no Docker, no network,
+resolver cutoff, timeout) it reports **skipped** — loudly, with a warning
+banner on the PR — so infra flakiness never masquerades as a broken upgrade
+and an un-run verification never reads as success. Everything that executes
+repository code runs with the Astro and GitHub tokens stripped from its
+environment.
 
 ## The rolling PR
 
@@ -344,7 +354,7 @@ don't race the branch.
 | `target` | `latest-minor` | `patch`, `latest-minor`, or `latest`. |
 | `max-upgrade-scope` | `minor` | `patch`, `minor`, or `major`. Airflow majors stay advisory-only regardless. |
 | `include-providers` | `true` | Also bump pinned providers. Unpinned are reported, never changed. |
-| `verify-level` | `import` | `syntax`, `import`, or `none`. |
+| `verify-level` | `parse` | `parse` (build + test in the target Runtime image; falls back to `import` without Docker), `import`, `syntax`, or `none`. |
 | `base-branch` | _(repo default branch)_ | PR base. |
 | `branch` | `otto/airflow-upgrade` | Rolling head branch. |
 | `labels` | `airflow-upgrade,dependencies` | Comma-separated PR labels (best-effort). |
@@ -386,9 +396,10 @@ don't race the branch.
   an explicit token URL regardless, so this costs nothing.
 - The Astro token authenticates Otto; it's masked and stripped from the
   DAG-import subprocess.
-- `verify-level: import` runs your repository's DAG code (to import it), with
-  secrets stripped from that subprocess; for repos with untrusted DAG authors,
-  prefer `verify-level: syntax`.
+- `verify-level: parse` and `import` run your repository's DAG code (building
+  the image and importing the DAGs), with secrets stripped from those
+  subprocesses; for repos with untrusted DAG authors, prefer
+  `verify-level: syntax`.
 - Run on a schedule / `workflow_dispatch` against your own default branch, never
   on `pull_request_target` from forks. The resolve step is intentionally
   unauthenticated so it works in CI / `act` without secrets.

@@ -38,11 +38,17 @@ report="$WORKDIR/verify-report.md"
 status="skipped"
 
 worktree_top=""
+fallback_note=""
 # Invoked indirectly via `trap ... EXIT` below; shellcheck can't see that, so it
 # flags the function as never-invoked (SC2329, v0.11+) and its body as
 # unreachable (SC2317, v0.9). Both are false positives for a trap handler.
 # shellcheck disable=SC2329,SC2317
 emit() {
+  # A parse->import fallback note must lead the report no matter which of the
+  # import branches wrote it; prepending here is the single choke point.
+  if [[ -n "$fallback_note" && -s "$report" ]]; then
+    { echo "$fallback_note"; echo; cat "$report"; } > "$report.tmp" && mv "$report.tmp" "$report"
+  fi
   echo "$status" > "$WORKDIR/verify-status.txt"
   if [[ -n "${GITHUB_OUTPUT:-}" ]]; then echo "status=$status" >> "$GITHUB_OUTPUT"; fi
   if [[ -n "$worktree_top" && -d "$WORKDIR/baseline" ]]; then
@@ -51,6 +57,24 @@ emit() {
   fi
 }
 trap emit EXIT
+
+# Create the pre-upgrade worktree (HEAD = before apply_bump/Otto, since verify
+# runs before open-pr.sh commits). Sets baseline_dir + worktree_top on success.
+baseline_dir=""
+make_baseline_worktree() {
+  local toplevel prefix
+  toplevel=$(git -C "$PROJECT_PATH" rev-parse --show-toplevel 2>/dev/null) || return 1
+  prefix=$(git -C "$PROJECT_PATH" rev-parse --show-prefix 2>/dev/null)
+  # A stale registration from a hard-killed prior run (self-hosted WORKDIR
+  # reuse) would fail the add and needlessly degrade to strict mode.
+  git -C "$toplevel" worktree prune 2>/dev/null || true
+  rm -rf "$WORKDIR/baseline"
+  git -C "$toplevel" worktree add --detach "$WORKDIR/baseline" HEAD >/dev/null 2>&1 || return 1
+  worktree_top="$toplevel"
+  baseline_dir="$WORKDIR/baseline/${prefix%/}"
+  baseline_dir="${baseline_dir%/}"
+  return 0
+}
 
 # Collect the source roots that exist.
 roots=()
@@ -91,6 +115,149 @@ fi
 if [[ "$VERIFY_LEVEL" == "syntax" ]]; then
   status="passed"
   echo "✅ All DAG files byte-compile (syntax level)." > "$report"
+  exit 0
+fi
+
+# --- parse (default): build the real image, verify inside it ---------------- #
+# `astro dev parse` builds the project's image (the actual target Runtime +
+# requirements — dependency resolution happens against the image's constraints,
+# which PyPI-level resolution can silently disagree with) and runs Astro's DAG
+# integrity suite inside it. This is the production-faithful check: env vars,
+# bundled providers, and the parse harness match a deployment, so a DAG that
+# parses on Astro parses here.
+if [[ "$VERIFY_LEVEL" == "parse" ]]; then
+  parse_prereq=""
+  if ! command -v astro >/dev/null 2>&1; then
+    parse_prereq="the Astro CLI is not available"
+  elif ! docker info >/dev/null 2>&1; then
+    parse_prereq="Docker is not available"
+  fi
+  if [[ -n "$parse_prereq" ]]; then
+    fallback_note="ℹ️ Image-level verification (\`verify-level: parse\`) could not run: ${parse_prereq}. Results below come from the import-level fallback — a PyPI approximation of the Runtime image."
+    echo "::warning::verify-level parse unavailable (${parse_prereq}); falling back to import-level verification."
+    VERIFY_LEVEL="import"
+  fi
+fi
+
+if [[ "$VERIFY_LEVEL" == "parse" ]]; then
+  tgt_tag=$(jq -r '.runtime.target_tag // empty' "$PLAN_FILE")
+
+  # Parse runs on a COPY: the build and any astro-generated files must never
+  # dirty the tree open-pr.sh commits.
+  parse_target_dir="$WORKDIR/parse-target"
+  rm -rf "$parse_target_dir"
+  mkdir -p "$parse_target_dir"
+  rsync -a --exclude .git "$PROJECT_PATH/" "$parse_target_dir/"
+
+  # Strip secrets: the build and the in-image pytest execute repository code.
+  run_parse() {
+    ( cd "$1" &&
+      env -u ASTRO_TOKEN -u ASTRO_API_TOKEN -u GH_TOKEN -u GITHUB_TOKEN \
+      timeout 1800 astro dev parse ) > "$2" 2>&1
+  }
+
+  echo "::group::Image parse (target Runtime ${tgt_tag:-per project Dockerfile})"
+  set +e
+  run_parse "$parse_target_dir" "$WORKDIR/parse-target.log"
+  target_run_rc=$?
+  IMPORT_JSON="$WORKDIR/import-failures.json" \
+    python3 "$ACTION_PATH/scripts/parse_check.py" "$WORKDIR/parse-target.log"
+  target_rc=$?
+  set -e
+  tail -n 40 "$WORKDIR/parse-target.log"
+  echo "::endgroup::"
+
+  if [[ "$target_rc" -eq 2 ]]; then
+    status="skipped"
+    {
+      echo "ℹ️ Image-level verification could not run (\`astro dev parse\` produced no recognizable result$([[ "$target_run_rc" -eq 124 ]] && echo ', timed out')); imports were NOT checked."
+      echo
+      echo '```'
+      tail -n 15 "$WORKDIR/parse-target.log"
+      echo '```'
+    } > "$report"
+    echo "::warning::Verification skipped: astro dev parse did not produce a result — imports were NOT checked."
+    exit 0
+  fi
+
+  if [[ "$target_rc" -eq 0 ]]; then
+    status="passed"
+    checked=$(jq -r '.checked' "$WORKDIR/import-failures.json")
+    echo "✅ All ${checked} DAG file(s) import cleanly inside the target Runtime image (\`${tgt_tag:-Dockerfile}\`)." > "$report"
+    exit 0
+  fi
+
+  # Baseline: the same parse at the pre-upgrade state (current image + pins).
+  set +e
+  make_baseline_worktree
+  baseline_made=$?
+  baseline_rc=""
+  if [[ "$baseline_made" -eq 0 ]]; then
+    echo "::group::Image parse (baseline: current Runtime)"
+    run_parse "$baseline_dir" "$WORKDIR/parse-baseline.log"
+    IMPORT_JSON="$WORKDIR/baseline-failures.json" \
+      python3 "$ACTION_PATH/scripts/parse_check.py" "$WORKDIR/parse-baseline.log"
+    baseline_rc=$?
+    tail -n 20 "$WORKDIR/parse-baseline.log"
+    echo "::endgroup::"
+  fi
+  set -e
+
+  if [[ "$target_rc" -eq 4 ]]; then
+    # The target image itself does not build. If the current image builds,
+    # the upgrade caused it — a real, mergeable-PR-blocking failure the
+    # PyPI-level check cannot see (image installs resolve against the
+    # Runtime's constraints and bundled packages).
+    build_excerpt=$(grep -aE "×|╰─▶|─▶|because|unsatisfiable|incompatible|No solution|ERROR: failed to build" \
+      "$WORKDIR/parse-target.log" \
+      | sed -E 's/^#[0-9]+ //; s/^[0-9]+\.[0-9]+ +//' | awk '!seen[$0]++' | tail -n 14)
+    if [[ "$baseline_rc" == "4" ]]; then
+      status="skipped"
+      {
+        echo "ℹ️ Neither the current nor the target Runtime image builds in this environment, so the build failure pre-dates this upgrade (or is an infrastructure issue). Imports were NOT checked."
+        echo
+        echo '```'
+        printf '%s\n' "$build_excerpt"
+        echo '```'
+      } > "$report"
+      echo "::warning::Verification skipped: neither the current nor the target image builds."
+    else
+      status="failed"
+      {
+        echo "❌ **The project does not build at the target Runtime image** (\`${tgt_tag:-Dockerfile}\`). Dependency resolution failed while installing your requirements into the image. Your current image builds cleanly, so this is caused by the upgrade — usually a project pin that conflicts with packages bundled in the newer Runtime:"
+        echo
+        echo '```'
+        printf '%s\n' "$build_excerpt"
+        echo '```'
+      } > "$report"
+    fi
+    exit 0
+  fi
+
+  # target_rc == 3: real import failures inside the target image.
+  if [[ "$baseline_rc" == "0" || "$baseline_rc" == "3" ]]; then
+    set +e
+    cmp_out=$(python3 "$ACTION_PATH/scripts/compare_failures.py" \
+      "$WORKDIR/import-failures.json" "$WORKDIR/baseline-failures.json")
+    cmp_rc=$?
+    set -e
+    printf '%s\n' "$cmp_out" > "$report"
+    # Fail CLOSED: the target run found real failures, so a comparison-tool
+    # crash must never read as a pass.
+    case "$cmp_rc" in
+      0) status="passed" ;;
+      *) status="failed" ;;
+    esac
+  else
+    status="failed"
+    {
+      echo "❌ $(jq -r '.failures | length' "$WORKDIR/import-failures.json") of $(jq -r '.checked' "$WORKDIR/import-failures.json") DAG file(s) failed to import inside the target Runtime image:"
+      echo
+      jq -r '.failures[] | "  - `\(.path)`: `\(.msg | gsub("`"; "'"'"'"))`"' "$WORKDIR/import-failures.json"
+      echo
+      echo "_Baseline comparison unavailable (the pre-upgrade image could not be parsed); all failures are shown — some may pre-date this upgrade._"
+    } > "$report"
+  fi
   exit 0
 fi
 
@@ -216,19 +383,10 @@ elif [[ "$rc" -eq 3 ]]; then
     if [[ -z "$current_af" ]]; then
       baseline_note="the current Airflow version is unknown"; return 1
     fi
-    local toplevel prefix bproj brc
-    toplevel=$(git -C "$PROJECT_PATH" rev-parse --show-toplevel 2>/dev/null) \
-      || { baseline_note="the project is not a git checkout"; return 1; }
-    prefix=$(git -C "$PROJECT_PATH" rev-parse --show-prefix 2>/dev/null)
-    # A stale registration from a hard-killed prior run (self-hosted WORKDIR
-    # reuse) would fail the add and needlessly degrade to strict mode.
-    git -C "$toplevel" worktree prune 2>/dev/null || true
-    rm -rf "$WORKDIR/baseline"
-    # verify runs before open-pr.sh commits, so HEAD is the pre-upgrade state.
-    git -C "$toplevel" worktree add --detach "$WORKDIR/baseline" HEAD >/dev/null 2>&1 \
+    local bproj brc
+    make_baseline_worktree \
       || { baseline_note="a baseline worktree could not be created"; return 1; }
-    worktree_top="$toplevel"
-    bproj="$WORKDIR/baseline/${prefix%/}"; bproj="${bproj%/}"
+    bproj="$baseline_dir"
     local bargs=(--project-root "$bproj")
     [[ -d "$bproj/dags" ]] && bargs+=(--dags-root "$bproj/dags")
     [[ -d "$bproj/plugins" ]] && bargs+=(--plugins-root "$bproj/plugins")
