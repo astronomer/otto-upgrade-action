@@ -61,7 +61,7 @@ fi
 body_file="$WORKDIR/pr-body.md"
 PLAN_FILE="$PLAN_FILE" OTTO_FILE="${OTTO_FILE:-}" VERIFY_FILE="${VERIFY_FILE:-}" \
   VERIFY_STATUS_FILE="${VERIFY_STATUS_FILE:-}" SECURITY_FILE="${SECURITY_FILE:-}" \
-  ACTION_REF="${ACTION_REF:-}" \
+  DEPRECATION_FILE="${DEPRECATION_FILE:-}" ACTION_REF="${ACTION_REF:-}" \
   python3 "$ACTION_PATH/scripts/build_pr_body.py" > "$body_file"
 
 # Title from the resolved target.

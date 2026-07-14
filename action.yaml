@@ -42,6 +42,10 @@ inputs:
     required: false
     default: "parse"
     description: "Post-upgrade verification: 'parse' (default — build the project's Docker image at the target Runtime and run Astro's DAG integrity tests inside it; catches image-build failures and verifies DAGs in the production-faithful environment; needs Docker, falls back to 'import' without it), 'import' (import the discovered DAG + plugin files in a PyPI-built env), 'syntax' (byte-compile only), or 'none'. Verification fails only on a NEW failure the upgrade introduces — failures that already occur at your current versions are reported but don't fail the run; env/setup problems report 'skipped'."
+  deprecation-cleanup:
+    required: false
+    default: "fix"
+    description: "Deprecated-Airflow-usage sweep (ruff AIR3 rules, dags/+plugins/+include/ only) beyond the hop's own migrations: 'fix' (default — mechanically rewrite what ruff can, e.g. operators moved to providers; remaining debt is listed in the PR), 'advisory' (only list the debt, change nothing), or 'off'. 'fix' auto-demotes to advisory when the target Airflow is not 3.x (the rewrites produce Airflow 3 forms) or when verify-level is below 'import' (nothing would gate the rewrites). Your own ruff excludes, per-file-ignores, and noqa comments are honored."
   base-branch:
     required: false
     default: ""
@@ -243,7 +247,8 @@ runs:
         steps.resolve.outputs.author-changes == 'true' &&
         steps.resolve.outputs.no-update != 'true' &&
         (steps.auth.outputs.enabled == 'true' ||
-         inputs.verify-level == 'import' || inputs.verify-level == 'parse')
+         inputs.verify-level == 'import' || inputs.verify-level == 'parse' ||
+         inputs.deprecation-cleanup != 'off')
       uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39  # v8.2.0
 
     - name: Reconcile provider bumps with project pins
@@ -327,6 +332,28 @@ runs:
         INPUT_MODEL: ${{ inputs.model }}
       run: bash "$GITHUB_ACTION_PATH/scripts/run-otto.sh"
 
+    - name: Deprecation cleanup
+      # Runs AFTER Otto (sweeps what the migration didn't touch) and BEFORE
+      # verification, so the parse-level check gates these rewrites exactly
+      # like every other change in the PR. Best-effort: tooling misses are
+      # reported in the PR body, never fail the run.
+      if: >-
+        inputs.deprecation-cleanup != 'off' &&
+        steps.resolve.outputs.author-changes == 'true' &&
+        steps.resolve.outputs.no-update != 'true'
+      shell: bash
+      env:
+        PROJECT_PATH: ${{ inputs.project-path }}
+        PLAN_FILE: /tmp/otto-upgrade/plan.json
+        DEPRECATION_MODE: ${{ inputs.deprecation-cleanup }}
+        VERIFY_LEVEL: ${{ inputs.verify-level }}
+      run: |
+        set -euo pipefail
+        python3 "$GITHUB_ACTION_PATH/scripts/deprecation_cleanup.py" > /tmp/otto-upgrade/deprecations.json
+        echo "::group::Deprecation cleanup"
+        cat /tmp/otto-upgrade/deprecations.json
+        echo "::endgroup::"
+
     - name: Verify upgrade
       id: verify
       if: steps.resolve.outputs.author-changes == 'true' && steps.resolve.outputs.no-update != 'true'
@@ -351,6 +378,7 @@ runs:
         VERIFY_FILE: /tmp/otto-upgrade/verify-report.md
         VERIFY_STATUS_FILE: /tmp/otto-upgrade/verify-status.txt
         SECURITY_FILE: /tmp/otto-upgrade/security.json
+        DEPRECATION_FILE: /tmp/otto-upgrade/deprecations.json
         ACTION_PATH: ${{ github.action_path }}
         WORKDIR: /tmp/otto-upgrade
         BASE_BRANCH: ${{ inputs.base-branch }}
