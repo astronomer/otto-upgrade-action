@@ -8,14 +8,16 @@ project via a pinned uvx invocation.
 
 Modes (DEPRECATION_MODE):
   fix       rewrite what ruff can (--fix --unsafe-fixes, AIR3 only) and
-            report the rest as debt. Ruff marks ALL AIR3 rewrites "unsafe"
-            because they change imports to Airflow-3 forms — exactly the
-            forms this pipeline verifies afterwards inside the real target
-            image, which is the gate that makes applying them responsible.
-            Fix therefore demotes itself to advisory (and says so) whenever
-            that gate is absent: a non-3.x target Airflow (the rewrites
-            would break the deployment) or a verify-level below
-            parse/import (nothing would check the rewrites).
+            report the rest as debt. Both safe and unsafe AIR3 fixes are
+            applied: most rewrites (import moves to Airflow-3 forms) are
+            marked unsafe by ruff, a few (the schedule_interval->schedule
+            kwarg rename) are safe. Parse-level verification in the real
+            target image is the backstop — it proves the DAGs still parse,
+            NOT that task logic behaves identically, which is why fix
+            demotes itself to advisory (and says so) whenever that gate is
+            absent: a non-3.x target Airflow (the rewrites would break the
+            deployment) or a verify-level below parse/import (nothing
+            would check the rewrites).
   advisory  report everything, rewrite nothing.
   off       the action skips this step entirely (no summary file).
 
@@ -43,6 +45,7 @@ import json
 import os
 import subprocess
 import sys
+import tempfile
 from collections import Counter
 
 # The exact version the AIR3 behavior was probed against; uvx pins it so a
@@ -71,9 +74,35 @@ def _ruff(paths: list[str], *, fix: bool) -> tuple[int, str, str]:
     ]
     if fix:
         cmd += ["--fix", "--unsafe-fixes"]
-    proc = subprocess.run(  # noqa: S603 — fixed argv, no shell
-        cmd, capture_output=True, text=True, timeout=300, check=False)
+    try:
+        proc = subprocess.run(  # noqa: S603 — fixed argv, no shell
+            cmd, capture_output=True, text=True, timeout=300, check=False)
+    except (subprocess.TimeoutExpired, OSError) as exc:
+        # A raise here would abort the composite action mid-pipeline (the
+        # step runs under set -euo pipefail) and no PR would open. Feed the
+        # existing rc-based failure handling instead.
+        return -1, "", f"{type(exc).__name__}: {exc}"
     return proc.returncode, proc.stdout, proc.stderr
+
+
+# One diagnostic this must always produce (usage site, not the bare import —
+# AIR3 flags usages). If a RUFF_VERSION bump renames/retires the AIR3 rules,
+# a scan would silently report "clean"; the canary makes that loud instead.
+_CANARY_SNIPPET = "from airflow.utils.dates import days_ago\nx = days_ago(1)\n"
+
+
+def _rules_alive() -> bool:
+    with tempfile.TemporaryDirectory() as tmp:
+        probe = os.path.join(tmp, "otto_air3_canary.py")
+        with open(probe, "w", encoding="utf-8") as fh:
+            fh.write(_CANARY_SNIPPET)
+        rc, out, _err = _ruff([probe], fix=False)
+        if rc != 1:
+            return False
+        try:
+            return bool(json.loads(out))
+        except json.JSONDecodeError:
+            return False
 
 
 def _dirty_files(project_path: str) -> set[str] | None:
@@ -82,7 +111,7 @@ def _dirty_files(project_path: str) -> set[str] | None:
     come from the filesystem truth, not diagnostic arithmetic."""
     try:
         proc = subprocess.run(  # noqa: S603 — fixed argv, no shell
-            ["git", "-C", project_path, "diff", "--name-only"],  # noqa: S607
+            ["git", "-C", project_path, "diff", "--name-only", "--relative"],  # noqa: S607
             capture_output=True, text=True, timeout=60, check=False)
     except Exception:  # noqa: BLE001
         return None
@@ -119,9 +148,7 @@ def _target_airflow_major(plan: dict) -> int | None:
     return int(head) if head.isdigit() else None
 
 
-def main() -> int:
-    with open(os.environ["PLAN_FILE"], encoding="utf-8") as fh:
-        plan = json.load(fh)
+def _sweep(plan: dict) -> dict:
     project_path = os.environ.get("PROJECT_PATH", ".")
     mode = os.environ.get("DEPRECATION_MODE", "advisory")
     summary: dict = {"mode": mode}
@@ -152,22 +179,28 @@ def main() -> int:
     if not paths:
         summary.update(status="ok", found=0, fixed=0,
                        files_changed=[], remaining=[])
-        json.dump(summary, sys.stdout, indent=2)
-        return 0
+        return summary
 
     rc, out, err = _ruff(paths, fix=False)
     if rc not in (0, 1) or not out.strip():
         summary.update(status="unavailable",
                        reason=f"ruff run failed (rc={rc}): {err.strip()[:300]}")
-        json.dump(summary, sys.stdout, indent=2)
-        return 0
+        return summary
     try:
         found = json.loads(out)
     except json.JSONDecodeError:
         summary.update(status="unavailable",
                        reason="ruff produced unparseable output")
-        json.dump(summary, sys.stdout, indent=2)
-        return 0
+        return summary
+
+    if not found and not _rules_alive():
+        # Zero findings is only trustworthy while the AIR3 rules demonstrably
+        # fire; a version/rule drift must not read as "clean project".
+        summary.update(status="unavailable",
+                       reason="the AIR3 canary produced no findings — ruff "
+                              "version or rule drift; refusing to report a "
+                              "clean sweep")
+        return summary
 
     remaining = found
     dirty_before = dirty_after = None
@@ -179,8 +212,7 @@ def main() -> int:
             summary.update(status="unavailable",
                            reason=f"ruff --fix run failed (rc={rc}) — rewrites may "
                                   f"already be in the diff: {err.strip()[:300]}")
-            json.dump(summary, sys.stdout, indent=2)
-            return 0
+            return summary
         try:
             remaining = json.loads(out)
         except json.JSONDecodeError:
@@ -189,8 +221,7 @@ def main() -> int:
             summary.update(status="unavailable",
                            reason="the fix pass ran (rewrites may be in the diff) "
                                   "but its report was unparseable; debt not itemized")
-            json.dump(summary, sys.stdout, indent=2)
-            return 0
+            return summary
 
     # Fixed = per-(file, rule) count drop between the scan and the fix pass.
     # Rows can't key the match — applied fixes shift the surviving
@@ -216,6 +247,19 @@ def main() -> int:
         files_changed=files_changed,
         remaining=_group(remaining, project_path),
     )
+    return summary
+
+
+def main() -> int:
+    # A missing/corrupt PLAN_FILE raises: broken invocation, red the run.
+    with open(os.environ["PLAN_FILE"], encoding="utf-8") as fh:
+        plan = json.load(fh)
+    try:
+        summary = _sweep(plan)
+    except Exception as exc:  # noqa: BLE001 — the step must never block the PR
+        summary = {"mode": os.environ.get("DEPRECATION_MODE", "advisory"),
+                   "status": "unavailable",
+                   "reason": f"unexpected error: {type(exc).__name__}: {exc}"}
     json.dump(summary, sys.stdout, indent=2)
     return 0
 

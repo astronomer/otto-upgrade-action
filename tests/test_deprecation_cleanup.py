@@ -104,8 +104,10 @@ def test_fix_demotes_to_advisory_when_target_airflow_not_3(tmp_path, monkeypatch
 
 
 def test_clean_project_reports_ok_zero(tmp_path, monkeypatch):
-    summary, flags = _run(tmp_path, monkeypatch, "fix", [(0, "[]", "")])
-    assert flags == [False]  # nothing found -> no fix pass
+    canary_hit = json.dumps([_diag("AIR301", "/tmp/otto_air3_canary.py", 2)])
+    summary, flags = _run(tmp_path, monkeypatch, "fix",
+                          [(0, "[]", ""), (1, canary_hit, "")])
+    assert flags == [False, False]  # scan + canary, never a fix pass
     assert summary["status"] == "ok"
     assert summary["found"] == 0 and summary["fixed"] == 0
     assert summary["remaining"] == []
@@ -195,3 +197,53 @@ def test_scan_paths_only_existing_verification_roots(tmp_path):
     (tmp_path / "vendored").mkdir()  # never scanned
     paths = dc._scan_paths(str(tmp_path))
     assert paths == [str(tmp_path / "dags"), str(tmp_path / "include")]
+
+
+@pytest.mark.parametrize("plan,expect_fix", [
+    # Digest-pinned runtime: target_airflow absent, current_airflow rules.
+    ({"runtime": {"current_airflow": "2.10.5"}}, False),
+    ({"runtime": {"current_airflow": "3.0.1"}}, True),
+])
+def test_current_airflow_fallback_drives_demotion(tmp_path, monkeypatch, plan, expect_fix):
+    results = [(1, json.dumps(FOUND), "")]
+    if expect_fix:
+        results.append((1, json.dumps(REMAINING), ""))
+    summary, flags = _run(tmp_path, monkeypatch, "fix", results, plan=plan)
+    assert (True in flags) is expect_fix
+    assert summary["mode"] == ("fix" if expect_fix else "advisory")
+
+
+def test_ruff_timeout_becomes_failure_tuple_not_crash(monkeypatch):
+    import subprocess as sp
+
+    def boom(*_a, **_k):
+        raise sp.TimeoutExpired(cmd="ruff", timeout=300)
+    monkeypatch.setattr(dc.subprocess, "run", boom)
+    rc, out, err = dc._ruff(["/x"], fix=False)
+    assert rc == -1 and out == "" and "TimeoutExpired" in err
+
+
+def test_missing_uvx_becomes_failure_tuple_not_crash(monkeypatch):
+    def boom(*_a, **_k):
+        raise FileNotFoundError("uvx")
+    monkeypatch.setattr(dc.subprocess, "run", boom)
+    rc, _out, err = dc._ruff(["/x"], fix=False)
+    assert rc == -1 and "FileNotFoundError" in err
+
+
+def test_zero_findings_with_dead_canary_refuses_clean_verdict(tmp_path, monkeypatch):
+    summary, flags = _run(
+        tmp_path, monkeypatch, "fix",
+        [(0, "[]", ""), (0, "[]", "")])  # scan clean, canary ALSO silent
+    assert flags == [False, False]
+    assert summary["status"] == "unavailable"
+    assert "canary" in summary["reason"]
+
+
+def test_unexpected_exception_reports_unavailable_not_crash(tmp_path, monkeypatch):
+    # ruff emitting a JSON object instead of an array must not abort the
+    # action after Otto already ran.
+    summary, _ = _run(tmp_path, monkeypatch, "advisory",
+                      [(1, json.dumps({"not": "an array"}), "")])
+    assert summary["status"] == "unavailable"
+    assert "unexpected error" in summary["reason"]
