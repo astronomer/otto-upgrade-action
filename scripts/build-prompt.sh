@@ -26,6 +26,11 @@ tgt_af=$(jq -r '.runtime.target_airflow // empty' "$PLAN_FILE")
 # Human-readable list of provider bumps, e.g. "amazon 9.0.0 -> 9.30.0".
 prov_lines=$(jq -r '.providers[]? | select(.target != null and .current != .target)
   | "\(.package | sub("apache-airflow-providers-"; "")) \(.current) -> \(.target)"' "$PLAN_FILE")
+# User pins the run raised (bump-blocking-pins). These are NOT Airflow
+# packages — the skill's KB says nothing about them — so Otto must be told
+# to reason about the user's own usage of them, especially across majors.
+pin_lines=$(jq -r '.user_pin_bumps[]?
+  | "\(.pin) \(.from) -> \(.to) (raised to take \(.unblocks.package | sub("apache-airflow-providers-"; "")) \(.unblocks.version))"' "$PLAN_FILE")
 
 # A runtime (Airflow) move and a provider-only move want different framing.
 # Both EXPLICITLY invoke the hosted `airflow-upgrade` skill (this KB). Without
@@ -55,6 +60,21 @@ fi
   if [[ -n "$prov_lines" ]]; then
     echo "- Provider bumps:"
     while IFS= read -r l; do [[ -n "$l" ]] && echo "    - $l"; done <<<"$prov_lines"
+  fi
+  if [[ -n "$pin_lines" ]]; then
+    echo "- User pins raised by this run (bump-blocking-pins):"
+    while IFS= read -r l; do [[ -n "$l" ]] && echo "    - $l"; done <<<"$pin_lines"
+    echo
+    echo "## Raised user pins need code review"
+    echo
+    echo "The pins above are the USER'S OWN dependencies, raised so newer"
+    echo "providers could resolve. They are not Airflow packages — the Airflow"
+    echo "upgrade knowledge does not cover them. For each one: scan the project"
+    echo "for code that imports or uses the package. When the raise crosses a"
+    echo "major version, treat the user's usage as potentially broken — apply"
+    echo "only migrations you are confident about, and otherwise add a"
+    echo "manual_followups item naming the affected files and the version jump."
+    echo "As with everything else, do not edit the pins themselves."
   fi
   echo
   echo "## Environment (headless CI)"
@@ -92,6 +112,13 @@ fi
   echo "Scan dags/, include/, and plugins/ under the project root. Make the edits"
   echo "directly. Do not guess: if a change is ambiguous or risky, leave the code"
   echo "as-is and record it under manual_followups instead."
+  if [[ -n "$pin_lines" ]]; then
+    echo
+    echo "This run also raised user-owned dependency pins — see 'Raised user"
+    echo "pins need code review' in the context file. Review the project's"
+    echo "usage of those packages as described there: migrate what you are"
+    echo "confident about, record the rest as manual follow-ups."
+  fi
   echo
   echo "This is a headless CI run with no Airflow instance — skip any af/rebuild"
   echo "validation steps (the action verifies separately), and keep environment"

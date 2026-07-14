@@ -462,3 +462,37 @@ def test_ambiguous_multi_line_pin_is_restored_not_rewritten(tmp_path, monkeypatc
     assert "user_pin_bumps" not in plan
     assert (tmp_path / "requirements.txt").read_text() == reqs.replace(
         "common-ai==0.6.0", "common-ai==0.5.2")
+
+
+def test_raise_breaking_another_pin_is_reverted_even_when_provider_unblocked(
+        tmp_path, monkeypatch):
+    # pin-correct H1: the override that picked `choice` also silenced ANOTHER
+    # user lib's cap on this package, so after the write-back the error names
+    # the pin + that lib — NOT the provider. "Provider gone from the error"
+    # must not count as success; only rc==0 keeps a raise.
+    plan_file = _project(
+        tmp_path,
+        "apache-airflow-providers-common-ai==0.6.0\n"
+        "pydantic-ai-slim[openai]==1.107.0\n"
+        "legacy-agent==1.0.0\n",
+        _plan(),
+    )
+    err_after_raise = (
+        "  x No solution found when resolving dependencies:\n"
+        "  |-> Because legacy-agent==1.0.0 depends on pydantic-ai-slim<2.0\n"
+        "      and you require pydantic-ai-slim[openai]==2.1.3, we can\n"
+        "      conclude that your requirements are unsatisfiable.\n"
+    )
+    _run_with_flag(
+        tmp_path, monkeypatch,
+        [(1, UV_CONFLICT.format(ver="0.6.0")),  # initial: provider vs pin
+         (1, err_after_raise),                   # after raise: NEW conflict, no provider
+         (1, UV_CONFLICT.format(ver="0.6.0")),  # after revert: original error
+         (0, "")],                               # after walk-back: resolves
+        versions=["0.5.2"])
+    plan = json.loads(plan_file.read_text())
+    assert plan["providers"][0]["target"] == "0.5.2"
+    assert "user_pin_bumps" not in plan
+    reqs = (tmp_path / "requirements.txt").read_text()
+    assert "pydantic-ai-slim[openai]==1.107.0" in reqs  # restored
+    assert "legacy-agent==1.0.0" in reqs                # untouched

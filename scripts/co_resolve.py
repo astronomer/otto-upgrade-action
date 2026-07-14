@@ -37,8 +37,10 @@ import apply_bump
 import resolve_target as rt
 from detect_versions import normalize_name
 
-# Each attributed conflict costs one `uv pip compile` (~seconds, cached); the
-# cap bounds pathological chains, not the common one-conflict case.
+# Iteration cap on the reconcile loop. An iteration costs one `uv pip compile`
+# (~seconds, cached) — up to four when a pin-raise attempt runs (resolve the
+# choice, verify it, revert it, re-verify). Bounds pathological chains, not
+# the common one-conflict case.
 _MAX_COMPILES = 10
 
 # "And because you require pydantic-ai-slim[openai]==1.107.0, we can ..."
@@ -230,15 +232,22 @@ def main() -> int:
                     revert = {**spec, "current": choice, "target": cur_ver}
                     if len(changed) == 1:
                         rc, err = compile_requirements(project_path)
-                        if rc == 0 or not re.search(
-                                rf"{re.escape(pkg)}(?![\w.-])", err):
-                            # The raise bought this provider — keep it.
+                        if rc == 0:
+                            # Keep-gate is deliberately rc==0, nothing weaker:
+                            # "offender gone from the error" is NOT success —
+                            # the override that picked `choice` also silenced
+                            # every OTHER pin's cap on this package, so the
+                            # written-back == pin can break a neighbor (review
+                            # proved it live with requests/urllib3). A raise
+                            # survives only when the WHOLE set resolves.
                             pin_raises.append({
                                 "pin": blk_name, "from": cur_ver, "to": choice,
                                 "unblocks": {"package": pkg, "version": live[pkg]}})
                             continue
-                        # Still blocked (another constraint): a kept-but-useless
-                        # user edit is worse than none — undo, then walk back.
+                        # Anything else: undo and let the walk handle this
+                        # offender. tried_pins clears on walks, so a raise that
+                        # failed only because an unrelated conflict was still
+                        # standing gets retried once the graph settles.
                         apply_bump.bump_requirements(project_path, [revert])
                         rc, err = compile_requirements(project_path)
                     elif changed:
