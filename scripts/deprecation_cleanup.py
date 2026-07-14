@@ -43,6 +43,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -103,6 +104,54 @@ def _rules_alive() -> bool:
             return bool(json.loads(out))
         except json.JSONDecodeError:
             return False
+
+
+_FROM_IMPORT = re.compile(
+    r"^(?P<indent>[ \t]*)from[ \t]+(?P<mod>[\w.]+)[ \t]+import[ \t]+"
+    r"(?P<names>[\w][\w \t.,]*)$")
+_IMPORT_NAME = re.compile(r"[\w.]+([ \t]+as[ \t]+\w+)?$")
+
+
+def _mergeable(m: re.Match | None) -> bool:
+    return bool(m) and all(
+        _IMPORT_NAME.fullmatch(n.strip()) for n in m.group("names").split(","))
+
+
+def _merge_adjacent_from_imports(path: str, before: str) -> bool:
+    """Ruff's fixer inserts one `from M import x` line per applied fix, so two
+    rewrites into the same module read as two lines (`from airflow.sdk import
+    dag` / `... import task`) instead of one. Merge ADJACENT same-module plain
+    from-imports — but only pairs the fix pass created (at least one line
+    absent from the pre-fix text); user-authored style is never rewritten.
+    Lines with comments, parens, continuations, or star imports never match.
+    """
+    try:
+        with open(path, encoding="utf-8", newline="") as fh:
+            lines = fh.readlines()
+    except OSError:
+        return False
+    pre_lines = {line.strip() for line in before.splitlines()}
+    changed = False
+    i = 0
+    while i < len(lines) - 1:
+        a = _FROM_IMPORT.match(lines[i].rstrip("\r\n"))
+        b = _FROM_IMPORT.match(lines[i + 1].rstrip("\r\n"))
+        if (_mergeable(a) and _mergeable(b)
+                and a.group("mod") == b.group("mod")
+                and a.group("indent") == b.group("indent")
+                and (lines[i].strip() not in pre_lines
+                     or lines[i + 1].strip() not in pre_lines)):
+            ending = "\r\n" if lines[i].endswith("\r\n") else "\n"
+            lines[i] = (f"{a.group('indent')}from {a.group('mod')} import "
+                        f"{a.group('names').strip()}, {b.group('names').strip()}{ending}")
+            del lines[i + 1]
+            changed = True
+            continue  # the merged line may merge again with the next one
+        i += 1
+    if changed:
+        with open(path, "w", encoding="utf-8", newline="") as fh:
+            fh.writelines(lines)
+    return changed
 
 
 def _dirty_files(project_path: str) -> set[str] | None:
@@ -205,8 +254,19 @@ def _sweep(plan: dict) -> dict:
     remaining = found
     dirty_before = dirty_after = None
     if mode == "fix" and found:
+        # Snapshot the files ruff may edit: the import-merge below must only
+        # touch lines the fix pass itself introduced.
+        pre_texts: dict[str, str] = {}
+        for f in {d.get("filename") for d in found if d.get("filename")}:
+            try:
+                with open(f, encoding="utf-8") as fh:
+                    pre_texts[f] = fh.read()
+            except OSError:
+                pass
         dirty_before = _dirty_files(project_path)
         rc, out, err = _ruff(paths, fix=True)
+        for f, before in pre_texts.items():
+            _merge_adjacent_from_imports(f, before)
         dirty_after = _dirty_files(project_path)
         if rc not in (0, 1):
             summary.update(status="unavailable",

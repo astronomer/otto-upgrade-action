@@ -247,3 +247,65 @@ def test_unexpected_exception_reports_unavailable_not_crash(tmp_path, monkeypatc
                       [(1, json.dumps({"not": "an array"}), "")])
     assert summary["status"] == "unavailable"
     assert "unexpected error" in summary["reason"]
+
+
+class TestImportMerge:
+    def _merge(self, tmp_path, text, before):
+        f = tmp_path / "x.py"
+        # Bytes in/out: Path.write_text/read_text translate newlines, which
+        # would hide a CRLF-mangling bug.
+        f.write_bytes(text.encode())
+        changed = dc._merge_adjacent_from_imports(str(f), before)
+        return changed, f.read_bytes().decode()
+
+    def test_fixer_introduced_pair_merges(self, tmp_path):
+        changed, out = self._merge(
+            tmp_path,
+            "from airflow.sdk import dag\nfrom airflow.sdk import task\n",
+            before="from airflow.decorators import dag, task\n")
+        assert changed
+        assert out == "from airflow.sdk import dag, task\n"
+
+    def test_triple_run_merges_into_one_line(self, tmp_path):
+        changed, out = self._merge(
+            tmp_path,
+            "from airflow.sdk import dag\nfrom airflow.sdk import task\n"
+            "from airflow.sdk import chain\n",
+            before="")
+        assert changed
+        assert out == "from airflow.sdk import dag, task, chain\n"
+
+    def test_user_authored_pair_left_alone(self, tmp_path):
+        text = "from x import a\nfrom x import b\n"
+        changed, out = self._merge(tmp_path, text, before=text)
+        assert not changed
+        assert out == text
+
+    def test_pair_with_one_preexisting_line_merges(self, tmp_path):
+        # Ruff inserted `task` next to the user's existing sdk import.
+        changed, out = self._merge(
+            tmp_path,
+            "from airflow.sdk import dag\nfrom airflow.sdk import task\n",
+            before="from airflow.sdk import dag\n")
+        assert changed
+        assert out == "from airflow.sdk import dag, task\n"
+
+    @pytest.mark.parametrize("text", [
+        "from a import x\nfrom b import y\n",              # different modules
+        "from a import x\n    from a import y\n",          # indent mismatch
+        "from a import *\nfrom a import y\n",              # star import
+        "from a import x  # keep\nfrom a import y\n",      # trailing comment
+        "from a import (\n    x,\n)\nfrom a import y\n",   # parenthesized
+    ])
+    def test_non_mergeable_shapes_untouched(self, tmp_path, text):
+        changed, out = self._merge(tmp_path, text, before="")
+        assert not changed
+        assert out == text
+
+    def test_aliases_merge_and_crlf_preserved(self, tmp_path):
+        changed, out = self._merge(
+            tmp_path,
+            "from a import x as y\r\nfrom a import z\r\n",
+            before="")
+        assert changed
+        assert out == "from a import x as y, z\r\n"
