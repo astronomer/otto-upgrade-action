@@ -12,6 +12,8 @@ import pytest
 UV_CONFLICT = """\
   x No solution found when resolving dependencies:
   |-> Because apache-airflow-providers-common-ai=={ver}
+      depends on pydantic-ai-slim>=2.0.0 and you require
+      pydantic-ai-slim[openai]==1.107.0, we can conclude that
       requirements and pydantic-ai-slim[openai]==1.107.0 are incompatible.
       And because you require pydantic-ai-slim[openai]==1.107.0, we can
       conclude that your requirements are unsatisfiable.
@@ -38,11 +40,12 @@ def _plan(target="0.6.0"):
     }
 
 
-def _run(tmp_path, monkeypatch, compile_results, versions=()):
+def _run(tmp_path, monkeypatch, compile_results, versions=(), dep_spec=">=2.0.0"):
     """compile_results: list of (rc, stderr) consumed per compile call."""
     calls = iter(compile_results)
     monkeypatch.setattr(co_resolve, "compile_requirements", lambda _p: next(calls))
     monkeypatch.setattr(co_resolve, "in_scope_versions", lambda *_a: list(versions))
+    monkeypatch.setattr(co_resolve, "_dependency_spec_for", lambda *_a: dep_spec)
     monkeypatch.setenv("PROJECT_PATH", str(tmp_path))
     monkeypatch.setenv("PLAN_FILE", str(tmp_path / "plan.json"))
     assert co_resolve.main() == 0
@@ -73,7 +76,9 @@ def test_conflict_steps_down_to_coresolving_version(tmp_path, monkeypatch):
     assert provider["target"] == "0.5.2"
     assert provider["tier"] == "patch"
     assert "pydantic-ai-slim[openai]==1.107.0" in provider["note"]
-    assert "raise `pydantic-ai-slim[openai]` to take 0.6.0" in provider["note"]
+    # The concrete change, not just the direction (Tamara's field request).
+    assert ("to take 0.6.0, raise your `pydantic-ai-slim[openai]` pin "
+            "to satisfy `pydantic-ai-slim>=2.0.0`") in provider["note"]
     reqs = (tmp_path / "requirements.txt").read_text()
     assert "apache-airflow-providers-common-ai==0.5.2" in reqs
     assert "pydantic-ai-slim[openai]==1.107.0" in reqs  # user pin untouched
@@ -134,12 +139,121 @@ def test_blocking_pin_extraction(stderr, expected):
         stderr, "apache-airflow-providers-common-ai") == expected
 
 
+def test_note_degrades_to_direction_only_when_metadata_unavailable(tmp_path, monkeypatch):
+    # PyPI metadata can be unreachable or the dep indirect; the advice then
+    # degrades to direction-only rather than guessing a bound.
+    plan_file = _project(
+        tmp_path,
+        "apache-airflow-providers-common-ai==0.6.0\npydantic-ai-slim[openai]==1.107.0\n",
+        _plan(),
+    )
+    _run(tmp_path, monkeypatch,
+         [(1, UV_CONFLICT.format(ver="0.6.0")), (0, "")],
+         versions=[], dep_spec=None)
+    note = json.loads(plan_file.read_text())["providers"][0]["note"]
+    assert "to take 0.6.0, adjust your `pydantic-ai-slim[openai]` pin" in note
+    assert "satisfy" not in note
+
+
+def test_note_carries_full_compound_specifier(tmp_path, monkeypatch):
+    # An upper-bounded requirement must be shown whole — advising only the
+    # lower bound could send the user to an incompatible major.
+    plan_file = _project(
+        tmp_path,
+        "apache-airflow-providers-common-ai==0.6.0\npydantic-ai-slim[openai]==1.107.0\n",
+        _plan(),
+    )
+    _run(tmp_path, monkeypatch,
+         [(1, UV_CONFLICT.format(ver="0.6.0")), (0, "")],
+         versions=[], dep_spec=">=2.0.0,<3")
+    note = json.loads(plan_file.read_text())["providers"][0]["note"]
+    assert "satisfy `pydantic-ai-slim>=2.0.0,<3`" in note
+    # A capped range is not provably "raise" territory.
+    assert "adjust your" in note
+
+
+def test_note_says_adjust_not_raise_for_upper_bound_requirement(tmp_path, monkeypatch):
+    # A provider capping a dep BELOW the user's pin (the dbt/mashumaro shape):
+    # telling the user to "raise" would point the wrong way.
+    plan_file = _project(
+        tmp_path,
+        "apache-airflow-providers-common-ai==0.6.0\npydantic-ai-slim[openai]==1.107.0\n",
+        _plan(),
+    )
+    _run(tmp_path, monkeypatch,
+         [(1, UV_CONFLICT.format(ver="0.6.0")), (0, "")],
+         versions=[], dep_spec="<=1.0.0")
+    note = json.loads(plan_file.read_text())["providers"][0]["note"]
+    assert "adjust your `pydantic-ai-slim[openai]` pin to satisfy `pydantic-ai-slim<=1.0.0`" in note
+    assert "raise" not in note
+
+
+def test_spec_fetched_for_original_target_not_walked_back_version(tmp_path, monkeypatch):
+    # The note explains what the ORIGINAL target requires ("to take 0.6.0...");
+    # fetching the walked-back version's metadata instead would stay green in
+    # every other test (they stub _dependency_spec_for), so lock the URL here.
+    plan_file = _project(
+        tmp_path,
+        "apache-airflow-providers-common-ai==0.6.0\npydantic-ai-slim[openai]==1.107.0\n",
+        _plan(),
+    )
+    urls: list[str] = []
+
+    def fake_http_json(url):
+        urls.append(url)
+        return {"info": {"requires_dist": ["pydantic-ai-slim>=2.0.0"]}}
+
+    monkeypatch.setattr(co_resolve.rt, "_http_json", fake_http_json)
+    calls = iter([(1, UV_CONFLICT.format(ver="0.6.0")), (0, "")])
+    monkeypatch.setattr(co_resolve, "compile_requirements", lambda _p: next(calls))
+    monkeypatch.setattr(co_resolve, "in_scope_versions", lambda *_a: ["0.5.2"])
+    monkeypatch.setenv("PROJECT_PATH", str(tmp_path))
+    monkeypatch.setenv("PLAN_FILE", str(tmp_path / "plan.json"))
+    assert co_resolve.main() == 0
+    assert urls == [
+        f"{co_resolve.rt.PYPI_BASE_URL}/apache-airflow-providers-common-ai/0.6.0/json"
+    ]
+    note = json.loads(plan_file.read_text())["providers"][0]["note"]
+    assert "to satisfy `pydantic-ai-slim>=2.0.0`" in note
+
+
+def _pypi(monkeypatch, requires_dist):
+    monkeypatch.setattr(
+        co_resolve.rt, "_http_json",
+        lambda _url: {"info": {"requires_dist": requires_dist}})
+
+
+@pytest.mark.parametrize("requires_dist,expected", [
+    (["pydantic-ai-slim>=2.0.0"], ">=2.0.0"),
+    # Legacy metadata: parenthesized spec, non-normalized name (PEP 503).
+    (["Pydantic_AI.Slim (>=2.0.0,<3)"], ">=2.0.0,<3"),
+    (["pydantic-ai-slim[openai]>=2.0.0"], ">=2.0.0"),
+    # Extras-gated requirement is optional, not the blocking constraint.
+    (["pydantic-ai-slim>=2.0.0; extra == 'fancy'"], None),
+    (["pydantic-ai-slim>=2.0.0; python_version >= '3.9'"], ">=2.0.0"),
+    (["unrelated>=1.0"], None),
+    ([], None),
+    (None, None),
+])
+def test_dependency_spec_extraction(monkeypatch, requires_dist, expected):
+    _pypi(monkeypatch, requires_dist)
+    assert co_resolve._dependency_spec_for(
+        "apache-airflow-providers-common-ai", "0.6.0", "pydantic-ai-slim") == expected
+
+
+def test_dependency_spec_none_on_network_error(monkeypatch):
+    def boom(_url):
+        raise OSError("offline")
+    monkeypatch.setattr(co_resolve.rt, "_http_json", boom)
+    assert co_resolve._dependency_spec_for("pkg", "1.0", "dep") is None
+
+
 def test_blocking_pin_picks_clause_nearest_the_offender():
     # A multi-conflict error carries clauses for unrelated pins; the advice
     # must name the pin gating THIS provider, not the first clause in the text.
     err = (
-        "Because somelib requires x and you require otherlib==2.0, ...\n"
-        "Because apache-airflow-providers-common-ai==0.6.0 requires\n"
+        "Because somelib depends on x and you require otherlib==2.0, ...\n"
+        "Because apache-airflow-providers-common-ai==0.6.0 depends on\n"
         "pydantic-ai-slim>=2.0.0 and you require pydantic-ai-slim[openai]==1.107.0, ...\n"
     )
     assert co_resolve._blocking_pin_for(
@@ -171,6 +285,7 @@ def test_multi_conflict_walks_second_offender_after_first_exhausts(tmp_path, mon
              "apache-airflow-providers-snowflake": ["6.10.0"]}
     monkeypatch.setattr(co_resolve, "in_scope_versions",
                         lambda pkg, *_a: list(pools[pkg]))
+    monkeypatch.setattr(co_resolve, "_dependency_spec_for", lambda *_a: None)
     calls = iter([
         (1, err_a_bumped),  # initial: A walked 0.6.0 -> current (empty pool)
         (1, err_a_held),    # still failing, A now named AT current -> exhausted

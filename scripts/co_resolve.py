@@ -34,6 +34,7 @@ import sys
 
 import apply_bump
 import resolve_target as rt
+from detect_versions import normalize_name
 
 # Each attributed conflict costs one `uv pip compile` (~seconds, cached); the
 # cap bounds pathological chains, not the common one-conflict case.
@@ -43,6 +44,34 @@ _MAX_COMPILES = 10
 _BLOCKING_PIN = re.compile(
     r"you require (?P<pin>[A-Za-z0-9_.\-]+(?:\[[^\]]*\])?==[0-9][^\s,]*)"
 )
+
+
+def _dependency_spec_for(package: str, version: str, dep_name: str) -> str | None:
+    """The full constraint ``package==version`` puts on ``dep_name``, from its
+    per-version PyPI ``requires_dist`` — structured metadata, scoped to the
+    exact offender and version by construction. uv's error prose can
+    interleave clauses from unrelated conflicts and truncate compound
+    specifiers, so it is never used for the bound. Names compare under PEP
+    503 normalization; extras-gated requirements are skipped (optional, not
+    the blocking constraint). None on any miss — the advice then degrades to
+    direction-only rather than guessing."""
+    try:
+        data = rt._http_json(f"{rt.PYPI_BASE_URL}/{package}/{version}/json")  # noqa: SLF001
+    except Exception:  # noqa: BLE001 — metadata miss just means no concrete bound
+        return None
+    want = normalize_name(dep_name)
+    for req in data.get("info", {}).get("requires_dist") or []:
+        base, _, marker = req.strip().partition(";")
+        if "extra" in marker:
+            continue
+        m = re.match(
+            r"^(?P<name>[A-Za-z0-9._-]+)(?:\[[^\]]*\])?\s*(?P<spec>[<>=!~(].*)?$",
+            base.strip(),
+        )
+        if m and normalize_name(m.group("name")) == want:
+            spec = (m.group("spec") or "").strip().strip("()")
+            return spec or None
+    return None
 
 
 def _blocking_pin_for(err: str, pkg: str) -> str | None:
@@ -163,7 +192,24 @@ def main() -> int:
         blk = blocking.get(pkg)
         why = (f"{orig} conflicts with your `{blk}` pin" if blk
                else f"{orig} does not resolve together with your other pins")
-        advice = f" (raise `{blk.split('==')[0]}` to take {orig})" if blk else ""
+        advice = ""
+        if blk:
+            # The concrete requirement comes from the ORIGINAL target's own
+            # metadata at note-build time — atomically scoped to this offender
+            # and version, never scraped from the (multi-conflict) error text.
+            blk_name = blk.split("==")[0]
+            dep_base = blk_name.split("[")[0]
+            spec = _dependency_spec_for(pkg, orig, dep_base)
+            if spec:
+                # "raise" is only provably the right direction for a pure
+                # lower bound; caps/exclusions (a provider capping a dep BELOW
+                # the user's pin is a real shape) get the neutral verb.
+                ops = set(re.findall(r">=|<=|==|!=|~=|>|<", spec))
+                verb = "raise" if ops <= {">=", ">"} else "adjust"
+                advice = (f" (to take {orig}, {verb} your `{blk_name}` pin "
+                          f"to satisfy `{dep_base}{spec}`)")
+            else:
+                advice = f" (to take {orig}, adjust your `{blk_name}` pin)"
         if final == p["current"]:
             p["note"] = f"left at {p['current']}: {why}{advice}"
         else:
