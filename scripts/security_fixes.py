@@ -28,11 +28,14 @@ Writes a JSON report to stdout.
 
 from __future__ import annotations
 
+import gzip
 import json
 import os
 import re
 import sys
+import time
 import urllib.request
+import zlib
 
 from resolve_target import version_tuple
 
@@ -48,10 +51,43 @@ _BULLET = re.compile(r"^\s*[*+-]\s+(?P<text>\S.*)$")
 _LINK = re.compile(r"\[(?P<id>[^\]]+)\]\((?P<url>[^)\s]+)(?:\s+\"[^\"]*\")?\)")
 
 
-def _fetch_text(url: str) -> str:
-    req = urllib.request.Request(url, headers={"User-Agent": "otto-upgrade-action"})  # noqa: S310
+def _fetch_once(url: str) -> str:
+    req = urllib.request.Request(url, headers={  # noqa: S310
+        "User-Agent": "otto-upgrade-action",
+        "Accept": "text/markdown, text/plain;q=0.9, */*;q=0.1",
+        # Field case (Tamara, 2026-07-15): a CDN edge intermittently served a
+        # compressed body even though urllib never asked for one, and the
+        # blind .decode("utf-8") died on byte 0xa5. Ask for identity
+        # explicitly, and decompress defensively below when an edge insists.
+        "Accept-Encoding": "identity",
+    })
     with urllib.request.urlopen(req, timeout=30) as resp:  # noqa: S310
-        return resp.read().decode("utf-8")
+        data = resp.read()
+        encoding = (resp.headers.get("Content-Encoding") or "").lower()
+        ctype = resp.headers.get("Content-Type") or "unknown"
+    if encoding == "gzip" or data[:2] == b"\x1f\x8b":
+        data = gzip.decompress(data)
+    elif encoding == "deflate":
+        data = zlib.decompress(data)
+    try:
+        return data.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        # Brotli/zstd or plain garbage: stdlib can't decompress those, so
+        # surface a reason with enough forensics to diagnose from a PR body.
+        raise RuntimeError(
+            f"response was not UTF-8 text (content-type={ctype}, "
+            f"content-encoding={encoding or 'none'}, "
+            f"first-bytes=0x{data[:4].hex()}): {exc}") from None
+
+
+def _fetch_text(url: str) -> str:
+    """Fetch with one retry: the failure mode seen in the field was a single
+    bad edge response, with the identical request succeeding minutes later."""
+    try:
+        return _fetch_once(url)
+    except Exception:  # noqa: BLE001 — retry exactly once, then let it surface
+        time.sleep(2)
+        return _fetch_once(url)
 
 
 def _parse_builds(page: str) -> list[tuple[str, str]]:
