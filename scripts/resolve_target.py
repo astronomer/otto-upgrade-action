@@ -121,18 +121,34 @@ def tier_between(cur: str, tgt: str) -> str:
 _STABLE: frozenset[str] = frozenset({"stable"})
 _STABLE_AND_DEPRECATED: frozenset[str] = frozenset({"stable", "deprecated"})
 
-# Astronomer publishes Python-variant image tags (`3.2-5-python-3.13`) that
-# the Runtime feed does NOT list — the feed carries base tags plus a
-# `pythonVersions` support list per build. Field case (Tamara, 2026-07-15):
-# a variant-pinned project got "tag not found in the Runtime feed" and lost
-# runtime bumps entirely.
-_PYTHON_VARIANT = re.compile(r"^(?P<base>.+?)-python-(?P<py>\d+\.\d+)$")
+# Astronomer publishes variant image tags the Runtime feed does NOT list —
+# the feed carries base tags plus a `pythonVersions` support list per build.
+# Documented variant chains stack: `-python-3.13`, `-python-3.11-base`,
+# `-ubi9-python-3.11`, `-slim-base` (see runtime-image-architecture docs).
+# Field case (Tamara, 2026-07-15): a variant-pinned project got "tag not
+# found in the Runtime feed" and lost runtime bumps entirely.
+_VARIANT_START = re.compile(r"-(?:python-\d|ubi\d*\b|slim\b|base\b)")
+_PY_IN_SUFFIX = re.compile(r"-python-(\d+\.\d+(?:\.\d+)?)")
 
 
-def split_python_variant(tag: str) -> tuple[str, str | None]:
-    """``3.2-5-python-3.13`` -> (``3.2-5``, ``3.13``); plain tags pass through."""
-    m = _PYTHON_VARIANT.match(tag)
-    return (m.group("base"), m.group("py")) if m else (tag, None)
+def split_python_variant(tag: str) -> tuple[str, str | None, str]:
+    """Peel the variant suffix chain off a Runtime tag.
+
+    ``3.2-5-python-3.13``        -> (``3.2-5``,  ``3.13``, ``-python-3.13``)
+    ``3.1-14-ubi9-python-3.11``  -> (``3.1-14``, ``3.11``, ``-ubi9-python-3.11``)
+    ``13.2.0-python-3.11-slim-base`` -> (``13.2.0``, ``3.11``, suffix)
+    ``3.2-5-slim-base``          -> (``3.2-5``,  None,     ``-slim-base``)
+    Plain tags pass through as (tag, None, "").
+
+    The FULL suffix is preserved verbatim onto upgrade targets; the Python
+    version (when present) additionally filters candidates by feed support.
+    """
+    m = _VARIANT_START.search(tag)
+    if not m or m.start() == 0:
+        return tag, None, ""
+    base, suffix = tag[:m.start()], tag[m.start():]
+    py = _PY_IN_SUFFIX.search(suffix)
+    return base, (py.group(1) if py else None), suffix
 
 
 def _runtime_candidates(channels: frozenset[str] = _STABLE) -> list[dict[str, Any]]:
@@ -200,7 +216,7 @@ def airflow_for_tag(tag: str) -> str | None:
     runtime still gets a real current Airflow version. Python-variant tags
     resolve via their base tag (the feed lists base tags only).
     """
-    base, _py = split_python_variant(tag)
+    base, _py, _suffix = split_python_variant(tag)
     try:
         for c in _runtime_candidates(_STABLE_AND_DEPRECATED):
             if c["tag"] == base:
@@ -217,13 +233,14 @@ def resolve_runtime(current_tag: str, target: str, max_scope: str) -> dict[str, 
     for c in cur_cands:
         by_tag.setdefault(c["tag"], c)
 
-    # A `-python-X.Y` variant pin resolves via its BASE tag and is restored
-    # onto whatever target gets picked, so the user keeps their Python.
-    base_tag, py_pin = split_python_variant(current_tag)
+    # A variant suffix (`-python-X.Y`, `-ubi9-...`, `-slim-base`) resolves
+    # via its BASE tag and is restored verbatim onto whatever target gets
+    # picked, so the user keeps their Python/OS/flavor.
+    base_tag, py_pin, variant_suffix = split_python_variant(current_tag)
     cur = by_tag.get(base_tag)
 
     def _with_variant(tag: str) -> str:
-        return f"{tag}-python-{py_pin}" if py_pin else tag
+        return f"{tag}{variant_suffix}"
 
     if cur is None:
         return {
@@ -238,20 +255,38 @@ def resolve_runtime(current_tag: str, target: str, max_scope: str) -> dict[str, 
             "skipping the runtime bump. Pin a published Runtime tag to enable it.",
         }
 
+    def _order_key(c: dict[str, Any]) -> tuple:
+        return (version_tuple(c["airflow"]), c["release_date"], version_tuple(c["tag"]))
+
     py_note = ""
-    if py_pin:
+    if py_pin and not cur.get("python_versions"):
+        # The feed doesn't track Python support for this line (live feed:
+        # every legacy 13.x entry omits pythonVersions). Filtering would
+        # silently hold ALL upgrades — resolve on the base instead and say
+        # the pin wasn't validated.
+        py_note = (f"the Runtime feed doesn't list Python support for this "
+                   f"line; your Python {py_pin} pin was kept on the target "
+                   "but couldn't be validated against it")
+    elif py_pin:
         # Only builds that publish the pinned Python are upgrade candidates.
         # A build without pythonVersions metadata is excluded (fail closed:
         # proposing a variant tag that may not exist beats guessing).
         unfiltered_newest = _newest(cands)
         cands = [c for c in cands if py_pin in c["python_versions"]]
         newest = _newest(cands)
+        # Full ordering, not Airflow versions: a newer BUILD of the same
+        # Airflow (a patch/security refresh) blocked by the pin must be
+        # said out loud too, not read as a clean no-update.
         if unfiltered_newest and (
-                newest is None
-                or version_tuple(newest["airflow"]) < version_tuple(unfiltered_newest["airflow"])):
-            py_note = (f"newer Runtime {unfiltered_newest['tag']} doesn't list "
-                       f"Python {py_pin} support, so it isn't a candidate for "
-                       "this python-pinned image")
+                newest is None or _order_key(newest) < _order_key(unfiltered_newest)):
+            if unfiltered_newest["tag"] == base_tag:
+                py_note = (f"your current build {base_tag} doesn't list Python "
+                           f"{py_pin} support in the feed; no in-scope upgrade "
+                           "is possible for this pin")
+            else:
+                py_note = (f"newer Runtime {unfiltered_newest['tag']} doesn't "
+                           f"list Python {py_pin} support, so it isn't a "
+                           "candidate for this python-pinned image")
 
     cur_af = cur["airflow"]
     cm = version_tuple(cur_af)
@@ -288,6 +323,17 @@ def resolve_runtime(current_tag: str, target: str, max_scope: str) -> dict[str, 
         elif max_scope == "minor":
             pick = _newest(same_major) or cur
         tier = _runtime_tier(base_tag, cur_af, pick)
+
+    # NEVER author a downgrade. The python filter can remove the CURRENT
+    # build from the pool (pin not listed for it), which breaks the implicit
+    # pick >= current invariant every other path relies on.
+    if _order_key(pick) < _order_key(cur):
+        pick = cur
+        tier = _runtime_tier(base_tag, cur_af, pick)
+        clamped = False
+        if py_pin and not py_note:
+            py_note = (f"held at {current_tag}: no in-scope build newer than "
+                       f"the current one lists Python {py_pin} support")
 
     out: dict[str, Any] = {
         "current_tag": current_tag,

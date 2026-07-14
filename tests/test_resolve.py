@@ -426,10 +426,11 @@ def test_digest_pinned_runtime_is_refused(tmp_path, monkeypatch):
 
 # --- python-variant tags ---------------------------------------------------- #
 @pytest.mark.parametrize("tag,expected", [
-    ("3.2-5-python-3.13", ("3.2-5", "3.13")),
-    ("3.3-2", ("3.3-2", None)),
-    ("12.1.1", ("12.1.1", None)),
-    ("3.2-5-python-3", ("3.2-5-python-3", None)),  # no minor -> not a variant
+    ("3.2-5-python-3.13", ("3.2-5", "3.13", "-python-3.13")),
+    ("3.3-2", ("3.3-2", None, "")),
+    ("12.1.1", ("12.1.1", None, "")),
+    # Undocumented shape: preserved verbatim as a suffix, no python filter.
+    ("3.2-5-python-3", ("3.2-5", None, "-python-3")),
 ])
 def test_split_python_variant(tag, expected):
     assert rt.split_python_variant(tag) == expected
@@ -465,3 +466,63 @@ def test_variant_python_unsupported_by_newer_builds_holds_with_note():
 
 def test_airflow_for_tag_resolves_variant_via_base():
     assert rt.airflow_for_tag("3.1-7-python-3.12") == "3.1.2"
+
+
+@pytest.mark.parametrize("tag,expected", [
+    ("3.1-14-ubi9-python-3.11", ("3.1-14", "3.11", "-ubi9-python-3.11")),
+    ("13.2.0-python-3.11-slim-base", ("13.2.0", "3.11", "-python-3.11-slim-base")),
+    ("3.2-5-slim-base", ("3.2-5", None, "-slim-base")),
+    ("3.2-5-python-3.11.2", ("3.2-5", "3.11.2", "-python-3.11.2")),
+])
+def test_split_variant_composite_shapes(tag, expected):
+    assert rt.split_python_variant(tag) == expected
+
+
+def test_variant_never_authors_a_downgrade():
+    # The python filter can remove the CURRENT build from the pool (its own
+    # entry doesn't list the pinned python) — the pick must then hold, never
+    # slide to an OLDER build (codex: 3.2-3-python-3.11 -> 3.2-1 regression).
+    r = rt.resolve_runtime("3.2-3-python-3.11", target="latest-minor", max_scope="minor")
+    assert r["target_tag"] == "3.2-3-python-3.11"
+    assert r["tier"] == "none"
+    assert "Python 3.11" in r["note"]
+
+
+def test_variant_composite_suffix_restored_whole():
+    r = rt.resolve_runtime("3.1-5-python-3.12-base", target="latest-minor", max_scope="minor")
+    assert r["target_tag"] == "3.2-3-python-3.12-base"
+
+
+def test_legacy_line_without_python_metadata_still_bumps_with_note(monkeypatch):
+    # Live-feed fact: every legacy (AF2.11 / 13.x) entry omits pythonVersions.
+    # Fail-closed filtering there would silently hold ALL upgrades — worse
+    # than main's explicit "tag not found" note. Fall back to base-tag
+    # resolution and say the pin wasn't validated.
+    feed = {"runtimeVersions": {
+        "13.5.0": {"metadata": {"airflowVersion": "2.11.1", "channel": "stable",
+                                "releaseDate": "2026-01-10"}},
+        "13.8.0": {"metadata": {"airflowVersion": "2.11.2", "channel": "stable",
+                                "releaseDate": "2026-06-01"}},
+    }}
+    monkeypatch.setattr(rt, "_http_json", lambda _u: feed)
+    r = rt.resolve_runtime("13.5.0-python-3.12", target="latest-minor", max_scope="minor")
+    assert r["target_tag"] == "13.8.0-python-3.12"
+    assert r["tier"] == "patch"
+    assert "couldn't be validated" in r["note"]
+
+
+def test_variant_same_airflow_build_exclusion_is_noted(monkeypatch):
+    # A newer BUILD of the same Airflow (patch/security refresh) that drops
+    # the pinned python must be said out loud, not read as a clean no-update.
+    feed = {"runtimeVersionsV3": {
+        "3.0-9": {"metadata": {"airflowVersion": "3.0.5", "channel": "stable",
+                               "releaseDate": "2026-01-01",
+                               "pythonVersions": ["3.11", "3.12"]}},
+        "3.0-10": {"metadata": {"airflowVersion": "3.0.5", "channel": "stable",
+                                "releaseDate": "2026-02-01",
+                                "pythonVersions": ["3.12"]}},
+    }}
+    monkeypatch.setattr(rt, "_http_json", lambda _u: feed)
+    r = rt.resolve_runtime("3.0-9-python-3.11", target="patch", max_scope="minor")
+    assert r["target_tag"] == "3.0-9-python-3.11"  # held: 3.0-10 dropped 3.11
+    assert "3.0-10" in r["note"]
