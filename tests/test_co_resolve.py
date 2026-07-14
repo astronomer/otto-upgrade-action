@@ -305,12 +305,13 @@ def test_multi_conflict_walks_second_offender_after_first_exhausts(tmp_path, mon
 
 def _run_with_flag(tmp_path, monkeypatch, compile_results, versions=(),
                    dep_spec=">=2.0.0", choice="2.1.3"):
-    """_run with BUMP_BLOCKING_PINS=true and a stubbed uv pin choice."""
+    """_run with BUMP_BLOCKING_PINS=true and a stubbed uv pin choice.
+    Returns the (base, override_spec) pairs resolve_pin_choice was asked for."""
     monkeypatch.setenv("BUMP_BLOCKING_PINS", "true")
     calls = []
 
-    def fake_choice(_project, base):
-        calls.append(base)
+    def fake_choice(_project, base, override_spec=None):
+        calls.append((base, override_spec))
         return choice
 
     monkeypatch.setattr(co_resolve, "resolve_pin_choice", fake_choice)
@@ -343,7 +344,9 @@ def test_flag_raises_user_pin_and_keeps_provider(tmp_path, monkeypatch):
     calls = _run_with_flag(
         tmp_path, monkeypatch,
         [(1, UV_CONFLICT.format(ver="0.6.0")), (0, "")])
-    assert calls == ["pydantic-ai-slim"]
+    # The override must carry the extras: a bare-name override resolves an
+    # extras-stripped graph (pin-brittle F1).
+    assert calls == [("pydantic-ai-slim", "pydantic-ai-slim[openai]")]
     plan = json.loads(plan_file.read_text())
     provider = plan["providers"][0]
     assert provider["target"] == "0.6.0"  # provider NOT walked back
@@ -373,10 +376,10 @@ def test_flag_falls_back_to_walk_when_uv_cannot_resolve(tmp_path, monkeypatch):
     assert "pydantic-ai-slim[openai]==1.107.0" in (tmp_path / "requirements.txt").read_text()
 
 
-def test_flag_tries_each_pin_once_then_walks(tmp_path, monkeypatch):
-    # The raise applies but the same offender/pin still conflicts (e.g. a
-    # second, transitive constraint) — the second iteration must walk back
-    # instead of raising forever. Both edits surface in the plan.
+def test_failed_raise_is_reverted_before_walk_back(tmp_path, monkeypatch):
+    # The raise applies but the same offender still conflicts (a second,
+    # transitive constraint) — the raise must be UNDONE (a kept-but-useless
+    # edit to a user pin misdescribes the PR) and the provider walked back.
     plan_file = _project(
         tmp_path,
         "apache-airflow-providers-common-ai==0.6.0\npydantic-ai-slim[openai]==1.107.0\n",
@@ -384,16 +387,19 @@ def test_flag_tries_each_pin_once_then_walks(tmp_path, monkeypatch):
     )
     calls = _run_with_flag(
         tmp_path, monkeypatch,
-        [(1, UV_CONFLICT.format(ver="0.6.0")),
-         (1, UV_CONFLICT.format(ver="0.6.0")),
-         (0, "")],
+        [(1, UV_CONFLICT.format(ver="0.6.0")),   # initial conflict
+         (1, UV_CONFLICT.format(ver="0.6.0")),   # after raise: still blocked
+         (1, UV_CONFLICT.format(ver="0.6.0")),   # after revert: original error
+         (0, "")],                                # after walk-back
         versions=["0.5.2"])
-    assert calls == ["pydantic-ai-slim"]  # single attempt
+    assert len(calls) == 1  # single raise attempt for this graph state
     plan = json.loads(plan_file.read_text())
     provider = plan["providers"][0]
-    assert provider["target"] == "0.5.2"          # walked after the raise failed
-    assert provider["note"].startswith("held at")  # hold note wins
-    assert plan["user_pin_bumps"][0]["to"] == "2.1.3"  # raise still reported
+    assert provider["target"] == "0.5.2"
+    assert provider["note"].startswith("held at")
+    assert "user_pin_bumps" not in plan          # nothing kept, nothing claimed
+    reqs = (tmp_path / "requirements.txt").read_text()
+    assert "pydantic-ai-slim[openai]==1.107.0" in reqs  # pin restored
 
 
 def test_resolve_pin_choice_reads_uv_lockfile(tmp_path, monkeypatch):
@@ -421,3 +427,38 @@ def test_resolve_pin_choice_none_when_uv_fails(tmp_path, monkeypatch):
 
     monkeypatch.setattr(co_resolve.subprocess, "run", lambda *a, **k: P())
     assert co_resolve.resolve_pin_choice(str(tmp_path), "x") is None
+
+
+def test_flag_never_downgrades_a_user_pin(tmp_path, monkeypatch):
+    # An upper-bound conflict makes uv pick a LOWER version; a flag named
+    # bump-* must hold the provider instead of silently downgrading.
+    plan_file = _project(
+        tmp_path,
+        "apache-airflow-providers-common-ai==0.6.0\npydantic-ai-slim[openai]==1.107.0\n",
+        _plan(),
+    )
+    _run_with_flag(
+        tmp_path, monkeypatch,
+        [(1, UV_CONFLICT.format(ver="0.6.0")), (0, "")],
+        versions=["0.5.2"], choice="1.0.0")
+    plan = json.loads(plan_file.read_text())
+    assert plan["providers"][0]["target"] == "0.5.2"  # walked, not downgraded
+    assert "pydantic-ai-slim[openai]==1.107.0" in (tmp_path / "requirements.txt").read_text()
+
+
+def test_ambiguous_multi_line_pin_is_restored_not_rewritten(tmp_path, monkeypatch):
+    # The same package pinned twice at one version behind different markers:
+    # rewriting both lines blind misdescribes the plan — restore and hold.
+    reqs = ("apache-airflow-providers-common-ai==0.6.0\n"
+            'pydantic-ai-slim[openai]==1.107.0 ; python_version < "3.12"\n'
+            'pydantic-ai-slim[openai]==1.107.0 ; python_version >= "3.12"\n')
+    plan_file = _project(tmp_path, reqs, _plan())
+    _run_with_flag(
+        tmp_path, monkeypatch,
+        [(1, UV_CONFLICT.format(ver="0.6.0")), (0, "")],
+        versions=["0.5.2"])
+    plan = json.loads(plan_file.read_text())
+    assert plan["providers"][0]["target"] == "0.5.2"
+    assert "user_pin_bumps" not in plan
+    assert (tmp_path / "requirements.txt").read_text() == reqs.replace(
+        "common-ai==0.6.0", "common-ai==0.5.2")

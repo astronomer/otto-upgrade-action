@@ -54,7 +54,7 @@ def bump_requirements(project_path: str, providers: list[dict]) -> list[dict]:
     if not os.path.isfile(path):
         return changed
     targets = {
-        p["package"]: p["target"]
+        p["package"]: (p["current"], p["target"])
         for p in providers
         if p.get("current") and p.get("target") and p["current"] != p["target"]
     }
@@ -78,12 +78,15 @@ def bump_requirements(project_path: str, providers: list[dict]) -> list[dict]:
         lines = fh.readlines()
     for i, raw in enumerate(lines):
         code = raw.split("#", 1)[0]
-        for pkg, target in targets.items():
+        for pkg, (current, target) in targets.items():
             # Match `pkg[extras]==x.y.z` (any PEP 503-equivalent spelling) and
             # swap only the version, preserving the user's spelling, extras,
-            # markers, trailing comment, and newline.
+            # markers, trailing comment, and newline. Only lines pinned at the
+            # plan's CURRENT version change: a package listed twice with
+            # per-marker versions (foo==1 for py<3.12, foo==2 otherwise) must
+            # not have its unrelated variant dragged along.
             m = patterns[pkg].match(code)
-            if not m or m.group("ver") == target:
+            if not m or m.group("ver") != current:
                 continue
             comment = raw[len(code):]
             lines[i] = f"{m.group('pre')}{target}{m.group('post')}{comment}"

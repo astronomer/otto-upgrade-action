@@ -99,35 +99,49 @@ def _blocking_pin_for(err: str, pkg: str) -> str | None:
 
 def compile_requirements(project_path: str) -> tuple[int, str]:
     req = os.path.join(project_path, "requirements.txt")
-    proc = subprocess.run(  # noqa: S603 — fixed argv, no shell
-        ["uv", "pip", "compile", req, "-o", os.devnull, "--no-header"],  # noqa: S607 — uv from PATH by design
+    try:
+        proc = subprocess.run(  # noqa: S603 — fixed argv, no shell
+            ["uv", "pip", "compile", req, "-o", os.devnull, "--no-header"],  # noqa: S607 — uv from PATH by design
 
-        capture_output=True, text=True, timeout=300, check=False,
-    )
+            capture_output=True, text=True, timeout=300, check=False,
+        )
+    except (subprocess.TimeoutExpired, OSError) as exc:
+        # This step is best-effort under set -euo pipefail: a stalled or
+        # vanished uv must degrade to "not attributable" (verification is the
+        # backstop), never abort the action.
+        return -1, f"{type(exc).__name__}: {exc}"
     return proc.returncode, proc.stderr
 
 
-def resolve_pin_choice(project_path: str, pin_base: str) -> str | None:
+def resolve_pin_choice(project_path: str, pin_base: str,
+                       override_spec: str | None = None) -> str | None:
     """The version uv picks for ``pin_base`` when its user pin is lifted.
 
-    Compiles the requirements with an override that relaxes JUST this pin
-    (an override replaces every declared constraint for that package), then
-    reads uv's choice from the lockfile it writes. All PEP 440/extras/marker
-    semantics stay uv's problem — no homegrown specifier evaluation. None
-    when uv still can't resolve or the choice can't be read; callers fall
-    back to walking the provider.
+    Compiles the requirements with an override that relaxes JUST this pin,
+    then reads uv's choice from the lockfile it writes. All PEP 440/extras/
+    marker semantics stay uv's problem — no homegrown specifier evaluation.
+    None when uv still can't resolve or the choice can't be read; callers
+    fall back to walking the provider.
+
+    ``override_spec`` must carry the pin's EXTRAS (``pydantic-ai-slim[openai]``):
+    an override REPLACES the declared requirement wholesale, so a bare name
+    would resolve an extras-stripped graph — a version can pass there and
+    still not co-resolve once written back next to the real requirement.
     """
     req = os.path.join(project_path, "requirements.txt")
     with tempfile.TemporaryDirectory() as tmp:
         override = os.path.join(tmp, "override.txt")
         with open(override, "w", encoding="utf-8") as fh:
-            fh.write(pin_base + "\n")
+            fh.write((override_spec or pin_base) + "\n")
         out_file = os.path.join(tmp, "resolved.txt")
-        proc = subprocess.run(  # noqa: S603 — fixed argv, no shell
-            ["uv", "pip", "compile", req, "-o", out_file, "--no-header",  # noqa: S607
-             "--override", override],
-            capture_output=True, text=True, timeout=300, check=False,
-        )
+        try:
+            proc = subprocess.run(  # noqa: S603 — fixed argv, no shell
+                ["uv", "pip", "compile", req, "-o", out_file, "--no-header",  # noqa: S607
+                 "--override", override],
+                capture_output=True, text=True, timeout=300, check=False,
+            )
+        except (subprocess.TimeoutExpired, OSError):
+            return None
         if proc.returncode != 0 or not os.path.isfile(out_file):
             return None
         want = normalize_name(pin_base)
@@ -205,16 +219,33 @@ def main() -> int:
             base = blk_name.split("[")[0]
             if bump_pins and cur_ver and base not in tried_pins:
                 tried_pins.add(base)
-                choice = resolve_pin_choice(project_path, base)
-                if choice and choice != cur_ver and apply_bump.bump_requirements(
-                        project_path,
-                        [{"package": normalize_name(base),
-                          "current": cur_ver, "target": choice}]):
-                    pin_raises.append({
-                        "pin": blk_name, "from": cur_ver, "to": choice,
-                        "unblocks": {"package": pkg, "version": live[pkg]}})
-                    rc, err = compile_requirements(project_path)
-                    continue  # conflict may be gone; only walk back if not
+                choice = resolve_pin_choice(project_path, base, blk_name)
+                # Upward only: an upper-bound conflict makes uv pick a LOWER
+                # version, and silently downgrading a user pin under a flag
+                # named bump-* would be a lie — that case stays a hold+advice.
+                if (choice and rt.version_tuple(choice) > rt.version_tuple(cur_ver)):
+                    spec = {"package": normalize_name(base),
+                            "current": cur_ver, "target": choice}
+                    changed = apply_bump.bump_requirements(project_path, [spec])
+                    revert = {**spec, "current": choice, "target": cur_ver}
+                    if len(changed) == 1:
+                        rc, err = compile_requirements(project_path)
+                        if rc == 0 or not re.search(
+                                rf"{re.escape(pkg)}(?![\w.-])", err):
+                            # The raise bought this provider — keep it.
+                            pin_raises.append({
+                                "pin": blk_name, "from": cur_ver, "to": choice,
+                                "unblocks": {"package": pkg, "version": live[pkg]}})
+                            continue
+                        # Still blocked (another constraint): a kept-but-useless
+                        # user edit is worse than none — undo, then walk back.
+                        apply_bump.bump_requirements(project_path, [revert])
+                        rc, err = compile_requirements(project_path)
+                    elif changed:
+                        # >1 line changed: the file pins this package more than
+                        # once (per-marker variants) — too ambiguous to edit
+                        # blind; restore and hold the provider instead.
+                        apply_bump.bump_requirements(project_path, [revert])
         if pkg not in pools:
             pools[pkg] = in_scope_versions(pkg, offender["current"], original[pkg])
         pool = pools[pkg]
@@ -231,7 +262,34 @@ def main() -> int:
             project_path, [{"package": pkg, "current": live[pkg], "target": nxt}])
         live[pkg] = nxt
         adjusted.add(pkg)
+        # The dependency graph changed: a pin lift that failed against the old
+        # graph may succeed for the next provider blocked by the same pin.
+        tried_pins.clear()
         rc, err = compile_requirements(project_path)
+
+    # A raise is only worth keeping while the provider it bought stayed
+    # bumped: a later, unrelated conflict can walk that provider after the
+    # raise. The plan must describe the FINAL state — revert raises whose
+    # benefit evaporated, and re-point the rest at the final target.
+    current_of = {p["package"]: p["current"] for p in bumped}
+    for raised in list(pin_raises):
+        pkg = raised["unblocks"]["package"]
+        pin_pkg = normalize_name(raised["pin"].split("[")[0])
+        if live[pkg] == current_of[pkg]:
+            if apply_bump.bump_requirements(
+                    project_path, [{"package": pin_pkg,
+                                    "current": raised["to"],
+                                    "target": raised["from"]}]):
+                rc2, _ = compile_requirements(project_path)
+                if rc2 == 0:
+                    pin_raises.remove(raised)
+                    continue
+                # Reverting re-broke the final set — restore and keep it.
+                apply_bump.bump_requirements(
+                    project_path, [{"package": pin_pkg,
+                                    "current": raised["from"],
+                                    "target": raised["to"]}])
+        raised["unblocks"]["version"] = live[pkg]
 
     if not adjusted and not pin_raises:
         json.dump(summary, sys.stdout, indent=2)

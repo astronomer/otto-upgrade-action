@@ -357,7 +357,7 @@ don't race the branch.
 | `max-upgrade-scope` | `minor` | `patch`, `minor`, or `major`. Airflow majors stay advisory-only regardless. |
 | `include-providers` | `true` | Also bump pinned providers. Unpinned are reported, never changed. |
 | `verify-level` | `parse` | `parse` (build + test in the target Runtime image; falls back to `import` without Docker), `import`, `syntax`, or `none`. |
-| `bump-blocking-pins` | `false` | When a provider bump conflicts with one of your own pins, raise your pin to the version uv resolves instead of holding the provider back. Off by default (it edits user-owned dependencies); every raise appears in the PR's version table and is gated by verification. |
+| `bump-blocking-pins` | `false` | When a provider bump conflicts with one of your own pins, raise your pin to the newest version uv can co-resolve instead of holding the provider back. Off by default (it edits user-owned dependencies); every raise appears in the PR's version table and is gated by verification. |
 | `deprecation-cleanup` | `fix` | Sweep deprecated Airflow usage (ruff AIR3 rules, `dags/`+`plugins/`+`include/` only) beyond the hop's own migrations: `fix` rewrites what ruff can (e.g. operators moved to providers) and lists the rest as debt in the PR; `advisory` only lists; `off` skips. `fix` auto-demotes to advisory when the target Airflow isn't 3.x or when `verify-level` is below `import` — rewrites are only applied when verification gates them. Your ruff excludes, per-file-ignores, and `noqa` comments are honored. |
 | `base-branch` | _(repo default branch)_ | PR base. |
 | `branch` | `otto/airflow-upgrade` | Rolling head branch. |

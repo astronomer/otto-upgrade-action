@@ -3,7 +3,7 @@ revision = 3
 requires-python = ">=3.10"
 
 [options]
-exclude-newer = "2026-07-14T17:23:19Z"
+exclude-newer = "2026-07-14T17:56:25Z"
 
 [[package]]
 name = "colorama"
