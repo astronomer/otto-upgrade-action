@@ -51,7 +51,7 @@ from collections import Counter
 
 # The exact version the AIR3 behavior was probed against; uvx pins it so a
 # ruff release can't silently change what gets rewritten between runs.
-RUFF_VERSION = os.environ.get("RUFF_VERSION", "0.14.0")
+RUFF_VERSION = os.environ.get("RUFF_VERSION", "0.15.20")
 
 # AIR3xx only: Airflow-3 removals and provider moves. AIR0xx are style/DAG
 # authoring checks, not deprecation debt.
