@@ -12,10 +12,18 @@ Modes (DEPRECATION_MODE):
             because they change imports to Airflow-3 forms — exactly the
             forms this pipeline verifies afterwards inside the real target
             image, which is the gate that makes applying them responsible.
-            When the target Airflow is not 3.x the rewrites would break the
-            deployment, so fix demotes itself to advisory and says so.
+            Fix therefore demotes itself to advisory (and says so) whenever
+            that gate is absent: a non-3.x target Airflow (the rewrites
+            would break the deployment) or a verify-level below
+            parse/import (nothing would check the rewrites).
   advisory  report everything, rewrite nothing.
   off       the action skips this step entirely (no summary file).
+
+Scope: only dags/, plugins/, and include/ are scanned and rewritten — the
+same roots verification covers. Mutating anything verification can't see
+would ship unreviewed edits. The user's own ruff config is honored (their
+excludes, per-file-ignores, and noqa comments are safety boundaries, not
+noise); only the rule selection is forced to AIR3 on the CLI.
 
 Best-effort on tooling: uvx/ruff unavailable or ruff crashing is recorded in
 the summary JSON (exit 0) so the PR shows a loud skip instead of silently
@@ -45,11 +53,20 @@ RUFF_VERSION = os.environ.get("RUFF_VERSION", "0.14.0")
 # authoring checks, not deprecation debt.
 _SELECT = "AIR3"
 
+# Mutation scope == verification scope. Rewrites outside what the verify
+# step covers would land in the PR unchecked.
+_SCAN_ROOTS = ("dags", "plugins", "include")
 
-def _ruff(project_path: str, *, fix: bool) -> tuple[int, str, str]:
+
+def _scan_paths(project_path: str) -> list[str]:
+    return [p for d in _SCAN_ROOTS
+            if os.path.isdir(p := os.path.join(project_path, d))]
+
+
+def _ruff(paths: list[str], *, fix: bool) -> tuple[int, str, str]:
     cmd = [
-        "uvx", f"ruff@{RUFF_VERSION}", "check", project_path,
-        "--select", _SELECT, "--preview", "--isolated",
+        "uvx", f"ruff@{RUFF_VERSION}", "check", *paths,
+        "--select", _SELECT, "--preview",
         "--output-format", "json",
     ]
     if fix:
@@ -57,6 +74,21 @@ def _ruff(project_path: str, *, fix: bool) -> tuple[int, str, str]:
     proc = subprocess.run(  # noqa: S603 — fixed argv, no shell
         cmd, capture_output=True, text=True, timeout=300, check=False)
     return proc.returncode, proc.stdout, proc.stderr
+
+
+def _dirty_files(project_path: str) -> set[str] | None:
+    """Files modified vs HEAD, or None when git can't answer (not a repo,
+    no git on PATH). Snapshotted before/after the fix pass so changed files
+    come from the filesystem truth, not diagnostic arithmetic."""
+    try:
+        proc = subprocess.run(  # noqa: S603 — fixed argv, no shell
+            ["git", "-C", project_path, "diff", "--name-only"],  # noqa: S607
+            capture_output=True, text=True, timeout=60, check=False)
+    except Exception:  # noqa: BLE001
+        return None
+    if proc.returncode != 0:
+        return None
+    return {line.strip() for line in proc.stdout.splitlines() if line.strip()}
 
 
 def _relative(filename: str, project_path: str) -> str:
@@ -95,6 +127,7 @@ def main() -> int:
     summary: dict = {"mode": mode}
 
     major = _target_airflow_major(plan)
+    verify_level = os.environ.get("VERIFY_LEVEL", "")
     if mode == "fix" and (major is None or major < 3):
         # AIR3 rewrites produce Airflow-3 import forms; applying them against
         # a 2.x (or unknown) target would break the deployment.
@@ -103,8 +136,26 @@ def main() -> int:
             f"fix requested but the target Airflow is {major or 'unknown'}.x; "
             "AIR3 rewrites produce Airflow 3 forms, so this run only reports the debt")
         mode = "advisory"
+    elif mode == "fix" and verify_level not in ("parse", "import"):
+        # Unsafe rewrites are only responsible when something downstream
+        # actually checks them; syntax/none verification checks nothing that
+        # a rewrite could break.
+        summary["mode"] = "advisory"
+        summary["demoted"] = (
+            f"fix requested but verify-level is '{verify_level or 'unset'}'; "
+            "rewrites are only applied when a parse- or import-level "
+            "verification gates them, so this run only reports the debt")
+        mode = "advisory"
 
-    rc, out, err = _ruff(project_path, fix=False)
+    paths = _scan_paths(project_path)
+    summary["scanned"] = [os.path.relpath(p, project_path) for p in paths]
+    if not paths:
+        summary.update(status="ok", found=0, fixed=0,
+                       files_changed=[], remaining=[])
+        json.dump(summary, sys.stdout, indent=2)
+        return 0
+
+    rc, out, err = _ruff(paths, fix=False)
     if rc not in (0, 1) or not out.strip():
         summary.update(status="unavailable",
                        reason=f"ruff run failed (rc={rc}): {err.strip()[:300]}")
@@ -119,31 +170,45 @@ def main() -> int:
         return 0
 
     remaining = found
+    dirty_before = dirty_after = None
     if mode == "fix" and found:
-        rc, out, err = _ruff(project_path, fix=True)
+        dirty_before = _dirty_files(project_path)
+        rc, out, err = _ruff(paths, fix=True)
+        dirty_after = _dirty_files(project_path)
         if rc not in (0, 1):
-            # The no-fix scan above succeeded, so report it instead of dying —
-            # but say the fix pass failed rather than pretending it ran.
             summary.update(status="unavailable",
-                           reason=f"ruff --fix run failed (rc={rc}): {err.strip()[:300]}")
+                           reason=f"ruff --fix run failed (rc={rc}) — rewrites may "
+                                  f"already be in the diff: {err.strip()[:300]}")
             json.dump(summary, sys.stdout, indent=2)
             return 0
         try:
             remaining = json.loads(out)
         except json.JSONDecodeError:
-            remaining = found
+            # The fix pass already mutated files; pretending nothing happened
+            # (ok/0-fixed) would hide those edits from the PR summary.
+            summary.update(status="unavailable",
+                           reason="the fix pass ran (rewrites may be in the diff) "
+                                  "but its report was unparseable; debt not itemized")
+            json.dump(summary, sys.stdout, indent=2)
+            return 0
 
     # Fixed = per-(file, rule) count drop between the scan and the fix pass.
     # Rows can't key the match — applied fixes shift the surviving
     # diagnostics' line numbers, which would double-count a finding as both
-    # fixed and remaining.
+    # fixed and remaining. (Net counts can under-report when a fix exposes a
+    # new same-rule finding in the same file; the file list below doesn't
+    # rely on them.)
     def _fc(d: dict) -> tuple:
         return (d.get("filename", "?"), d.get("code") or "AIR?")
 
     delta = Counter(_fc(d) for d in found) - Counter(_fc(d) for d in remaining)
     fixed = sum(delta.values())
-    files_changed = sorted(
-        {_relative(f, project_path) for (f, _), n in delta.items() if n})
+    if dirty_before is not None and dirty_after is not None:
+        # Filesystem truth beats diagnostic arithmetic for "what changed".
+        files_changed = sorted(dirty_after - dirty_before)
+    else:
+        files_changed = sorted(
+            {_relative(f, project_path) for (f, _), n in delta.items() if n})
     summary.update(
         status="ok",
         found=len(found),

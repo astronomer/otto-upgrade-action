@@ -31,8 +31,11 @@ REMAINING = [
 ]
 
 
-def _run(tmp_path, monkeypatch, mode, ruff_results, plan=None, project="/proj"):
-    """ruff_results: list of (rc, stdout, stderr) consumed per _ruff call."""
+def _run(tmp_path, monkeypatch, mode, ruff_results, plan=None, project="/proj",
+         verify_level="parse", dirty=None):
+    """ruff_results: list of (rc, stdout, stderr) consumed per _ruff call.
+    dirty: list of git-dirty-file sets consumed per _dirty_files call
+    (default: git unavailable -> Counter-based files_changed fallback)."""
     if plan is None:
         plan = {"runtime": {"target_airflow": "3.3.1"}}
     plan_f = tmp_path / "plan.json"
@@ -40,10 +43,18 @@ def _run(tmp_path, monkeypatch, mode, ruff_results, plan=None, project="/proj"):
     monkeypatch.setenv("PLAN_FILE", str(plan_f))
     monkeypatch.setenv("PROJECT_PATH", project)
     monkeypatch.setenv("DEPRECATION_MODE", mode)
+    monkeypatch.setenv("VERIFY_LEVEL", verify_level)
+    monkeypatch.setattr(dc, "_scan_paths", lambda p: [f"{p}/dags"])
+    dirty_calls = iter(dirty if dirty is not None else [])
+
+    def fake_dirty(_p):
+        return next(dirty_calls, None) if dirty is not None else None
+
+    monkeypatch.setattr(dc, "_dirty_files", fake_dirty)
     calls = iter(ruff_results)
     seen_fix_flags = []
 
-    def fake_ruff(_path, *, fix):
+    def fake_ruff(_paths, *, fix):
         seen_fix_flags.append(fix)
         return next(calls)
 
@@ -127,3 +138,60 @@ def test_locations_cap_at_five_with_count_intact(tmp_path, monkeypatch):
     grp = summary["remaining"][0]
     assert grp["count"] == 8
     assert len(grp["locations"]) == 5
+
+
+@pytest.mark.parametrize("level", ["syntax", "none", ""])
+def test_fix_demotes_when_verification_would_not_gate_rewrites(tmp_path, monkeypatch, level):
+    summary, flags = _run(
+        tmp_path, monkeypatch, "fix", [(1, json.dumps(FOUND), "")],
+        verify_level=level)
+    assert flags == [False]
+    assert summary["mode"] == "advisory"
+    assert "verify-level" in summary["demoted"]
+    assert summary["fixed"] == 0
+
+
+def test_malformed_fix_pass_output_is_loud_not_ok_zero(tmp_path, monkeypatch):
+    # The fix pass already mutated files; falling back to "ok, 0 fixed"
+    # would hide those edits from the PR summary.
+    summary, _ = _run(
+        tmp_path, monkeypatch, "fix",
+        [(1, json.dumps(FOUND), ""), (1, "garbage{", "")])
+    assert summary["status"] == "unavailable"
+    assert "rewrites may be in the diff" in summary["reason"]
+
+
+def test_files_changed_prefers_git_snapshot_over_diagnostic_delta(tmp_path, monkeypatch):
+    # Otto already dirtied dags/otto.py before this step; only the fix-pass
+    # delta belongs to the sweep.
+    summary, _ = _run(
+        tmp_path, monkeypatch, "fix",
+        [(1, json.dumps(FOUND), ""), (1, json.dumps(REMAINING), "")],
+        dirty=[{"dags/otto.py"}, {"dags/otto.py", "dags/a.py", "dags/c.py"}])
+    assert summary["files_changed"] == ["dags/a.py", "dags/c.py"]
+    assert summary["fixed"] == 2  # count still from the diagnostic delta
+
+
+def test_no_scan_roots_reports_ok_zero(tmp_path, monkeypatch):
+    plan_f = tmp_path / "plan.json"
+    plan_f.write_text(json.dumps({"runtime": {"target_airflow": "3.3.1"}}))
+    monkeypatch.setenv("PLAN_FILE", str(plan_f))
+    monkeypatch.setenv("PROJECT_PATH", str(tmp_path))  # no dags/plugins/include
+    monkeypatch.setenv("DEPRECATION_MODE", "fix")
+    monkeypatch.setenv("VERIFY_LEVEL", "parse")
+    monkeypatch.setattr(dc, "_ruff",
+                        lambda *_a, **_k: pytest.fail("ruff must not run"))
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        assert dc.main() == 0
+    summary = json.loads(buf.getvalue())
+    assert summary["status"] == "ok" and summary["found"] == 0
+    assert summary["scanned"] == []
+
+
+def test_scan_paths_only_existing_verification_roots(tmp_path):
+    (tmp_path / "dags").mkdir()
+    (tmp_path / "include").mkdir()
+    (tmp_path / "vendored").mkdir()  # never scanned
+    paths = dc._scan_paths(str(tmp_path))
+    assert paths == [str(tmp_path / "dags"), str(tmp_path / "include")]

@@ -318,3 +318,19 @@ def test_clean_deprecation_report_renders_nothing(tmp_path, monkeypatch):
     monkeypatch.setenv("DEPRECATION_FILE", str(dep_f))
     out = _render(tmp_path, monkeypatch, _SEC_PLAN, {"files": []})
     assert "Deprecation" not in out
+
+
+def test_deprecation_rewrites_marked_unverified_unless_verify_passed(tmp_path, monkeypatch):
+    dep = {"mode": "fix", "status": "ok", "found": 2, "fixed": 2,
+           "files_changed": ["dags/a.py"], "remaining": []}
+    dep_f = tmp_path / "deprecations.json"
+    dep_f.write_text(json.dumps(dep))
+    monkeypatch.setenv("DEPRECATION_FILE", str(dep_f))
+    out = _render(tmp_path, monkeypatch, _SEC_PLAN, {"files": []},
+                  verify="❌ failures", verify_status="failed")
+    assert "these rewrites are **unverified**" in out
+    assert "covered by this PR's verification" not in out
+    out_ok = _render(tmp_path, monkeypatch, _SEC_PLAN, {"files": []},
+                     verify="✅ ok", verify_status="passed")
+    assert "covered by this PR's verification" in out_ok
+    assert "unverified" not in out_ok

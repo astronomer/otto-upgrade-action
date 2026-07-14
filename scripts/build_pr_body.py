@@ -235,12 +235,23 @@ def main() -> int:
                 out += [f"> {dep['demoted']}.", ""]
             if fixed:
                 files = ", ".join(f"`{f}`" for f in dep.get("files_changed", []))
+                # The "verified" claim must track the actual outcome — a PR
+                # whose verification failed or never ran must not describe
+                # its riskiest edits as checked.
+                gate = (" (covered by this PR's verification)"
+                        if verify_status == "passed" else "")
                 out += [
                     f"Rewrote {fixed} deprecated usage(s)"
-                    + (f" in {files}" if files else "")
-                    + " (verified with the rest of this PR).",
+                    + (f" in {files}" if files else "") + f"{gate}.",
                     "",
                 ]
+                if verify_status != "passed":
+                    out += [
+                        "> ⚠️ This PR's verification did not pass (see the "
+                        "Verification section), so these rewrites are "
+                        "**unverified** — review them before merging.",
+                        "",
+                    ]
             if remaining:
                 out.append("**Remaining deprecation debt** (no mechanical fix; "
                            "works today but will break in a future Airflow):")

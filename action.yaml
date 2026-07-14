@@ -45,7 +45,7 @@ inputs:
   deprecation-cleanup:
     required: false
     default: "fix"
-    description: "Deprecated-Airflow-usage sweep (ruff AIR3 rules) beyond the hop's own migrations: 'fix' (default — mechanically rewrite what ruff can, e.g. operators moved to providers; the rewrites are verified like every other change, and remaining debt is listed in the PR), 'advisory' (only list the debt, change nothing), or 'off'. 'fix' auto-demotes to advisory when the target Airflow is not 3.x (the rewrites produce Airflow 3 forms)."
+    description: "Deprecated-Airflow-usage sweep (ruff AIR3 rules, dags/+plugins/+include/ only) beyond the hop's own migrations: 'fix' (default — mechanically rewrite what ruff can, e.g. operators moved to providers; remaining debt is listed in the PR), 'advisory' (only list the debt, change nothing), or 'off'. 'fix' auto-demotes to advisory when the target Airflow is not 3.x (the rewrites produce Airflow 3 forms) or when verify-level is below 'import' (nothing would gate the rewrites). Your own ruff excludes, per-file-ignores, and noqa comments are honored."
   base-branch:
     required: false
     default: ""
@@ -346,6 +346,7 @@ runs:
         PROJECT_PATH: ${{ inputs.project-path }}
         PLAN_FILE: /tmp/otto-upgrade/plan.json
         DEPRECATION_MODE: ${{ inputs.deprecation-cleanup }}
+        VERIFY_LEVEL: ${{ inputs.verify-level }}
       run: |
         set -euo pipefail
         python3 "$GITHUB_ACTION_PATH/scripts/deprecation_cleanup.py" > /tmp/otto-upgrade/deprecations.json
