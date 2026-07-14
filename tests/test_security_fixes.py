@@ -193,3 +193,78 @@ def test_link_with_markdown_title_keeps_id_and_url():
     assert report["fixes"] == [
         {"id": "CVE-2026-1", "url": "https://example.com/cve-2026-1",
          "builds": ["3.3-2"]}]
+
+
+class TestFetchHardening:
+    class _Resp:
+        def __init__(self, body, headers):
+            self._body = body
+            self.headers = headers
+
+        def read(self):
+            return self._body
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+    def _serve(self, monkeypatch, responses):
+        """responses: list consumed per urlopen call — (body, headers) or Exception."""
+        calls = iter(responses)
+        seen = {}
+
+        def fake_urlopen(req, timeout):
+            seen["accept-encoding"] = req.headers.get("Accept-encoding")
+            item = next(calls)
+            if isinstance(item, Exception):
+                raise item
+            return self._Resp(*item)
+
+        monkeypatch.setattr(sf.urllib.request, "urlopen", fake_urlopen)
+        monkeypatch.setattr(sf.time, "sleep", lambda _s: None)
+        return seen
+
+    def test_requests_identity_encoding(self, monkeypatch):
+        seen = self._serve(monkeypatch, [(b"# ok", {"Content-Type": "text/markdown"})])
+        assert sf._fetch_text("https://x") == "# ok"
+        assert seen["accept-encoding"] == "identity"
+
+    def test_gzip_body_is_decompressed(self, monkeypatch):
+        import gzip as gz
+        body = gz.compress(b"## Astro Runtime 3.3-2\n")
+        self._serve(monkeypatch, [(body, {"Content-Encoding": "gzip",
+                                          "Content-Type": "text/markdown"})])
+        assert "3.3-2" in sf._fetch_text("https://x")
+
+    def test_gzip_magic_without_header_is_decompressed(self, monkeypatch):
+        import gzip as gz
+        body = gz.compress(b"content")
+        self._serve(monkeypatch, [(body, {"Content-Type": "text/markdown"})])
+        assert sf._fetch_text("https://x") == "content"
+
+    def test_garbage_bytes_retry_once_then_surface_forensics(self, monkeypatch):
+        # The field failure: one bad edge response, identical request fine after.
+        self._serve(monkeypatch, [
+            (b"\xa5\x01\x02\x03junk", {"Content-Type": "text/markdown"}),
+            (b"# recovered", {"Content-Type": "text/markdown"}),
+        ])
+        assert sf._fetch_text("https://x") == "# recovered"
+
+    def test_persistent_garbage_raises_with_diagnostics(self, monkeypatch):
+        bad = (b"\xa5\x01\x02\x03junk", {"Content-Type": "text/markdown",
+                                         "Content-Encoding": "br"})
+        self._serve(monkeypatch, [bad, bad])
+        with pytest.raises(RuntimeError) as exc:
+            sf._fetch_text("https://x")
+        msg = str(exc.value)
+        assert "content-encoding=br" in msg
+        assert "0xa5010203" in msg
+
+    def test_transient_network_error_retries_once(self, monkeypatch):
+        self._serve(monkeypatch, [
+            OSError("connection reset"),
+            (b"# ok", {"Content-Type": "text/markdown"}),
+        ])
+        assert sf._fetch_text("https://x") == "# ok"
