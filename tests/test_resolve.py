@@ -422,3 +422,46 @@ def test_digest_pinned_runtime_is_refused(tmp_path, monkeypatch):
         TARGET="latest", MAX_SCOPE="major", INCLUDE_PROVIDERS="false",
     )
     assert plan2["runtime"]["current_airflow"] is None
+
+
+# --- python-variant tags ---------------------------------------------------- #
+@pytest.mark.parametrize("tag,expected", [
+    ("3.2-5-python-3.13", ("3.2-5", "3.13")),
+    ("3.3-2", ("3.3-2", None)),
+    ("12.1.1", ("12.1.1", None)),
+    ("3.2-5-python-3", ("3.2-5-python-3", None)),  # no minor -> not a variant
+])
+def test_split_python_variant(tag, expected):
+    assert rt.split_python_variant(tag) == expected
+
+
+def test_variant_pinned_tag_resolves_via_base_and_keeps_python():
+    # Field case (Tamara): '3.2-5-python-3.13' got "not found in the Runtime
+    # feed" and lost the runtime bump entirely. The base locates the project;
+    # the target keeps the python pin.
+    r = rt.resolve_runtime("3.1-5-python-3.12", target="latest-minor", max_scope="minor")
+    assert r["current_airflow"] == "3.1.0"
+    assert r["target_tag"] == "3.2-3-python-3.12"
+    assert r["target_airflow"] == "3.2.2"
+    assert r["tier"] == "minor"
+    assert r["python_pin"] == "3.12"
+
+
+def test_variant_no_op_is_not_a_phantom_patch():
+    # Same build, python-pinned: the full tag never equals a feed tag, which
+    # used to read as a "patch" bump to the base of the SAME image.
+    r = rt.resolve_runtime("3.2-3-python-3.13", target="patch", max_scope="minor")
+    assert r["target_tag"] == "3.2-3-python-3.13"  # unchanged, with pin
+    assert r["tier"] == "none"
+
+
+def test_variant_python_unsupported_by_newer_builds_holds_with_note():
+    # Python 3.11 is supported up to 3.2-1 but dropped by 3.2-3 (fixture):
+    # the pinned image must not be bumped onto a build that can't run it.
+    r = rt.resolve_runtime("3.1-5-python-3.11", target="latest-minor", max_scope="minor")
+    assert r["target_tag"] == "3.2-1-python-3.11"
+    assert "doesn't list Python 3.11 support" in r["note"]
+
+
+def test_airflow_for_tag_resolves_variant_via_base():
+    assert rt.airflow_for_tag("3.1-7-python-3.12") == "3.1.2"
