@@ -114,6 +114,16 @@ def main() -> int:
                 f"| `{p['current']}` | `{p['target']}` "
                 f"| {TIER_BADGE.get(p['tier'], p['tier'])} | {notes} |"
             )
+    # User pins the run raised to unblock a provider (bump-blocking-pins).
+    # These are USER-owned edits — they must be as visible as the bumps.
+    for b in plan.get("user_pin_bumps", []):
+        unb = b.get("unblocks") or {}
+        taken = unb.get("package", "?").replace("apache-airflow-providers-", "")
+        rows.append(
+            f"| `{b.get('pin', '?')}` (your pin) | `{b.get('from', '?')}` "
+            f"| `{b.get('to', '?')}` | — | raised to take `{taken}` "
+            f"{unb.get('version', '?')} (`bump-blocking-pins`) |"
+        )
     if rows:
         out += ["| Component | From | To | Tier | Notes |", "| --- | --- | --- | --- | --- |", *rows, ""]
     else:

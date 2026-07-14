@@ -31,6 +31,7 @@ import os
 import re
 import subprocess
 import sys
+import tempfile
 
 import apply_bump
 import resolve_target as rt
@@ -106,6 +107,39 @@ def compile_requirements(project_path: str) -> tuple[int, str]:
     return proc.returncode, proc.stderr
 
 
+def resolve_pin_choice(project_path: str, pin_base: str) -> str | None:
+    """The version uv picks for ``pin_base`` when its user pin is lifted.
+
+    Compiles the requirements with an override that relaxes JUST this pin
+    (an override replaces every declared constraint for that package), then
+    reads uv's choice from the lockfile it writes. All PEP 440/extras/marker
+    semantics stay uv's problem — no homegrown specifier evaluation. None
+    when uv still can't resolve or the choice can't be read; callers fall
+    back to walking the provider.
+    """
+    req = os.path.join(project_path, "requirements.txt")
+    with tempfile.TemporaryDirectory() as tmp:
+        override = os.path.join(tmp, "override.txt")
+        with open(override, "w", encoding="utf-8") as fh:
+            fh.write(pin_base + "\n")
+        out_file = os.path.join(tmp, "resolved.txt")
+        proc = subprocess.run(  # noqa: S603 — fixed argv, no shell
+            ["uv", "pip", "compile", req, "-o", out_file, "--no-header",  # noqa: S607
+             "--override", override],
+            capture_output=True, text=True, timeout=300, check=False,
+        )
+        if proc.returncode != 0 or not os.path.isfile(out_file):
+            return None
+        want = normalize_name(pin_base)
+        with open(out_file, encoding="utf-8") as fh:
+            for line in fh:
+                code = line.split("#", 1)[0].strip()
+                m = re.match(r"([A-Za-z0-9._\-]+)(?:\[[^\]]*\])?==(\S+)", code)
+                if m and normalize_name(m.group(1)) == want:
+                    return m.group(2)
+    return None
+
+
 def in_scope_versions(package: str, above: str, below: str) -> list[str]:
     """Installable stable versions strictly between two pins, newest first."""
     try:
@@ -139,6 +173,13 @@ def main() -> int:
     pools: dict[str, list[str]] = {}
     adjusted: set[str] = set()
     exhausted: set[str] = set()
+    # Opt-in (Tamara's field ask): raise the USER's blocking pin instead of
+    # holding the provider back. Off by default — it edits user-owned
+    # dependencies; every raise is reported in the plan and gated by
+    # verification like any other change.
+    bump_pins = os.environ.get("BUMP_BLOCKING_PINS", "").lower() in ("true", "1", "yes")
+    pin_raises: list[dict] = []
+    tried_pins: set[str] = set()   # one attempt per pin, then walk-back
 
     rc, err = compile_requirements(project_path)
     for _ in range(_MAX_COMPILES):
@@ -160,6 +201,20 @@ def main() -> int:
         pin = _blocking_pin_for(err, pkg)
         if pin:
             blocking.setdefault(pkg, pin)
+            blk_name, _, cur_ver = pin.partition("==")
+            base = blk_name.split("[")[0]
+            if bump_pins and cur_ver and base not in tried_pins:
+                tried_pins.add(base)
+                choice = resolve_pin_choice(project_path, base)
+                if choice and choice != cur_ver and apply_bump.bump_requirements(
+                        project_path,
+                        [{"package": normalize_name(base),
+                          "current": cur_ver, "target": choice}]):
+                    pin_raises.append({
+                        "pin": blk_name, "from": cur_ver, "to": choice,
+                        "unblocks": {"package": pkg, "version": live[pkg]}})
+                    rc, err = compile_requirements(project_path)
+                    continue  # conflict may be gone; only walk back if not
         if pkg not in pools:
             pools[pkg] = in_scope_versions(pkg, offender["current"], original[pkg])
         pool = pools[pkg]
@@ -178,7 +233,7 @@ def main() -> int:
         adjusted.add(pkg)
         rc, err = compile_requirements(project_path)
 
-    if not adjusted:
+    if not adjusted and not pin_raises:
         json.dump(summary, sys.stdout, indent=2)
         return 0
 
@@ -217,6 +272,21 @@ def main() -> int:
                          f"with your pins; {why}{advice}")
         summary["adjustments"].append(
             {"package": pkg, "from": orig, "to": final, "blocking_pin": blk})
+
+    if pin_raises:
+        plan["user_pin_bumps"] = plan.get("user_pin_bumps", []) + pin_raises
+        summary["pin_raises"] = pin_raises
+        by_pkg = {p.get("package"): p for p in plan.get("providers", [])}
+        for raised in pin_raises:
+            p = by_pkg.get(raised["unblocks"]["package"])
+            # A provider that was ALSO walked back keeps its hold note (the
+            # raise alone didn't clear its conflict); the raise itself still
+            # surfaces via user_pin_bumps either way.
+            if p is not None and p.get("package") not in adjusted:
+                p["note"] = (
+                    f"takes {raised['unblocks']['version']} — your "
+                    f"`{raised['pin']}` pin was raised {raised['from']} → "
+                    f"{raised['to']} to resolve the conflict (`bump-blocking-pins`)")
 
     # One source of truth for ALL derived aggregates (overall_tier, no_update,
     # author_changes, needs_migration, scope_exceeded, advisory) — a partial

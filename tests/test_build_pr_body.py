@@ -334,3 +334,19 @@ def test_deprecation_rewrites_marked_unverified_unless_verify_passed(tmp_path, m
                      verify="✅ ok", verify_status="passed")
     assert "covered by this PR's verification" in out_ok
     assert "unverified" not in out_ok
+
+
+def test_user_pin_bump_row_renders_in_version_table(tmp_path, monkeypatch):
+    plan = dict(_SEC_PLAN)
+    plan["providers"] = [
+        {"package": "apache-airflow-providers-common-ai", "current": "0.5.0",
+         "target": "0.6.0", "tier": "minor",
+         "note": "takes 0.6.0 — your `pydantic-ai-slim[openai]` pin was raised "
+                 "1.107.0 → 2.1.3 to resolve the conflict (`bump-blocking-pins`)"}]
+    plan["user_pin_bumps"] = [
+        {"pin": "pydantic-ai-slim[openai]", "from": "1.107.0", "to": "2.1.3",
+         "unblocks": {"package": "apache-airflow-providers-common-ai",
+                      "version": "0.6.0"}}]
+    out = _render(tmp_path, monkeypatch, plan, {"files": []})
+    assert ("| `pydantic-ai-slim[openai]` (your pin) | `1.107.0` | `2.1.3` | — | "
+            "raised to take `common-ai` 0.6.0 (`bump-blocking-pins`) |") in out
