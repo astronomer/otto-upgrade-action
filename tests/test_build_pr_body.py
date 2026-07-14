@@ -7,13 +7,18 @@ import json
 import build_pr_body as bpb
 
 
-def _render(tmp_path, monkeypatch, plan, apply, otto=None, verify=None, verify_status=None):
+def _render(tmp_path, monkeypatch, plan, apply, otto=None, verify=None, verify_status=None,
+            security=None):
     plan_f = tmp_path / "plan.json"
     apply_f = tmp_path / "apply.json"
     plan_f.write_text(json.dumps(plan))
     apply_f.write_text(json.dumps(apply))
     monkeypatch.setenv("PLAN_FILE", str(plan_f))
     monkeypatch.setenv("APPLY_FILE", str(apply_f))
+    if security is not None:
+        sec_f = tmp_path / "security.json"
+        sec_f.write_text(json.dumps(security))
+        monkeypatch.setenv("SECURITY_FILE", str(sec_f))
     if otto is not None:
         otto_f = tmp_path / "otto.json"
         otto_f.write_text(json.dumps(otto))
@@ -196,3 +201,48 @@ def test_scope_exceeded_points_to_guided_upgrade_for_held_major(tmp_path, monkey
     assert "Raise the input to go further" not in out
     assert "never auto-authored" in out
     assert "major Airflow upgrade is available" in out  # Heads up section still present
+
+
+_SEC_PLAN = {
+    "overall_tier": "minor", "needs_migration": True, "scope_exceeded": False,
+    "advisory": "",
+    "runtime": {"current_tag": "3.2-3", "target_tag": "3.3-2", "tier": "minor",
+                "current_airflow": "3.2.2", "target_airflow": "3.3.1"},
+    "providers": [],
+}
+
+
+def test_security_fixes_render_with_links_and_builds(tmp_path, monkeypatch):
+    sec = {"checked": True, "status": "ok", "current": "3.2-3", "target": "3.3-2",
+           "crossed": ["3.3-1", "3.3-2"], "total": 2,
+           "fixes": [
+               {"id": "CVE-2026-49298", "url": "https://avd.aquasec.com/nvd/cve-2026-49298",
+                "builds": ["3.3-1", "3.3-2"]},
+               {"id": "PYSEC-2026-24", "url": None, "builds": ["3.3-1"]},
+           ]}
+    out = _render(tmp_path, monkeypatch, _SEC_PLAN, {"files": []}, security=sec)
+    assert "### Security fixes included" in out
+    assert "[CVE-2026-49298](https://avd.aquasec.com/nvd/cve-2026-49298) (fixed in `3.3-1`, `3.3-2`)" in out
+    assert "- PYSEC-2026-24 (fixed in `3.3-1`)" in out  # linkless entry stays plain
+
+
+def test_security_determination_failure_is_loud(tmp_path, monkeypatch):
+    sec = {"checked": True, "status": "unavailable", "current": "3.2-3",
+           "target": "3.3-2", "reason": "release notes fetch failed: offline"}
+    out = _render(tmp_path, monkeypatch, _SEC_PLAN, {"files": []}, security=sec)
+    assert "### Security fixes included" in out
+    assert "Could not determine the security fixes" in out
+    assert "offline" in out
+
+
+def test_security_zero_fixes_says_so(tmp_path, monkeypatch):
+    sec = {"checked": True, "status": "ok", "current": "3.2-3", "target": "3.3-2",
+           "crossed": ["3.3-1", "3.3-2"], "fixes": [], "total": 0}
+    out = _render(tmp_path, monkeypatch, _SEC_PLAN, {"files": []}, security=sec)
+    assert "list no security fixes" in out
+
+
+def test_security_section_absent_when_not_checked(tmp_path, monkeypatch):
+    sec = {"checked": False, "reason": "runtime unchanged"}
+    out = _render(tmp_path, monkeypatch, _SEC_PLAN, {"files": []}, security=sec)
+    assert "Security fixes" not in out

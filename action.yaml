@@ -83,6 +83,9 @@ outputs:
   verify-status:
     description: "Verification result: passed, failed, or skipped (skipped when verification didn't run)."
     value: ${{ steps.verify.outputs.status || 'skipped' }}
+  security-fixes:
+    description: "Count of security fixes the Runtime upgrade ships (target release line), 'unknown' when it couldn't be determined, empty when the runtime didn't change."
+    value: ${{ steps.security.outputs.security-fixes }}
   pr-number:
     description: "Number of the opened/updated PR (empty in dry-run or no-op)."
     value: ${{ steps.open-pr.outputs.pr-number }}
@@ -277,6 +280,28 @@ runs:
           echo "author-changes=$(jq -r '.author_changes' "$P")"
         } >> "$GITHUB_OUTPUT"
 
+    - name: Collect security fixes shipped by the Runtime upgrade
+      id: security
+      # Reads the public Runtime release notes so the PR can show the security
+      # payoff of merging. Best-effort: a fetch miss or page-shape change is
+      # reported loudly in the PR body, never fails the run.
+      if: steps.resolve.outputs.no-update != 'true'
+      shell: bash
+      env:
+        PLAN_FILE: /tmp/otto-upgrade/plan.json
+      run: |
+        set -euo pipefail
+        python3 "$GITHUB_ACTION_PATH/scripts/security_fixes.py" > /tmp/otto-upgrade/security.json
+        echo "::group::Security fixes"
+        cat /tmp/otto-upgrade/security.json
+        echo "::endgroup::"
+        S=/tmp/otto-upgrade/security.json
+        if [[ "$(jq -r '.status // ""' "$S")" == "ok" ]]; then
+          echo "security-fixes=$(jq -r '.total' "$S")" >> "$GITHUB_OUTPUT"
+        elif [[ "$(jq -r '.checked' "$S")" == "true" ]]; then
+          echo "security-fixes=unknown" >> "$GITHUB_OUTPUT"
+        fi
+
     - name: Build Otto prompt
       if: steps.auth.outputs.enabled == 'true'
       shell: bash
@@ -325,6 +350,7 @@ runs:
         OTTO_FILE: /tmp/otto-upgrade/result.json
         VERIFY_FILE: /tmp/otto-upgrade/verify-report.md
         VERIFY_STATUS_FILE: /tmp/otto-upgrade/verify-status.txt
+        SECURITY_FILE: /tmp/otto-upgrade/security.json
         ACTION_PATH: ${{ github.action_path }}
         WORKDIR: /tmp/otto-upgrade
         BASE_BRANCH: ${{ inputs.base-branch }}

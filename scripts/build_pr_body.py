@@ -8,6 +8,7 @@ Env in:
   PLAN_FILE       resolve_target.py output      (required)
   VERIFY_FILE     verify status text file       (optional)
   OTTO_FILE       extract_result.py output JSON (optional)
+  SECURITY_FILE   security_fixes.py output JSON (optional)
   ACTION_REF      action version, for the footer (optional)
 Writes Markdown to stdout.
 """
@@ -129,6 +130,42 @@ def main() -> int:
             skipped.append(f"- **`{name}`**: {p['note']}")
     if skipped:
         out += ["### Not changed", "", *skipped, ""]
+
+    # Security fixes the Runtime upgrade delivers. Scoped to the target's
+    # release line (see security_fixes.py) — the wording must only assert
+    # what that scope supports. A determination failure is said out loud so
+    # a shape change on the notes page can't silently drop the section.
+    sec = _load("SECURITY_FILE")
+    if sec and sec.get("checked"):
+        if sec.get("status") == "ok" and sec.get("fixes"):
+            out += [
+                "### Security fixes included",
+                "",
+                f"The Runtime release notes list {sec['total']} security "
+                f"fix(es) in the `{sec['target']}` line that this upgrade picks up:",
+                "",
+            ]
+            for fix in sec["fixes"]:
+                label = f"[{fix['id']}]({fix['url']})" if fix.get("url") else fix["id"]
+                via = ", ".join(f"`{b}`" for b in fix.get("builds", []))
+                out.append(f"- {label}" + (f" (fixed in {via})" if via else ""))
+            out.append("")
+        elif sec.get("status") == "ok":
+            out += [
+                "### Security fixes included",
+                "",
+                "_The Runtime release notes list no security fixes for the "
+                "builds this upgrade picks up._",
+                "",
+            ]
+        else:
+            out += [
+                "### Security fixes included",
+                "",
+                f"> ⚠️ Could not determine the security fixes this upgrade "
+                f"ships: {sec.get('reason', 'unknown')}",
+                "",
+            ]
 
     # Otto migration result.
     if otto:
