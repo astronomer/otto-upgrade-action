@@ -28,11 +28,16 @@ provider (its walk-backs pick versions the first probe never saw). The
 re-gate pass sets PROJECT_PATH: the tree already carries the reconciled
 pins, so any target the gate changes is synced back into the files too.
 
+Probes go through `astro otto --validate-upgrade` (otto PR #359) — Otto is
+the only Astro API client; this action never speaks to Core directly. An
+astro CLI too old to know the flag degrades to unchecked-with-disclosure.
+
 Env in:
   PLAN_FILE           resolve_target.py output JSON (required; updated in place)
-  ASTRO_API_TOKEN     bearer token (ASTRO_TOKEN fallback)
+  ASTRO_CLI_PATH      astro binary (set by the install step)
+  ASTRO_API_TOKEN     credentials Otto reads (ASTRO_TOKEN fallback)
   ASTRO_ORGANIZATION  organization id (required for a real probe)
-  ASTRO_DOMAIN        astronomer.io | astronomer-stage.io | ... (default astronomer.io)
+  ASTRO_DOMAIN        astronomer.io | astronomer-stage.io | ... (Otto reads it)
   MAX_SCOPE           patch | minor | major (provider re-clamp after step-down)
   PROJECT_PATH        set ONLY on the re-gate pass: sync plan changes to files
 Writes a JSON summary to stdout. Always exits 0 unless PLAN_FILE is broken.
@@ -43,10 +48,8 @@ from __future__ import annotations
 import json
 import os
 import re
+import subprocess
 import sys
-import urllib.error
-import urllib.parse
-import urllib.request
 
 import apply_bump
 import resolve_target as rt
@@ -58,45 +61,55 @@ _MAX_PROVIDERS_PER_PROBE = 50
 _PROVIDER_IN_400 = re.compile(r"provider (apache-airflow-providers-[a-z0-9.\-_]+)", re.IGNORECASE)
 
 
-def _endpoint() -> tuple[str, str] | None:
-    token = os.environ.get("ASTRO_API_TOKEN") or os.environ.get("ASTRO_TOKEN")
-    org = os.environ.get("ASTRO_ORGANIZATION")
-    if not token or not org:
-        return None
-    domain = os.environ.get("ASTRO_DOMAIN", "astronomer.io")
-    return (f"https://api.{domain}/v1alpha1/organizations/{org}"
-            "/agent/skills/airflow-upgrade/archive", token)
+def _cli_ready() -> bool:
+    """The gate needs Otto's CLI (Otto is the ONLY Astro API client — this
+    action never speaks to Core directly) plus the credentials Otto reads."""
+    return bool(os.environ.get("ASTRO_CLI_PATH")
+                and (os.environ.get("ASTRO_API_TOKEN") or os.environ.get("ASTRO_TOKEN"))
+                and os.environ.get("ASTRO_ORGANIZATION"))
 
 
-def probe(url: str, token: str, current_af: str, target_af: str,
-          providers: list[dict]) -> tuple[int, str]:
-    """One validation probe. Returns (status, message). Status 0 = transport
-    error (Core unreachable / unexpected), message carries the reason."""
-    params = {"currentVersion": current_af}
+def probe(current_af: str, target_af: str, providers: list[dict]) -> tuple[int, str]:
+    """One validation probe via `astro otto --validate-upgrade` (a non-agent
+    mode that hits the airflow-upgrade archive endpoint through Otto's own
+    auth/routing and prints a JSON verdict — otto PR #359).
+
+    Returns (status, message) in the shape the dispatch below expects:
+    200/204 covered, 400 with Core's message for KB rejections, other HTTP
+    codes for auth-class errors, and 0 for anything transport-level —
+    including an astro CLI too old to know the flag.
+    """
+    params: dict = {"currentVersion": current_af}
     if target_af and target_af != current_af:
         params["targetVersion"] = target_af
     entries = [f"{p['package']}:{p['current']}:{p['target']}"
                for p in providers]
     if entries:
         params["providers"] = ",".join(entries)
-    req = urllib.request.Request(  # noqa: S310 — https URL built from the Astro domain
-        f"{url}?{urllib.parse.urlencode(params)}",
-        headers={"Authorization": f"Bearer {token}",
-                 "User-Agent": "otto-upgrade-action"},
-    )
     try:
-        with urllib.request.urlopen(req, timeout=60) as resp:  # noqa: S310 — https to the caller's Astro domain
-            resp.read(1)  # the archive body is irrelevant; probe is the point
-            return resp.status, ""
-    except urllib.error.HTTPError as exc:
-        body = exc.read().decode("utf-8", errors="replace")
-        try:
-            message = json.loads(body).get("message", body)
-        except (json.JSONDecodeError, AttributeError):
-            message = body
-        return exc.code, message[:500]
-    except Exception as exc:  # noqa: BLE001 — DNS, TLS, timeout: transport-level
+        proc = subprocess.run(  # noqa: S603 — fixed argv, no shell
+            [os.environ["ASTRO_CLI_PATH"], "otto",
+             "--validate-upgrade", json.dumps(params)],
+            capture_output=True, text=True, timeout=120, check=False,
+        )
+    except (subprocess.TimeoutExpired, OSError) as exc:
         return 0, f"{type(exc).__name__}: {exc}"
+    if proc.returncode != 0 or not proc.stdout.strip():
+        # Includes an older astro CLI that doesn't know --validate-upgrade.
+        detail = (proc.stderr or proc.stdout or "").strip()[:300]
+        return 0, f"otto --validate-upgrade unavailable (rc={proc.returncode}): {detail}"
+    try:
+        verdict = json.loads(proc.stdout)
+    except json.JSONDecodeError:
+        return 0, f"unparseable otto verdict: {proc.stdout.strip()[:300]}"
+    status = verdict.get("status")
+    if status == "covered":
+        return 204 if verdict.get("noop") else 200, ""
+    if status == "rejected":
+        return int(verdict.get("http") or 400), str(verdict.get("message", ""))[:500]
+    if status == "error":
+        return int(verdict.get("http") or 502), str(verdict.get("message", ""))[:500]
+    return 0, str(verdict.get("message", "unreachable"))[:500]
 
 
 def _probe_budget(n_bumped: int, n_candidates: int) -> int:
@@ -173,16 +186,15 @@ def main() -> int:
                       for p in plan.get("providers", [])},
     }
 
-    endpoint = _endpoint()
-    if endpoint is None:
-        summary["reason"] = "no Astro token/organization (dry-run?); KB coverage not checked"
+    if not _cli_ready():
+        summary["reason"] = ("no astro CLI / token / organization (dry-run?); "
+                             "KB coverage not checked")
         json.dump(summary, sys.stdout, indent=2)
         return 0
     if not current_af:
         summary["reason"] = "current Airflow unknown; KB coverage not checked"
         json.dump(summary, sys.stdout, indent=2)
         return 0
-    url, token = endpoint
 
     # Ranked step-down candidates the resolver exported (newest first,
     # distinct Airflow versions, all within scope). Fall back to hold-only
@@ -208,7 +220,7 @@ def main() -> int:
     resolved = False
     for _ in range(_probe_budget(len(_bumped(plan)), len(candidates))):
         target_af = runtime.get("target_airflow") or current_af
-        status, message = probe(url, token, current_af, target_af, _bumped(plan))
+        status, message = probe(current_af, target_af, _bumped(plan))
         summary["checked"] = True
         if status in (200, 204):
             summary["status"] = "covered"

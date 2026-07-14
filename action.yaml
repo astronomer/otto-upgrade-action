@@ -184,6 +184,20 @@ runs:
         } >> "$GITHUB_ENV"
         echo "enabled=true" >> "$GITHUB_OUTPUT"
 
+    - name: Install Astro CLI
+      id: install
+      # Needed by the Otto migration step AND by verify-level 'parse' (astro
+      # dev parse builds + tests the image), which runs even in tokenless
+      # dry-runs.
+      if: >-
+        steps.auth.outputs.enabled == 'true' ||
+        (steps.resolve.outputs.author-changes == 'true' &&
+         steps.resolve.outputs.no-update != 'true' &&
+         inputs.verify-level == 'parse')
+      uses: astronomer/setup-astro-cli@d8de1c738a79b83c057d185202557c894e33d2f7  # v0.0.1
+      with:
+        version: ${{ inputs.astro-cli-version }}
+
     - name: KB coverage gate
       id: kb-gate
       # Validates every target against the Upgrade KB through Core's
@@ -200,6 +214,7 @@ runs:
       env:
         PLAN_FILE: /tmp/otto-upgrade/plan.json
         MAX_SCOPE: ${{ inputs.max-upgrade-scope }}
+        ASTRO_CLI_PATH: ${{ steps.install.outputs.cli-path }}
         ASTRO_TOKEN: ${{ env.ASTRO_TOKEN }}
         ASTRO_API_TOKEN: ${{ env.ASTRO_API_TOKEN }}
         ASTRO_DOMAIN: ${{ env.ASTRO_DOMAIN }}
@@ -237,20 +252,6 @@ runs:
         echo "::group::Applied bumps"
         cat /tmp/otto-upgrade/apply.json
         echo "::endgroup::"
-
-    - name: Install Astro CLI
-      id: install
-      # Needed by the Otto migration step AND by verify-level 'parse' (astro
-      # dev parse builds + tests the image), which runs even in tokenless
-      # dry-runs.
-      if: >-
-        steps.auth.outputs.enabled == 'true' ||
-        (steps.resolve.outputs.author-changes == 'true' &&
-         steps.resolve.outputs.no-update != 'true' &&
-         inputs.verify-level == 'parse')
-      uses: astronomer/setup-astro-cli@d8de1c738a79b83c057d185202557c894e33d2f7  # v0.0.1
-      with:
-        version: ${{ inputs.astro-cli-version }}
 
     - name: Verify Otto is available
       if: steps.auth.outputs.enabled == 'true'
@@ -351,6 +352,7 @@ runs:
         PLAN_FILE: /tmp/otto-upgrade/plan.json
         PROJECT_PATH: ${{ inputs.project-path }}
         MAX_SCOPE: ${{ inputs.max-upgrade-scope }}
+        ASTRO_CLI_PATH: ${{ steps.install.outputs.cli-path }}
         ASTRO_TOKEN: ${{ env.ASTRO_TOKEN }}
         ASTRO_API_TOKEN: ${{ env.ASTRO_API_TOKEN }}
         ASTRO_DOMAIN: ${{ env.ASTRO_DOMAIN }}

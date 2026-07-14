@@ -40,17 +40,19 @@ def _run(tmp_path, monkeypatch, plan, probes, token=True):
     plan_f.write_text(json.dumps(plan))
     monkeypatch.setenv("PLAN_FILE", str(plan_f))
     if token:
+        monkeypatch.setenv("ASTRO_CLI_PATH", "/usr/local/bin/astro")
         monkeypatch.setenv("ASTRO_API_TOKEN", "tok")
         monkeypatch.setenv("ASTRO_ORGANIZATION", "org123")
         monkeypatch.setenv("ASTRO_DOMAIN", "astronomer-test.io")
     else:
+        monkeypatch.delenv("ASTRO_CLI_PATH", raising=False)
         monkeypatch.delenv("ASTRO_API_TOKEN", raising=False)
         monkeypatch.delenv("ASTRO_TOKEN", raising=False)
         monkeypatch.delenv("ASTRO_ORGANIZATION", raising=False)
     calls = []
     results = iter(probes)
 
-    def fake_probe(url, token_, current_af, target_af, providers):
+    def fake_probe(current_af, target_af, providers):
         calls.append((target_af, [(p["package"], p["target"]) for p in providers]))
         return next(results)
 
@@ -141,48 +143,78 @@ def test_uninterpretable_400_fails_closed_on_everything(tmp_path, monkeypatch):
     assert plan["no_update"] is True  # roll_up recomputed
 
 
-def test_probe_encodes_params_and_parses_error_json(monkeypatch):
+def _probe_with_cli(monkeypatch, returncode=0, stdout="", stderr="", raise_=None):
     seen = {}
 
-    class FakeResp:
-        status = 200
-        def read(self, _n): return b"x"
-        def __enter__(self): return self
-        def __exit__(self, *a): return False
+    def fake_run(cmd, **_kw):
+        seen["cmd"] = cmd
+        if raise_ is not None:
+            raise raise_
 
-    def fake_urlopen(req, timeout):
-        seen["url"] = req.full_url
-        seen["auth"] = req.headers.get("Authorization")
-        return FakeResp()
+        class P:
+            pass
 
-    monkeypatch.setattr(kb_gate.urllib.request, "urlopen", fake_urlopen)
+        P.returncode = returncode
+        P.stdout = stdout
+        P.stderr = stderr
+        return P()
+
+    monkeypatch.setenv("ASTRO_CLI_PATH", "/opt/astro")
+    monkeypatch.setattr(kb_gate.subprocess, "run", fake_run)
+    return seen
+
+
+def test_probe_invokes_otto_validate_upgrade_with_json_params(monkeypatch):
+    seen = _probe_with_cli(monkeypatch, stdout='{"status":"covered"}')
     status, msg = kb_gate.probe(
-        "https://api.x/v1alpha1/organizations/o/agent/skills/airflow-upgrade/archive",
-        "tok", "3.2.2", "3.3.0",
+        "3.2.2", "3.3.0",
         [{"package": "apache-airflow-providers-amazon",
           "current": "9.19.0", "target": "9.32.0"}])
-    assert status == 200 and msg == ""
-    assert "currentVersion=3.2.2" in seen["url"]
-    assert "targetVersion=3.3.0" in seen["url"]
-    assert "apache-airflow-providers-amazon%3A9.19.0%3A9.32.0" in seen["url"]
-    assert seen["auth"] == "Bearer tok"
+    assert (status, msg) == (200, "")
+    assert seen["cmd"][:3] == ["/opt/astro", "otto", "--validate-upgrade"]
+    params = json.loads(seen["cmd"][3])
+    assert params == {"currentVersion": "3.2.2", "targetVersion": "3.3.0",
+                      "providers": "apache-airflow-providers-amazon:9.19.0:9.32.0"}
 
 
 def test_probe_same_version_omits_target_param(monkeypatch):
-    seen = {}
-
-    class FakeResp:
-        status = 204
-        def read(self, _n): return b""
-        def __enter__(self): return self
-        def __exit__(self, *a): return False
-
-    monkeypatch.setattr(
-        kb_gate.urllib.request, "urlopen",
-        lambda req, timeout: seen.update(url=req.full_url) or FakeResp())
-    status, _ = kb_gate.probe("https://api.x/base", "tok", "3.2.2", "3.2.2", [])
+    seen = _probe_with_cli(monkeypatch, stdout='{"status":"covered","noop":true}')
+    status, _ = kb_gate.probe("3.2.2", "3.2.2", [])
     assert status == 204
-    assert "targetVersion" not in seen["url"]
+    assert "targetVersion" not in json.loads(seen["cmd"][3])
+
+
+def test_probe_maps_rejected_and_error_verdicts(monkeypatch):
+    _probe_with_cli(monkeypatch,
+                    stdout='{"status":"rejected","http":400,"message":"was yanked: bad"}')
+    assert kb_gate.probe("3.2.2", "3.3.0", []) == (400, "was yanked: bad")
+    _probe_with_cli(monkeypatch,
+                    stdout='{"status":"error","http":401,"message":"unauthorized"}')
+    assert kb_gate.probe("3.2.2", "3.3.0", []) == (401, "unauthorized")
+    _probe_with_cli(monkeypatch,
+                    stdout='{"status":"unreachable","message":"ECONNREFUSED"}')
+    assert kb_gate.probe("3.2.2", "3.3.0", []) == (0, "ECONNREFUSED")
+
+
+def test_probe_treats_old_cli_without_flag_as_transport(monkeypatch):
+    _probe_with_cli(monkeypatch, returncode=64, stderr="unknown flag: --validate-upgrade")
+    status, msg = kb_gate.probe("3.2.2", "3.3.0", [])
+    assert status == 0
+    assert "unknown flag" in msg
+
+
+def test_probe_treats_unparseable_verdict_as_transport(monkeypatch):
+    _probe_with_cli(monkeypatch, stdout="EPIPE garbage")
+    status, msg = kb_gate.probe("3.2.2", "3.3.0", [])
+    assert status == 0
+    assert "unparseable otto verdict" in msg
+
+
+def test_probe_survives_cli_timeout(monkeypatch):
+    import subprocess as sp
+    _probe_with_cli(monkeypatch, raise_=sp.TimeoutExpired(cmd="astro", timeout=120))
+    status, msg = kb_gate.probe("3.2.2", "3.3.0", [])
+    assert status == 0 and "TimeoutExpired" in msg
 
 
 def test_budget_exhaustion_fails_closed_not_half_adjusted(tmp_path, monkeypatch):
