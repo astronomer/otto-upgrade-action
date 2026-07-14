@@ -42,6 +42,10 @@ inputs:
     required: false
     default: "parse"
     description: "Post-upgrade verification: 'parse' (default — build the project's Docker image at the target Runtime and run Astro's DAG integrity tests inside it; catches image-build failures and verifies DAGs in the production-faithful environment; needs Docker, falls back to 'import' without it), 'import' (import the discovered DAG + plugin files in a PyPI-built env), 'syntax' (byte-compile only), or 'none'. Verification fails only on a NEW failure the upgrade introduces — failures that already occur at your current versions are reported but don't fail the run; env/setup problems report 'skipped'."
+  bump-blocking-pins:
+    required: false
+    default: "false"
+    description: "When a provider bump conflicts with one of YOUR pins, raise your pin to the newest version uv can co-resolve instead of holding the provider back. Off by default — it edits user-owned dependencies. Every raise is listed in the PR's version table and gated by verification like any other change; if uv can't resolve a raise, the provider is held as usual."
   deprecation-cleanup:
     required: false
     default: "fix"
@@ -267,6 +271,7 @@ runs:
       env:
         PROJECT_PATH: ${{ inputs.project-path }}
         PLAN_FILE: /tmp/otto-upgrade/plan.json
+        BUMP_BLOCKING_PINS: ${{ inputs.bump-blocking-pins }}
       run: |
         set -euo pipefail
         if command -v uv >/dev/null 2>&1; then

@@ -31,13 +31,16 @@ import os
 import re
 import subprocess
 import sys
+import tempfile
 
 import apply_bump
 import resolve_target as rt
 from detect_versions import normalize_name
 
-# Each attributed conflict costs one `uv pip compile` (~seconds, cached); the
-# cap bounds pathological chains, not the common one-conflict case.
+# Iteration cap on the reconcile loop. An iteration costs one `uv pip compile`
+# (~seconds, cached) — up to four when a pin-raise attempt runs (resolve the
+# choice, verify it, revert it, re-verify). Bounds pathological chains, not
+# the common one-conflict case.
 _MAX_COMPILES = 10
 
 # "And because you require pydantic-ai-slim[openai]==1.107.0, we can ..."
@@ -98,12 +101,59 @@ def _blocking_pin_for(err: str, pkg: str) -> str | None:
 
 def compile_requirements(project_path: str) -> tuple[int, str]:
     req = os.path.join(project_path, "requirements.txt")
-    proc = subprocess.run(  # noqa: S603 — fixed argv, no shell
-        ["uv", "pip", "compile", req, "-o", os.devnull, "--no-header"],  # noqa: S607 — uv from PATH by design
+    try:
+        proc = subprocess.run(  # noqa: S603 — fixed argv, no shell
+            ["uv", "pip", "compile", req, "-o", os.devnull, "--no-header"],  # noqa: S607 — uv from PATH by design
 
-        capture_output=True, text=True, timeout=300, check=False,
-    )
+            capture_output=True, text=True, timeout=300, check=False,
+        )
+    except (subprocess.TimeoutExpired, OSError) as exc:
+        # This step is best-effort under set -euo pipefail: a stalled or
+        # vanished uv must degrade to "not attributable" (verification is the
+        # backstop), never abort the action.
+        return -1, f"{type(exc).__name__}: {exc}"
     return proc.returncode, proc.stderr
+
+
+def resolve_pin_choice(project_path: str, pin_base: str,
+                       override_spec: str | None = None) -> str | None:
+    """The version uv picks for ``pin_base`` when its user pin is lifted.
+
+    Compiles the requirements with an override that relaxes JUST this pin,
+    then reads uv's choice from the lockfile it writes. All PEP 440/extras/
+    marker semantics stay uv's problem — no homegrown specifier evaluation.
+    None when uv still can't resolve or the choice can't be read; callers
+    fall back to walking the provider.
+
+    ``override_spec`` must carry the pin's EXTRAS (``pydantic-ai-slim[openai]``):
+    an override REPLACES the declared requirement wholesale, so a bare name
+    would resolve an extras-stripped graph — a version can pass there and
+    still not co-resolve once written back next to the real requirement.
+    """
+    req = os.path.join(project_path, "requirements.txt")
+    with tempfile.TemporaryDirectory() as tmp:
+        override = os.path.join(tmp, "override.txt")
+        with open(override, "w", encoding="utf-8") as fh:
+            fh.write((override_spec or pin_base) + "\n")
+        out_file = os.path.join(tmp, "resolved.txt")
+        try:
+            proc = subprocess.run(  # noqa: S603 — fixed argv, no shell
+                ["uv", "pip", "compile", req, "-o", out_file, "--no-header",  # noqa: S607
+                 "--override", override],
+                capture_output=True, text=True, timeout=300, check=False,
+            )
+        except (subprocess.TimeoutExpired, OSError):
+            return None
+        if proc.returncode != 0 or not os.path.isfile(out_file):
+            return None
+        want = normalize_name(pin_base)
+        with open(out_file, encoding="utf-8") as fh:
+            for line in fh:
+                code = line.split("#", 1)[0].strip()
+                m = re.match(r"([A-Za-z0-9._\-]+)(?:\[[^\]]*\])?==(\S+)", code)
+                if m and normalize_name(m.group(1)) == want:
+                    return m.group(2)
+    return None
 
 
 def in_scope_versions(package: str, above: str, below: str) -> list[str]:
@@ -139,6 +189,16 @@ def main() -> int:
     pools: dict[str, list[str]] = {}
     adjusted: set[str] = set()
     exhausted: set[str] = set()
+    # Opt-in (Tamara's field ask): raise the USER's blocking pin instead of
+    # holding the provider back. Off by default — it edits user-owned
+    # dependencies; every raise is reported in the plan and gated by
+    # verification like any other change.
+    bump_pins = os.environ.get("BUMP_BLOCKING_PINS", "").lower() in ("true", "1", "yes")
+    pin_raises: list[dict] = []
+    # (pin base, chosen version) pairs that already failed: retry a pin only
+    # when the graph shift produces a NEW answer — re-verifying the same
+    # failed choice on every walk step is pure compile churn.
+    failed_raises: set[tuple[str, str]] = set()
 
     rc, err = compile_requirements(project_path)
     for _ in range(_MAX_COMPILES):
@@ -160,6 +220,45 @@ def main() -> int:
         pin = _blocking_pin_for(err, pkg)
         if pin:
             blocking.setdefault(pkg, pin)
+            blk_name, _, cur_ver = pin.partition("==")
+            base = blk_name.split("[")[0]
+            if bump_pins and cur_ver:
+                choice = resolve_pin_choice(project_path, base, blk_name)
+                # Upward only: an upper-bound conflict makes uv pick a LOWER
+                # version, and silently downgrading a user pin under a flag
+                # named bump-* would be a lie — that case stays a hold+advice.
+                if (choice and (base, choice) not in failed_raises
+                        and rt.version_tuple(choice) > rt.version_tuple(cur_ver)):
+                    spec = {"package": normalize_name(base),
+                            "current": cur_ver, "target": choice}
+                    changed = apply_bump.bump_requirements(project_path, [spec])
+                    revert = {**spec, "current": choice, "target": cur_ver}
+                    if len(changed) == 1:
+                        rc, err = compile_requirements(project_path)
+                        if rc == 0:
+                            # Keep-gate is deliberately rc==0, nothing weaker:
+                            # "offender gone from the error" is NOT success —
+                            # the override that picked `choice` also silenced
+                            # every OTHER pin's cap on this package, so the
+                            # written-back == pin can break a neighbor (review
+                            # proved it live with requests/urllib3). A raise
+                            # survives only when the WHOLE set resolves.
+                            pin_raises.append({
+                                "pin": blk_name, "from": cur_ver, "to": choice,
+                                "unblocks": {"package": pkg, "version": live[pkg]}})
+                            continue
+                        # Anything else: undo and let the walk handle this
+                        # offender. A later iteration may retry this pin, but
+                        # only if the shifting graph yields a DIFFERENT choice.
+                        failed_raises.add((base, choice))
+                        apply_bump.bump_requirements(project_path, [revert])
+                        rc, err = compile_requirements(project_path)
+                    elif changed:
+                        # >1 line changed: the file pins this package more than
+                        # once (per-marker variants) — too ambiguous to edit
+                        # blind; restore and hold the provider instead.
+                        failed_raises.add((base, choice))
+                        apply_bump.bump_requirements(project_path, [revert])
         if pkg not in pools:
             pools[pkg] = in_scope_versions(pkg, offender["current"], original[pkg])
         pool = pools[pkg]
@@ -178,7 +277,31 @@ def main() -> int:
         adjusted.add(pkg)
         rc, err = compile_requirements(project_path)
 
-    if not adjusted:
+    # A raise is only worth keeping while the provider it bought stayed
+    # bumped: a later, unrelated conflict can walk that provider after the
+    # raise. The plan must describe the FINAL state — revert raises whose
+    # benefit evaporated, and re-point the rest at the final target.
+    current_of = {p["package"]: p["current"] for p in bumped}
+    for raised in list(pin_raises):
+        pkg = raised["unblocks"]["package"]
+        pin_pkg = normalize_name(raised["pin"].split("[")[0])
+        if live[pkg] == current_of[pkg]:
+            if apply_bump.bump_requirements(
+                    project_path, [{"package": pin_pkg,
+                                    "current": raised["to"],
+                                    "target": raised["from"]}]):
+                rc2, _ = compile_requirements(project_path)
+                if rc2 == 0:
+                    pin_raises.remove(raised)
+                    continue
+                # Reverting re-broke the final set — restore and keep it.
+                apply_bump.bump_requirements(
+                    project_path, [{"package": pin_pkg,
+                                    "current": raised["from"],
+                                    "target": raised["to"]}])
+        raised["unblocks"]["version"] = live[pkg]
+
+    if not adjusted and not pin_raises:
         json.dump(summary, sys.stdout, indent=2)
         return 0
 
@@ -217,6 +340,21 @@ def main() -> int:
                          f"with your pins; {why}{advice}")
         summary["adjustments"].append(
             {"package": pkg, "from": orig, "to": final, "blocking_pin": blk})
+
+    if pin_raises:
+        plan["user_pin_bumps"] = plan.get("user_pin_bumps", []) + pin_raises
+        summary["pin_raises"] = pin_raises
+        by_pkg = {p.get("package"): p for p in plan.get("providers", [])}
+        for raised in pin_raises:
+            p = by_pkg.get(raised["unblocks"]["package"])
+            # A provider that was ALSO walked back keeps its hold note (the
+            # raise alone didn't clear its conflict); the raise itself still
+            # surfaces via user_pin_bumps either way.
+            if p is not None and p.get("package") not in adjusted:
+                p["note"] = (
+                    f"takes {raised['unblocks']['version']} — your "
+                    f"`{raised['pin']}` pin was raised {raised['from']} → "
+                    f"{raised['to']} to resolve the conflict (`bump-blocking-pins`)")
 
     # One source of truth for ALL derived aggregates (overall_tier, no_update,
     # author_changes, needs_migration, scope_exceeded, advisory) — a partial
