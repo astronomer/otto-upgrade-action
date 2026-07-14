@@ -251,6 +251,26 @@ def resolve_runtime(current_tag: str, target: str, max_scope: str) -> dict[str, 
             pick = _newest(same_major) or cur
         tier = _runtime_tier(current_tag, cur_af, pick)
 
+    # Ranked step-down candidates for the KB coverage gate (kb_gate.py):
+    # in-scope tags newer than the current one, newest first, one per Airflow
+    # version. If the gate's probe rejects the picked Airflow target as not
+    # KB-covered, it walks this list instead of re-deriving feed logic.
+    scope_pool = same_minor if max_scope == "patch" else (
+        same_major if max_scope == "minor" else cands)
+    step_candidates: list[dict[str, str]] = []
+    seen_af: set[str] = set()
+    for c in sorted(scope_pool, key=lambda c: (
+            version_tuple(c["airflow"]), c["release_date"], version_tuple(c["tag"])),
+            reverse=True):
+        if version_tuple(c["airflow"]) < cm or c["tag"] == current_tag:
+            continue
+        if c["airflow"] in seen_af:
+            continue
+        seen_af.add(c["airflow"])
+        step_candidates.append({"tag": c["tag"], "airflow": c["airflow"]})
+        if len(step_candidates) >= 6:
+            break
+
     out: dict[str, Any] = {
         "current_tag": current_tag,
         "current_airflow": cur_af,
@@ -260,6 +280,7 @@ def resolve_runtime(current_tag: str, target: str, max_scope: str) -> dict[str, 
         "clamped": clamped,
         "held_major": held_major,
         "available_latest_tag": (_newest(cands) or {}).get("tag"),
+        "kb_step_candidates": step_candidates,
         "note": "",
     }
     if held_major:

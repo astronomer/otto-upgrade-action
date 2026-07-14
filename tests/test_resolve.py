@@ -422,3 +422,17 @@ def test_digest_pinned_runtime_is_refused(tmp_path, monkeypatch):
         TARGET="latest", MAX_SCOPE="major", INCLUDE_PROVIDERS="false",
     )
     assert plan2["runtime"]["current_airflow"] is None
+
+
+def test_runtime_exports_ranked_kb_step_candidates():
+    r = rt.resolve_runtime("3.1-5", target="latest-minor", max_scope="minor")
+    cands = r["kb_step_candidates"]
+    assert cands, "candidates must be exported for the KB gate"
+    # Newest first, one entry per Airflow version, none older than current.
+    airflows = [c["airflow"] for c in cands]
+    assert airflows == sorted(airflows, key=rt.version_tuple, reverse=True)
+    assert len(set(airflows)) == len(airflows)
+    assert cands[0]["tag"] == r["target_tag"]
+    cur_af = rt.version_tuple(r["current_airflow"])
+    assert all(rt.version_tuple(a) >= cur_af for a in airflows)
+    assert all(c["tag"] != "3.1-5" for c in cands)

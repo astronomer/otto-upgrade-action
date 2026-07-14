@@ -80,14 +80,14 @@ outputs:
     description: "Detected current Runtime tag."
     value: ${{ steps.resolve.outputs.current-runtime }}
   target-runtime:
-    description: "Resolved target Runtime tag."
-    value: ${{ steps.resolve.outputs.target-runtime }}
+    description: "Resolved target Runtime tag (after the KB coverage gate)."
+    value: ${{ steps.kb-gate.outputs.target-runtime || steps.resolve.outputs.target-runtime }}
   overall-scope:
-    description: "Largest tier across the resolved plan (after pin reconciliation): patch, minor, major, or none."
-    value: ${{ steps.reconcile.outputs.overall-tier || steps.resolve.outputs.overall-tier }}
+    description: "Largest tier across the resolved plan (after pin reconciliation and the KB coverage gate): patch, minor, major, or none."
+    value: ${{ steps.reconcile.outputs.overall-tier || steps.kb-gate.outputs.overall-tier || steps.resolve.outputs.overall-tier }}
   no-update:
     description: "'true' when nothing is behind and the action no-ops."
-    value: ${{ steps.reconcile.outputs.no-update || steps.resolve.outputs.no-update }}
+    value: ${{ steps.reconcile.outputs.no-update || steps.kb-gate.outputs.no-update || steps.resolve.outputs.no-update }}
   verify-status:
     description: "Verification result: passed, failed, or skipped (skipped when verification didn't run)."
     value: ${{ steps.verify.outputs.status || 'skipped' }}
@@ -148,20 +148,6 @@ runs:
           echo "Nothing to upgrade — everything is within scope of the latest available. No PR."
         fi
 
-    - name: Apply version bumps
-      id: apply
-      if: steps.resolve.outputs.no-update != 'true' && steps.resolve.outputs.author-changes == 'true'
-      shell: bash
-      env:
-        PROJECT_PATH: ${{ inputs.project-path }}
-        PLAN_FILE: /tmp/otto-upgrade/plan.json
-      run: |
-        set -euo pipefail
-        python3 "$GITHUB_ACTION_PATH/scripts/apply_bump.py" > /tmp/otto-upgrade/apply.json
-        echo "::group::Applied bumps"
-        cat /tmp/otto-upgrade/apply.json
-        echo "::endgroup::"
-
     - name: Resolve Otto auth
       id: auth
       # Runs for any real bump. Otto is mandatory: a real (PR-opening) run with
@@ -197,6 +183,59 @@ runs:
           echo "ASTRO_ORGANIZATION=$ORG"
         } >> "$GITHUB_ENV"
         echo "enabled=true" >> "$GITHUB_OUTPUT"
+
+    - name: KB coverage gate
+      id: kb-gate
+      # Validates every target against the Upgrade KB through Core's
+      # airflow-upgrade archive endpoint — the same check Otto's skill fetch
+      # enforces mid-run as a hard 400, moved to plan time and converted into
+      # holds/step-downs with notes. Token-gated: a tokenless dry-run previews
+      # the unenforced plan. Best-effort on transport: Core unreachable is
+      # noted in the plan, never fails the run.
+      if: >-
+        steps.auth.outputs.enabled == 'true' &&
+        steps.resolve.outputs.author-changes == 'true' &&
+        steps.resolve.outputs.no-update != 'true'
+      shell: bash
+      env:
+        PLAN_FILE: /tmp/otto-upgrade/plan.json
+        ASTRO_TOKEN: ${{ env.ASTRO_TOKEN }}
+        ASTRO_API_TOKEN: ${{ env.ASTRO_API_TOKEN }}
+        ASTRO_DOMAIN: ${{ env.ASTRO_DOMAIN }}
+        ASTRO_ORGANIZATION: ${{ env.ASTRO_ORGANIZATION }}
+      run: |
+        set -euo pipefail
+        python3 "$GITHUB_ACTION_PATH/scripts/kb_gate.py" > /tmp/otto-upgrade/kb-gate.json
+        echo "::group::KB coverage gate"
+        cat /tmp/otto-upgrade/kb-gate.json
+        echo "::endgroup::"
+        P=/tmp/otto-upgrade/plan.json
+        {
+          echo "overall-tier=$(jq -r '.overall_tier' "$P")"
+          echo "needs-migration=$(jq -r '.needs_migration' "$P")"
+          echo "no-update=$(jq -r '.no_update' "$P")"
+          echo "author-changes=$(jq -r '.author_changes' "$P")"
+          echo "target-runtime=$(jq -r '.runtime.target_tag // ""' "$P")"
+        } >> "$GITHUB_OUTPUT"
+
+    - name: Apply version bumps
+      id: apply
+      # Reads the gate-adjusted plan; a plan the gate fully held must not
+      # touch the tree. kb-gate is skipped in tokenless runs -> fall back to
+      # the resolve outputs.
+      if: >-
+        (steps.kb-gate.outputs.no-update || steps.resolve.outputs.no-update) != 'true' &&
+        (steps.kb-gate.outputs.author-changes || steps.resolve.outputs.author-changes) == 'true'
+      shell: bash
+      env:
+        PROJECT_PATH: ${{ inputs.project-path }}
+        PLAN_FILE: /tmp/otto-upgrade/plan.json
+      run: |
+        set -euo pipefail
+        python3 "$GITHUB_ACTION_PATH/scripts/apply_bump.py" > /tmp/otto-upgrade/apply.json
+        echo "::group::Applied bumps"
+        cat /tmp/otto-upgrade/apply.json
+        echo "::endgroup::"
 
     - name: Install Astro CLI
       id: install

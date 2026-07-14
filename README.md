@@ -381,10 +381,11 @@ don't race the branch.
 
 1. **Detect** — parse the Dockerfile `FROM` Runtime tag (and any `@sha256:` digest) and `apache-airflow-providers-*` pins.
 2. **Resolve** — query the public Runtime feed and PyPI (no credentials needed), pick the target per `target`/`max-upgrade-scope`, tier the jump. Digest-pinned `FROM` lines are reported, not silently bumped.
-3. **Apply** — rewrite the Runtime tag and provider pins in place (extras, markers, and comments preserved).
-4. **Migrate** (minor/major jumps, Otto) — drives Otto's hosted **airflow-upgrade skill** (this KB) to rewrite moved imports / renamed call sites over the bumped project. The skill is engaged *deterministically*: the action both scopes it (`--allowed-skills airflow-upgrade`) and names it in the prompt with `currentVersion`/`targetVersion`. This matters — a bare "upgrade this project" prompt makes Otto route to generic documentation search and skip the curated skill entirely. If Otto errors, the run **fails** (no PR) and retries next schedule — it never ships an unmigrated bump as a pretend upgrade.
-5. **Verify** — syntax + (default) import-at-target check.
-6. **Open/update PR** — single rolling branch, body with the version table, migration summary, and verification result.
+3. **KB coverage gate** (real runs) — validate every target against Otto's Upgrade KB through the same Core endpoint the migration uses. A target the KB can't migrate yet (a Runtime line released hours ago, a provider version the KB hasn't ingested, a curated yank) is stepped down or held with the reason in the PR — the action never proposes what Otto can't reason about. Tokenless dry-runs preview the unchecked plan and say so.
+4. **Apply** — rewrite the Runtime tag and provider pins in place (extras, markers, and comments preserved).
+5. **Migrate** (minor/major jumps, Otto) — drives Otto's hosted **airflow-upgrade skill** (this KB) to rewrite moved imports / renamed call sites over the bumped project. The skill is engaged *deterministically*: the action both scopes it (`--allowed-skills airflow-upgrade`) and names it in the prompt with `currentVersion`/`targetVersion`. This matters — a bare "upgrade this project" prompt makes Otto route to generic documentation search and skip the curated skill entirely. If Otto errors, the run **fails** (no PR) and retries next schedule — it never ships an unmigrated bump as a pretend upgrade.
+6. **Verify** — syntax + (default) import-at-target check.
+7. **Open/update PR** — single rolling branch, body with the version table, migration summary, and verification result.
 
 ## Security & permissions
 
