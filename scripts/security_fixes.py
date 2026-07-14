@@ -51,9 +51,13 @@ _BULLET = re.compile(r"^\s*[*+-]\s+(?P<text>\S.*)$")
 _LINK = re.compile(r"\[(?P<id>[^\]]+)\]\((?P<url>[^)\s]+)(?:\s+\"[^\"]*\")?\)")
 
 
-# The real page is ~110 KB; anything near this cap is wrong regardless of
-# origin, and the caps keep a hostile/broken response (compression bomb) from
-# OOM-killing the step before main() can emit its loud-skip JSON.
+# Bomb protection, not a growth budget: the caps exist so a hostile/broken
+# response (compression bomb, runaway body) can't OOM the step before main()
+# emits its loud-skip JSON. Headroom is ~72x today's page (~110 KB for two
+# years of builds, ~1.3 KB per entry — decades of growth), and the docs site
+# already archives old Runtime lines to a separate page, so the page prunes
+# rather than growing monotonically. If the cap is ever hit anyway, the
+# outcome is the loud "could not determine" skip, never a wrong count.
 _MAX_BODY = 8 * 1024 * 1024
 
 
