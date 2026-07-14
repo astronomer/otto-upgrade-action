@@ -246,3 +246,24 @@ def test_security_section_absent_when_not_checked(tmp_path, monkeypatch):
     sec = {"checked": False, "reason": "runtime unchanged"}
     out = _render(tmp_path, monkeypatch, _SEC_PLAN, {"files": []}, security=sec)
     assert "Security fixes" not in out
+
+
+def test_cross_line_security_count_reads_as_lower_bound(tmp_path, monkeypatch):
+    sec = {"checked": True, "status": "ok", "current": "3.2-3", "target": "3.3-2",
+           "crossed": ["3.3-1", "3.3-2"], "total": 2, "lower_bound": True,
+           "fixes": [
+               {"id": "CVE-2026-49298", "url": "https://x.test/a", "builds": ["3.3-1"]},
+               {"id": "PYSEC-2026-24", "url": "https://x.test/b", "builds": ["3.3-1"]},
+           ]}
+    out = _render(tmp_path, monkeypatch, _SEC_PLAN, {"files": []}, security=sec)
+    assert "list at least 2 security fix(es)" in out
+    assert "lower bound" in out
+
+
+def test_cross_line_zero_does_not_claim_no_fixes(tmp_path, monkeypatch):
+    sec = {"checked": True, "status": "ok", "current": "3.2-3", "target": "3.3-2",
+           "crossed": ["3.3-1", "3.3-2"], "fixes": [], "total": 0,
+           "lower_bound": True}
+    out = _render(tmp_path, monkeypatch, _SEC_PLAN, {"files": []}, security=sec)
+    assert "may still include fixes inherited" in out
+    assert "list no security fixes for the builds" not in out

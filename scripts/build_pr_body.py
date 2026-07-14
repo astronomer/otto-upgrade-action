@@ -137,19 +137,44 @@ def main() -> int:
     # a shape change on the notes page can't silently drop the section.
     sec = _load("SECURITY_FILE")
     if sec and sec.get("checked"):
+        # Cross-line counts are a lower bound (fixes inherited at the new
+        # line's fork point aren't enumerable from per-line notes) — say
+        # "at least" and never present the number as exhaustive.
+        lower = sec.get("lower_bound")
         if sec.get("status") == "ok" and sec.get("fixes"):
+            # .get() throughout: this JSON crossed a process boundary, and a
+            # missing key must degrade the section, never crash the render —
+            # a crash here would abort open-pr.sh and ship NO PR at all.
+            total = sec.get("total", len(sec["fixes"]))
+            qty = f"at least {total}" if lower else f"{total}"
             out += [
                 "### Security fixes included",
                 "",
-                f"The Runtime release notes list {sec['total']} security "
-                f"fix(es) in the `{sec['target']}` line that this upgrade picks up:",
+                f"The Runtime release notes list {qty} security "
+                f"fix(es) in the `{sec.get('target', '?')}` line that this upgrade picks up:",
                 "",
             ]
             for fix in sec["fixes"]:
-                label = f"[{fix['id']}]({fix['url']})" if fix.get("url") else fix["id"]
+                label = (f"[{fix['id']}]({fix['url']})"
+                         if fix.get("id") and fix.get("url") else fix.get("id", "?"))
                 via = ", ".join(f"`{b}`" for b in fix.get("builds", []))
                 out.append(f"- {label}" + (f" (fixed in {via})" if via else ""))
+            if lower:
+                out += ["",
+                        "_The new release line may also include fixes inherited "
+                        "from earlier lines; the release notes only enumerate "
+                        "fixes per line, so this list is a lower bound._"]
             out.append("")
+        elif sec.get("status") == "ok" and lower:
+            out += [
+                "### Security fixes included",
+                "",
+                "_The Runtime release notes list no security fixes in the "
+                "target's release line yet. The upgrade may still include "
+                "fixes inherited from earlier lines — the notes don't "
+                "enumerate those._",
+                "",
+            ]
         elif sec.get("status") == "ok":
             out += [
                 "### Security fixes included",

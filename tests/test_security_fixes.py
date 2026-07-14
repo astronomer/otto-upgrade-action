@@ -147,3 +147,49 @@ def test_main_end_to_end_ok(tmp_path, monkeypatch):
         {"runtime": {"current_tag": "3.2-3", "target_tag": "3.3-2"}},
     )
     assert report["status"] == "ok" and report["total"] == 3
+
+
+def test_cross_line_report_is_flagged_lower_bound():
+    assert sf.collect(PAGE, "3.2-3", "3.3-2")["lower_bound"] is True
+    assert sf.collect(PAGE, "3.3-1", "3.3-2")["lower_bound"] is False
+
+
+@pytest.mark.parametrize("mutation", [
+    ("### Security fixes", "#### Security fixes"),      # level change
+    ("### Security fixes", "### Security updates"),      # rename, keeps the word
+    ("### Security fixes", "### Security fixes (CVEs)"),  # parenthetical
+])
+def test_unrecognized_security_heading_in_crossed_build_fails_closed(mutation):
+    page = PAGE.replace(*mutation)
+    report = sf.collect(page, "3.3-1", "3.3-2")
+    assert report["status"] == "shape-mismatch"
+    assert "unrecognized format" in report["reason"]
+
+
+def test_sitewide_heading_rename_without_the_word_security_trips_canary():
+    # A rename the heading probe can't see ("Vulnerability patches") makes
+    # every section parse as absent — the page-wide canary must refuse to
+    # report a confident zero.
+    page = PAGE.replace("### Security fixes", "### Vulnerability patches")
+    report = sf.collect(page, "3.3-1", "3.3-2")
+    assert report["status"] == "shape-mismatch"
+    assert "anywhere on the page" in report["reason"]
+
+
+def test_numbered_list_entries_fail_closed():
+    page = PAGE.replace(
+        "* Fixed [CVE-2026-49298](https://avd.aquasec.com/nvd/cve-2026-49298)\n"
+        "* Fixed [GHSA-65pc-fj4g-8rjx](https://github.com/advisories/GHSA-65pc-fj4g-8rjx)",
+        "1. Fixed [CVE-2026-49298](https://avd.aquasec.com/nvd/cve-2026-49298)",
+    )
+    report = sf.collect(page, "3.3-1", "3.3-2")
+    assert report["status"] == "shape-mismatch"
+
+
+def test_link_with_markdown_title_keeps_id_and_url():
+    page = ('## Astro Runtime 3.3-2\n\n### Security fixes\n\n'
+            '* Fixed [CVE-2026-1](https://example.com/cve-2026-1 "advisory")\n')
+    report = sf.collect(page, "3.3-1", "3.3-2")
+    assert report["fixes"] == [
+        {"id": "CVE-2026-1", "url": "https://example.com/cve-2026-1",
+         "builds": ["3.3-2"]}]

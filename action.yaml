@@ -84,7 +84,7 @@ outputs:
     description: "Verification result: passed, failed, or skipped (skipped when verification didn't run)."
     value: ${{ steps.verify.outputs.status || 'skipped' }}
   security-fixes:
-    description: "Count of security fixes the Runtime upgrade ships (target release line), 'unknown' when it couldn't be determined, empty when the runtime didn't change."
+    description: "Count of security fixes listed in the Runtime release notes for the target's release line — a lower bound for cross-line upgrades. 'unknown' when it couldn't be determined, empty when the runtime didn't change."
     value: ${{ steps.security.outputs.security-fixes }}
   pr-number:
     description: "Number of the opened/updated PR (empty in dry-run or no-op)."

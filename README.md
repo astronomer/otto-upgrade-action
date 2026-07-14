@@ -372,7 +372,7 @@ don't race the branch.
 | `overall-scope` | Largest tier across the plan: `patch`/`minor`/`major`/`none`. |
 | `no-update` | `true` when nothing is behind. |
 | `verify-status` | `passed`/`failed`/`skipped` (`skipped` when verification didn't run). |
-| `security-fixes` | Count of security fixes the Runtime upgrade ships (from the public [Runtime release notes](https://www.astronomer.io/docs/runtime/runtime-release-notes), scoped to the target's release line). `unknown` when the notes couldn't be read; empty when the Runtime didn't change. |
+| `security-fixes` | Count of security fixes listed in the public [Runtime release notes](https://www.astronomer.io/docs/runtime/runtime-release-notes) for the target's release line — a lower bound when the upgrade crosses lines (inherited fixes aren't enumerable per line). `unknown` when the notes couldn't be read; empty when the Runtime didn't change. |
 | `pr-number` / `pr-url` / `branch` | The opened/updated PR (empty in dry-run / no-op). |
 
 ## How it works

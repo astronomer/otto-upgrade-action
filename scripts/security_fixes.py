@@ -13,10 +13,12 @@ when the current tag is on the same line — strictly above it. A cross-minor
 upgrade therefore under-claims (fixes the new line inherited from its fork
 point go uncounted); the PR wording matches what is actually asserted.
 
-Best-effort by design: always exits 0. Any miss — page unreachable, heading
-shape changed, target build not listed yet — is recorded loudly in the output
-JSON so the PR says "could not be determined" instead of silently omitting
-the section.
+Best-effort on DATA, loud on infrastructure: any data miss — page
+unreachable, heading shape changed, target build not listed yet — is
+recorded in the output JSON (exit 0) so the PR says "could not be
+determined" instead of silently omitting the section. A broken invocation
+(PLAN_FILE unset/unreadable) still raises: that's an action bug and must
+red the run.
 
 Env in:
   PLAN_FILE           resolve_target.py output JSON (required)
@@ -41,8 +43,9 @@ RELEASE_NOTES_URL = os.environ.get(
 
 _BUILD_HEADING = re.compile(r"^##\s+Astro Runtime\s+(?P<tag>[A-Za-z0-9.\-]+)\s*$", re.M)
 _SECURITY_HEADING = re.compile(r"^###\s+Security fixes\s*$", re.M | re.I)
+_HEADING_LINE = re.compile(r"^#{1,6}\s.*$", re.M)
 _BULLET = re.compile(r"^\s*[*+-]\s+(?P<text>\S.*)$")
-_LINK = re.compile(r"\[(?P<id>[^\]]+)\]\((?P<url>[^)\s]+)\)")
+_LINK = re.compile(r"\[(?P<id>[^\]]+)\]\((?P<url>[^)\s]+)(?:\s+\"[^\"]*\")?\)")
 
 
 def _fetch_text(url: str) -> str:
@@ -60,8 +63,19 @@ def _parse_builds(page: str) -> list[tuple[str, str]]:
     ]
 
 
-def _security_entries(body: str) -> list[dict]:
-    """Fix entries under a build's 'Security fixes' heading; [] when absent."""
+def _security_entries(body: str) -> list[dict] | None:
+    """Fix entries under a build's security heading.
+
+    [] means the build has no security section — a legitimate zero. None
+    means the build HAS security content in a shape this parser doesn't
+    recognize (heading at another depth/name, entries that aren't bullets):
+    fail closed — callers must report a shape mismatch loudly, never let a
+    format change on the page masquerade as "zero fixes".
+    """
+    for h in _HEADING_LINE.finditer(body):
+        line = h.group(0)
+        if "security" in line.lower() and not _SECURITY_HEADING.match(line):
+            return None
     m = _SECURITY_HEADING.search(body)
     if not m:
         return []
@@ -80,6 +94,8 @@ def _security_entries(body: str) -> list[dict]:
             entries.append({"id": link.group("id"), "url": link.group("url")})
         else:
             entries.append({"id": re.sub(r"^Fixed\s+", "", text).strip(), "url": None})
+    if not entries and section.strip():
+        return None
     return entries
 
 
@@ -110,14 +126,31 @@ def collect(page: str, current: str, target: str) -> dict:
          and (not same_line or version_tuple(tag) > version_tuple(current))),
         key=version_tuple,
     )
-    bodies = dict(builds)
+    # Parse every build, not just crossed ones: if NOTHING on the whole page
+    # yields a recognizable security entry, the format changed globally and a
+    # "zero fixes" answer would be a lie with confidence.
+    parsed = {tag: _security_entries(body) for tag, body in builds}
+    for tag in crossed:
+        if parsed[tag] is None:
+            report.update(status="shape-mismatch",
+                          reason=f"build {tag} has security content in an "
+                                 "unrecognized format; refusing to report a count")
+            return report
+    if not any(parsed.values()):
+        report.update(status="shape-mismatch",
+                      reason="no security-fix entries recognized anywhere on "
+                             "the page; the format may have changed")
+        return report
     fixes: dict[str, dict] = {}
     for tag in crossed:
-        for entry in _security_entries(bodies[tag]):
+        for entry in parsed[tag]:
             fix = fixes.setdefault(
                 entry["id"], {"id": entry["id"], "url": entry["url"], "builds": []})
             fix["builds"].append(tag)
-    report.update(status="ok", crossed=crossed,
+    # Cross-line upgrades under-claim by design (fixes the target line
+    # inherited at its fork point are not enumerable from per-line notes) —
+    # the count is a lower bound and consumers must present it as one.
+    report.update(status="ok", crossed=crossed, lower_bound=not same_line,
                   fixes=list(fixes.values()), total=len(fixes))
     return report
 
