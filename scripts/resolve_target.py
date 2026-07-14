@@ -121,6 +121,19 @@ def tier_between(cur: str, tgt: str) -> str:
 _STABLE: frozenset[str] = frozenset({"stable"})
 _STABLE_AND_DEPRECATED: frozenset[str] = frozenset({"stable", "deprecated"})
 
+# Astronomer publishes Python-variant image tags (`3.2-5-python-3.13`) that
+# the Runtime feed does NOT list — the feed carries base tags plus a
+# `pythonVersions` support list per build. Field case (Tamara, 2026-07-15):
+# a variant-pinned project got "tag not found in the Runtime feed" and lost
+# runtime bumps entirely.
+_PYTHON_VARIANT = re.compile(r"^(?P<base>.+?)-python-(?P<py>\d+\.\d+)$")
+
+
+def split_python_variant(tag: str) -> tuple[str, str | None]:
+    """``3.2-5-python-3.13`` -> (``3.2-5``, ``3.13``); plain tags pass through."""
+    m = _PYTHON_VARIANT.match(tag)
+    return (m.group("base"), m.group("py")) if m else (tag, None)
+
 
 def _runtime_candidates(channels: frozenset[str] = _STABLE) -> list[dict[str, Any]]:
     """Flatten the runtime feed into candidates with airflow versions.
@@ -146,6 +159,7 @@ def _runtime_candidates(channels: frozenset[str] = _STABLE) -> list[dict[str, An
                     "release_date": meta.get("releaseDate", ""),
                     "channel": meta.get("channel", ""),
                     "scheme": "v3" if key == "runtimeVersionsV3" else "legacy",
+                    "python_versions": meta.get("pythonVersions") or [],
                 }
             )
     seen: set[str] = set()
@@ -183,11 +197,13 @@ def airflow_for_tag(tag: str) -> str | None:
     """Airflow version behind a Runtime tag, or None if the tag isn't in the feed.
 
     Resolves against stable *and* deprecated channels so a project on an EOL
-    runtime still gets a real current Airflow version.
+    runtime still gets a real current Airflow version. Python-variant tags
+    resolve via their base tag (the feed lists base tags only).
     """
+    base, _py = split_python_variant(tag)
     try:
         for c in _runtime_candidates(_STABLE_AND_DEPRECATED):
-            if c["tag"] == tag:
+            if c["tag"] == base:
                 return c["airflow"]
     except Exception:  # noqa: BLE001 — feed unreachable; caller treats None as "unknown"
         return None
@@ -200,7 +216,14 @@ def resolve_runtime(current_tag: str, target: str, max_scope: str) -> dict[str, 
     by_tag: dict[str, Any] = {}
     for c in cur_cands:
         by_tag.setdefault(c["tag"], c)
-    cur = by_tag.get(current_tag)
+
+    # A `-python-X.Y` variant pin resolves via its BASE tag and is restored
+    # onto whatever target gets picked, so the user keeps their Python.
+    base_tag, py_pin = split_python_variant(current_tag)
+    cur = by_tag.get(base_tag)
+
+    def _with_variant(tag: str) -> str:
+        return f"{tag}-python-{py_pin}" if py_pin else tag
 
     if cur is None:
         return {
@@ -214,6 +237,21 @@ def resolve_runtime(current_tag: str, target: str, max_scope: str) -> dict[str, 
             "note": f"Runtime tag '{current_tag}' not found in the Runtime feed; "
             "skipping the runtime bump. Pin a published Runtime tag to enable it.",
         }
+
+    py_note = ""
+    if py_pin:
+        # Only builds that publish the pinned Python are upgrade candidates.
+        # A build without pythonVersions metadata is excluded (fail closed:
+        # proposing a variant tag that may not exist beats guessing).
+        unfiltered_newest = _newest(cands)
+        cands = [c for c in cands if py_pin in c["python_versions"]]
+        newest = _newest(cands)
+        if unfiltered_newest and (
+                newest is None
+                or version_tuple(newest["airflow"]) < version_tuple(unfiltered_newest["airflow"])):
+            py_note = (f"newer Runtime {unfiltered_newest['tag']} doesn't list "
+                       f"Python {py_pin} support, so it isn't a candidate for "
+                       "this python-pinned image")
 
     cur_af = cur["airflow"]
     cm = version_tuple(cur_af)
@@ -232,7 +270,7 @@ def resolve_runtime(current_tag: str, target: str, max_scope: str) -> dict[str, 
         pick = _newest(same_major)
 
     pick = pick or cur
-    tier = _runtime_tier(current_tag, cur_af, pick)
+    tier = _runtime_tier(base_tag, cur_af, pick)
 
     # Clamp to max-upgrade-scope. If the natural pick is too big a jump, fall
     # back to the newest candidate that stays within scope. Track whether the
@@ -249,17 +287,18 @@ def resolve_runtime(current_tag: str, target: str, max_scope: str) -> dict[str, 
             pick = _newest(same_minor) or cur
         elif max_scope == "minor":
             pick = _newest(same_major) or cur
-        tier = _runtime_tier(current_tag, cur_af, pick)
+        tier = _runtime_tier(base_tag, cur_af, pick)
 
     out: dict[str, Any] = {
         "current_tag": current_tag,
         "current_airflow": cur_af,
-        "target_tag": pick["tag"],
+        "target_tag": _with_variant(pick["tag"]) if pick["tag"] != base_tag else current_tag,
         "target_airflow": pick["airflow"],
         "tier": tier,
         "clamped": clamped,
         "held_major": held_major,
         "available_latest_tag": (_newest(cands) or {}).get("tag"),
+        "python_pin": py_pin,
         "note": "",
     }
     if held_major:
@@ -271,6 +310,8 @@ def resolve_runtime(current_tag: str, target: str, max_scope: str) -> dict[str, 
             f"current Runtime '{current_tag}' (Airflow {cur_af}) is on the "
             "deprecated channel — upgrading off it is recommended."
         )
+    if py_note:
+        out["note"] = f"{out['note']}; {py_note}" if out["note"] else py_note
     return out
 
 

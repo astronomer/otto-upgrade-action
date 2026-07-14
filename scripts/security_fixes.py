@@ -37,7 +37,7 @@ import time
 import urllib.request
 import zlib
 
-from resolve_target import version_tuple
+from resolve_target import split_python_variant, version_tuple
 
 RELEASE_NOTES_URL = os.environ.get(
     "RELEASE_NOTES_URL",
@@ -240,6 +240,10 @@ def main() -> int:
         plan = json.load(fh)
     runtime = plan.get("runtime") or {}
     current, target = runtime.get("current_tag"), runtime.get("target_tag")
+    # Release notes list base tags only; a python-variant pin
+    # (3.3-2-python-3.13) must not read as an unknown build.
+    current = split_python_variant(current)[0] if current else current
+    target = split_python_variant(target)[0] if target else target
     if not current or not target or current == target:
         json.dump({"checked": False, "reason": "runtime unchanged"}, sys.stdout, indent=2)
         return 0

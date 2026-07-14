@@ -334,3 +334,15 @@ class TestFetchHardening:
         with pytest.raises(RuntimeError) as exc:
             sf._fetch_text("https://x")
         assert "size cap" in str(exc.value)
+
+
+def test_python_variant_tags_resolve_to_base_for_coverage(tmp_path, monkeypatch):
+    # Release notes list base tags only; a python-pinned image must not read
+    # as an unknown build (shape-mismatch) or as unchanged.
+    report = _main(
+        tmp_path, monkeypatch,
+        {"runtime": {"current_tag": "3.2-3-python-3.13",
+                     "target_tag": "3.3-2-python-3.13"}},
+    )
+    assert report["status"] == "ok"
+    assert report["crossed"] == ["3.3-1", "3.3-2"]

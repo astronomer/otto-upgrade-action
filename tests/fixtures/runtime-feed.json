@@ -1,19 +1,125 @@
 {
   "schemaVersion": "test",
   "runtimeVersionsV3": {
-    "2.10-12": { "metadata": { "airflowVersion": "2.10.5", "channel": "stable", "releaseDate": "2025-01-01" } },
-    "2.11-1":  { "metadata": { "airflowVersion": "2.11.0", "channel": "stable", "releaseDate": "2025-03-01" } },
-    "3.0-9":   { "metadata": { "airflowVersion": "3.0.5",  "channel": "stable", "releaseDate": "2025-06-01" } },
-    "3.0-10":  { "metadata": { "airflowVersion": "3.0.5",  "channel": "stable", "releaseDate": "2025-07-01" } },
-    "3.1-5":   { "metadata": { "airflowVersion": "3.1.0",  "channel": "stable", "releaseDate": "2025-09-01" } },
-    "3.1-7":   { "metadata": { "airflowVersion": "3.1.2",  "channel": "stable", "releaseDate": "2025-10-01" } },
-    "3.2-1":   { "metadata": { "airflowVersion": "3.2.0",  "channel": "stable", "releaseDate": "2026-04-01" } },
-    "3.2-3":   { "metadata": { "airflowVersion": "3.2.2",  "channel": "stable", "releaseDate": "2026-06-01" } },
-    "3.3-1":   { "metadata": { "airflowVersion": "3.3.0rc1", "channel": "stable", "releaseDate": "2026-06-15" } },
-    "3.3-rc":  { "metadata": { "airflowVersion": "3.3.0",  "channel": "alpha",  "releaseDate": "2026-06-10" } }
+    "2.10-12": {
+      "metadata": {
+        "airflowVersion": "2.10.5",
+        "channel": "stable",
+        "releaseDate": "2025-01-01",
+        "pythonVersions": [
+          "3.11",
+          "3.12"
+        ]
+      }
+    },
+    "2.11-1": {
+      "metadata": {
+        "airflowVersion": "2.11.0",
+        "channel": "stable",
+        "releaseDate": "2025-03-01",
+        "pythonVersions": [
+          "3.11",
+          "3.12"
+        ]
+      }
+    },
+    "3.0-9": {
+      "metadata": {
+        "airflowVersion": "3.0.5",
+        "channel": "stable",
+        "releaseDate": "2025-06-01",
+        "pythonVersions": [
+          "3.11",
+          "3.12"
+        ]
+      }
+    },
+    "3.0-10": {
+      "metadata": {
+        "airflowVersion": "3.0.5",
+        "channel": "stable",
+        "releaseDate": "2025-07-01",
+        "pythonVersions": [
+          "3.11",
+          "3.12"
+        ]
+      }
+    },
+    "3.1-5": {
+      "metadata": {
+        "airflowVersion": "3.1.0",
+        "channel": "stable",
+        "releaseDate": "2025-09-01",
+        "pythonVersions": [
+          "3.11",
+          "3.12"
+        ]
+      }
+    },
+    "3.1-7": {
+      "metadata": {
+        "airflowVersion": "3.1.2",
+        "channel": "stable",
+        "releaseDate": "2025-10-01",
+        "pythonVersions": [
+          "3.11",
+          "3.12"
+        ]
+      }
+    },
+    "3.2-1": {
+      "metadata": {
+        "airflowVersion": "3.2.0",
+        "channel": "stable",
+        "releaseDate": "2026-04-01",
+        "pythonVersions": [
+          "3.11",
+          "3.12",
+          "3.13"
+        ]
+      }
+    },
+    "3.2-3": {
+      "metadata": {
+        "airflowVersion": "3.2.2",
+        "channel": "stable",
+        "releaseDate": "2026-06-01",
+        "pythonVersions": [
+          "3.12",
+          "3.13"
+        ]
+      }
+    },
+    "3.3-1": {
+      "metadata": {
+        "airflowVersion": "3.3.0rc1",
+        "channel": "stable",
+        "releaseDate": "2026-06-15"
+      }
+    },
+    "3.3-rc": {
+      "metadata": {
+        "airflowVersion": "3.3.0",
+        "channel": "alpha",
+        "releaseDate": "2026-06-10"
+      }
+    }
   },
   "runtimeVersions": {
-    "2.9-5":  { "metadata": { "airflowVersion": "2.9.3", "channel": "deprecated", "releaseDate": "2024-06-01", "endOfSupport": "2025-12-01" } },
-    "2.8-3":  { "metadata": { "airflowVersion": "2.8.1", "channel": "deprecated", "releaseDate": "2024-01-01" } }
+    "2.9-5": {
+      "metadata": {
+        "airflowVersion": "2.9.3",
+        "channel": "deprecated",
+        "releaseDate": "2024-06-01",
+        "endOfSupport": "2025-12-01"
+      }
+    },
+    "2.8-3": {
+      "metadata": {
+        "airflowVersion": "2.8.1",
+        "channel": "deprecated",
+        "releaseDate": "2024-01-01"
+      }
+    }
   }
 }
