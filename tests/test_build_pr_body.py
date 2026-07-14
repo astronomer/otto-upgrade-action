@@ -350,3 +350,19 @@ def test_user_pin_bump_row_renders_in_version_table(tmp_path, monkeypatch):
     out = _render(tmp_path, monkeypatch, plan, {"files": []})
     assert ("| `pydantic-ai-slim[openai]` (your pin) | `1.107.0` | `2.1.3` | — | "
             "raised to take `common-ai` 0.6.0 (`bump-blocking-pins`) |") in out
+
+
+def test_bumped_runtime_note_stays_in_its_row_not_not_changed(tmp_path, monkeypatch):
+    plan = {
+        "overall_tier": "minor", "scope_exceeded": False, "needs_migration": True,
+        "advisory": "",
+        "runtime": {"current_tag": "3.1-5-python-3.11", "target_tag": "3.2-1-python-3.11",
+                    "tier": "minor", "current_airflow": "3.1.0", "target_airflow": "3.2.0",
+                    "note": "newer Runtime 3.2-3 doesn't list Python 3.11 support, "
+                            "so it isn't a candidate for this python-pinned image"},
+        "providers": [],
+    }
+    out = _render(tmp_path, monkeypatch, plan, {"files": []})
+    row = next(line for line in out.splitlines() if line.startswith("| Runtime |"))
+    assert "doesn't list Python 3.11" in row
+    assert "### Not changed" not in out
