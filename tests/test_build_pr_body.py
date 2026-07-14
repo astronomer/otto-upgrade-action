@@ -267,3 +267,54 @@ def test_cross_line_zero_does_not_claim_no_fixes(tmp_path, monkeypatch):
     out = _render(tmp_path, monkeypatch, _SEC_PLAN, {"files": []}, security=sec)
     assert "may still include fixes inherited" in out
     assert "list no security fixes for the builds" not in out
+
+
+def test_deprecation_sweep_renders_fixed_and_debt(tmp_path, monkeypatch):
+    dep = {"mode": "fix", "status": "ok", "found": 4, "fixed": 2,
+           "files_changed": ["dags/a.py"],
+           "remaining": [{"rule": "AIR301", "count": 2,
+                          "message": "`days_ago` is removed in Airflow 3.0",
+                          "locations": ["dags/a.py:6", "dags/b.py:2"]}]}
+    dep_f = tmp_path / "deprecations.json"
+    dep_f.write_text(json.dumps(dep))
+    monkeypatch.setenv("DEPRECATION_FILE", str(dep_f))
+    out = _render(tmp_path, monkeypatch, _SEC_PLAN, {"files": []})
+    assert "### Deprecation sweep" in out
+    assert "Rewrote 2 deprecated usage(s) in `dags/a.py`" in out
+    assert "**AIR301** ×2" in out and "`dags/b.py:2`" in out
+
+
+def test_deprecation_demotion_note_renders(tmp_path, monkeypatch):
+    dep = {"mode": "advisory", "status": "ok", "found": 1, "fixed": 0,
+           "demoted": "fix requested but the target Airflow is 2.x; AIR3 "
+                      "rewrites produce Airflow 3 forms, so this run only "
+                      "reports the debt",
+           "files_changed": [],
+           "remaining": [{"rule": "AIR312", "count": 1, "message": "moved",
+                          "locations": ["dags/a.py:3"]}]}
+    dep_f = tmp_path / "deprecations.json"
+    dep_f.write_text(json.dumps(dep))
+    monkeypatch.setenv("DEPRECATION_FILE", str(dep_f))
+    out = _render(tmp_path, monkeypatch, _SEC_PLAN, {"files": []})
+    assert "only reports the debt" in out
+
+
+def test_deprecation_tooling_miss_is_loud(tmp_path, monkeypatch):
+    dep = {"mode": "fix", "status": "unavailable",
+           "reason": "ruff run failed (rc=127): uvx: command not found"}
+    dep_f = tmp_path / "deprecations.json"
+    dep_f.write_text(json.dumps(dep))
+    monkeypatch.setenv("DEPRECATION_FILE", str(dep_f))
+    out = _render(tmp_path, monkeypatch, _SEC_PLAN, {"files": []})
+    assert "sweep could not run" in out
+    assert "command not found" in out
+
+
+def test_clean_deprecation_report_renders_nothing(tmp_path, monkeypatch):
+    dep = {"mode": "fix", "status": "ok", "found": 0, "fixed": 0,
+           "files_changed": [], "remaining": []}
+    dep_f = tmp_path / "deprecations.json"
+    dep_f.write_text(json.dumps(dep))
+    monkeypatch.setenv("DEPRECATION_FILE", str(dep_f))
+    out = _render(tmp_path, monkeypatch, _SEC_PLAN, {"files": []})
+    assert "Deprecation" not in out

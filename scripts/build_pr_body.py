@@ -5,11 +5,12 @@ result, and (when present) Otto's migration result into one deterministic body.
 Used both for the real PR description and for the dry-run step summary.
 
 Env in:
-  PLAN_FILE       resolve_target.py output      (required)
-  VERIFY_FILE     verify status text file       (optional)
-  OTTO_FILE       extract_result.py output JSON (optional)
-  SECURITY_FILE   security_fixes.py output JSON (optional)
-  ACTION_REF      action version, for the footer (optional)
+  PLAN_FILE         resolve_target.py output        (required)
+  VERIFY_FILE       verify status text file         (optional)
+  OTTO_FILE         extract_result.py output JSON   (optional)
+  SECURITY_FILE     security_fixes.py output JSON   (optional)
+  DEPRECATION_FILE  deprecation_cleanup.py JSON     (optional)
+  ACTION_REF        action version, for the footer  (optional)
 Writes Markdown to stdout.
 """
 
@@ -214,6 +215,43 @@ def main() -> int:
             "structured result). **Review breaking changes manually before merging.**",
             "",
         ]
+
+    # Deprecation sweep — what got mechanically rewritten and what debt
+    # remains. A tooling miss renders loudly, mirroring the security section.
+    dep = _load("DEPRECATION_FILE")
+    if dep:
+        fixed, remaining = dep.get("fixed", 0), dep.get("remaining") or []
+        if dep.get("status") != "ok":
+            out += [
+                "### Deprecation sweep",
+                "",
+                f"> ⚠️ The deprecated-usage sweep could not run: "
+                f"{dep.get('reason', 'unknown')}",
+                "",
+            ]
+        elif fixed or remaining:
+            out += ["### Deprecation sweep", ""]
+            if dep.get("demoted"):
+                out += [f"> {dep['demoted']}.", ""]
+            if fixed:
+                files = ", ".join(f"`{f}`" for f in dep.get("files_changed", []))
+                out += [
+                    f"Rewrote {fixed} deprecated usage(s)"
+                    + (f" in {files}" if files else "")
+                    + " (verified with the rest of this PR).",
+                    "",
+                ]
+            if remaining:
+                out.append("**Remaining deprecation debt** (no mechanical fix; "
+                           "works today but will break in a future Airflow):")
+                for g in remaining:
+                    locs = ", ".join(f"`{loc}`" for loc in g.get("locations", []))
+                    more = (f", +{g['count'] - len(g.get('locations', []))} more"
+                            if g.get("count", 0) > len(g.get("locations", [])) else "")
+                    out.append(
+                        f"- **{g.get('rule', 'AIR?')}** ×{g.get('count', '?')}: "
+                        f"{g.get('message', '')} — {locs}{more}")
+                out.append("")
 
     # Verification — collapsible, with the outcome in the summary line so the
     # detail (and any Airflow import-time noise) stays tucked away. Failure and
