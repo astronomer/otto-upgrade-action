@@ -28,10 +28,10 @@ Writes a JSON report to stdout.
 
 from __future__ import annotations
 
-import gzip
 import json
 import os
 import re
+import subprocess
 import sys
 import time
 import urllib.request
@@ -51,6 +51,21 @@ _BULLET = re.compile(r"^\s*[*+-]\s+(?P<text>\S.*)$")
 _LINK = re.compile(r"\[(?P<id>[^\]]+)\]\((?P<url>[^)\s]+)(?:\s+\"[^\"]*\")?\)")
 
 
+# The real page is ~110 KB; anything near this cap is wrong regardless of
+# origin, and the caps keep a hostile/broken response (compression bomb) from
+# OOM-killing the step before main() can emit its loud-skip JSON.
+_MAX_BODY = 8 * 1024 * 1024
+
+
+def _decompress_capped(data: bytes) -> bytes:
+    # wbits=47 auto-detects gzip and zlib containers.
+    d = zlib.decompressobj(47)
+    out = d.decompress(data, _MAX_BODY + 1)
+    if len(out) > _MAX_BODY:
+        raise RuntimeError("decompressed release-notes body exceeds the size cap")
+    return out
+
+
 def _fetch_once(url: str) -> str:
     req = urllib.request.Request(url, headers={  # noqa: S310
         "User-Agent": "otto-upgrade-action",
@@ -62,13 +77,13 @@ def _fetch_once(url: str) -> str:
         "Accept-Encoding": "identity",
     })
     with urllib.request.urlopen(req, timeout=30) as resp:  # noqa: S310
-        data = resp.read()
+        data = resp.read(_MAX_BODY + 1)
         encoding = (resp.headers.get("Content-Encoding") or "").lower()
         ctype = resp.headers.get("Content-Type") or "unknown"
-    if encoding == "gzip" or data[:2] == b"\x1f\x8b":
-        data = gzip.decompress(data)
-    elif encoding == "deflate":
-        data = zlib.decompress(data)
+    if len(data) > _MAX_BODY:
+        raise RuntimeError("release-notes body exceeds the size cap")
+    if encoding in ("gzip", "deflate") or data[:2] == b"\x1f\x8b":
+        data = _decompress_capped(data)
     try:
         return data.decode("utf-8")
     except UnicodeDecodeError as exc:
@@ -80,14 +95,39 @@ def _fetch_once(url: str) -> str:
             f"first-bytes=0x{data[:4].hex()}): {exc}") from None
 
 
+def _fetch_via_curl(url: str) -> str:
+    """Last-resort fetch through curl, which negotiates and decodes brotli —
+    stdlib can't. The field failure recurred across runs from the same
+    runner (its CDN edge kept serving br), so a urllib retry alone isn't
+    enough there. curl ships on every GitHub runner; a machine without it
+    just surfaces the original error."""
+    proc = subprocess.run(  # noqa: S603 — fixed argv, no shell
+        ["curl", "-fsSL", "--compressed", "--max-time", "30",  # noqa: S607
+         "--max-filesize", str(_MAX_BODY),
+         "-A", "otto-upgrade-action", url],
+        capture_output=True, text=True, timeout=60, check=False,
+    )
+    if proc.returncode != 0:
+        raise RuntimeError(f"curl fallback failed (rc={proc.returncode}): "
+                           f"{proc.stderr.strip()[:200]}")
+    return proc.stdout
+
+
 def _fetch_text(url: str) -> str:
-    """Fetch with one retry: the failure mode seen in the field was a single
-    bad edge response, with the identical request succeeding minutes later."""
+    """Fetch with one urllib retry, then a curl fallback. Field history: one
+    runner's CDN edge served brotli persistently (two runs in a row) while
+    other runners fetched the same URL cleanly in between."""
     try:
         return _fetch_once(url)
-    except Exception:  # noqa: BLE001 — retry exactly once, then let it surface
+    except Exception:  # noqa: BLE001 — retry once before escalating
         time.sleep(2)
-        return _fetch_once(url)
+        try:
+            return _fetch_once(url)
+        except Exception as urllib_exc:  # noqa: BLE001 — brotli edge: curl can decode it
+            try:
+                return _fetch_via_curl(url)
+            except Exception:  # noqa: BLE001 — keep the primary error as the reason
+                raise urllib_exc from None
 
 
 def _parse_builds(page: str) -> list[tuple[str, str]]:

@@ -201,8 +201,8 @@ class TestFetchHardening:
             self._body = body
             self.headers = headers
 
-        def read(self):
-            return self._body
+        def read(self, n=None):
+            return self._body if n is None else self._body[:n]
 
         def __enter__(self):
             return self
@@ -268,3 +268,69 @@ class TestFetchHardening:
             (b"# ok", {"Content-Type": "text/markdown"}),
         ])
         assert sf._fetch_text("https://x") == "# ok"
+
+    def test_persistent_urllib_failure_falls_back_to_curl(self, monkeypatch):
+        bad = (b"\xa5\x01junk", {"Content-Type": "text/markdown"})
+        self._serve(monkeypatch, [bad, bad])
+
+        def fake_curl(cmd, **_kw):
+            assert "--compressed" in cmd
+
+            class P:
+                returncode = 0
+                stdout = "# via curl"
+                stderr = ""
+            return P()
+
+        monkeypatch.setattr(sf.subprocess, "run", fake_curl)
+        assert sf._fetch_text("https://x") == "# via curl"
+
+    def test_curl_failure_surfaces_the_urllib_error(self, monkeypatch):
+        bad = (b"\xa5\x01junk", {"Content-Type": "text/markdown"})
+        self._serve(monkeypatch, [bad, bad])
+
+        def fake_curl(cmd, **_kw):
+            class P:
+                returncode = 127
+                stdout = ""
+                stderr = "curl: not found"
+            return P()
+
+        monkeypatch.setattr(sf.subprocess, "run", fake_curl)
+        with pytest.raises(RuntimeError) as exc:
+            sf._fetch_text("https://x")
+        assert "not UTF-8 text" in str(exc.value)  # the primary diagnosis wins
+
+    def test_compression_bomb_is_rejected_bounded(self, monkeypatch):
+        import gzip as gz
+        bomb = gz.compress(b"\x00" * (20 * 1024 * 1024))  # tiny body, 20MB payload
+        self._serve(monkeypatch, [
+            (bomb, {"Content-Encoding": "gzip", "Content-Type": "text/markdown"}),
+            (bomb, {"Content-Encoding": "gzip", "Content-Type": "text/markdown"}),
+        ])
+        monkeypatch.setattr(
+            sf.subprocess, "run",
+            lambda *a, **k: pytest.fail("curl must not be reached with a bounded reject"))
+
+        class NoCurl:
+            returncode = 22
+            stdout = ""
+            stderr = "rejected"
+        monkeypatch.setattr(sf.subprocess, "run", lambda *a, **k: NoCurl())
+        with pytest.raises(RuntimeError) as exc:
+            sf._fetch_text("https://x")
+        assert "size cap" in str(exc.value)
+
+    def test_oversized_raw_body_is_rejected(self, monkeypatch):
+        big = b"a" * (sf._MAX_BODY + 10)
+        self._serve(monkeypatch, [(big, {"Content-Type": "text/markdown"}),
+                                  (big, {"Content-Type": "text/markdown"})])
+
+        class NoCurl:
+            returncode = 22
+            stdout = ""
+            stderr = "rejected"
+        monkeypatch.setattr(sf.subprocess, "run", lambda *a, **k: NoCurl())
+        with pytest.raises(RuntimeError) as exc:
+            sf._fetch_text("https://x")
+        assert "size cap" in str(exc.value)
