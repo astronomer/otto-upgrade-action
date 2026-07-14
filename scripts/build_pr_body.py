@@ -92,14 +92,30 @@ def main() -> int:
             )
     out.append("")
 
+    # KB coverage disclosure: when the gate couldn't check the plan (Core
+    # unreachable, unexpected status), the PR must say so even for
+    # provider-only plans where no runtime note exists to carry it.
+    if plan.get("kb_gate_unchecked"):
+        out += [
+            f"> ⚠️ Upgrade-KB coverage was NOT verified for this plan: "
+            f"{plan['kb_gate_unchecked']}",
+            "",
+        ]
+
     # Version table.
     rt = plan.get("runtime")
     rows = []
-    if rt and rt.get("target_tag") and rt.get("current_tag") != rt.get("target_tag"):
+    runtime_bumped = bool(
+        rt and rt.get("target_tag") and rt.get("current_tag") != rt.get("target_tag"))
+    if runtime_bumped:
+        # A bumped runtime carries its note (e.g. the KB gate's step-down
+        # reason) in ITS OWN row — routing it to "Not changed" while the
+        # table shows a change reads as a contradiction.
+        note = f"; {rt['note']}" if rt.get("note") else ""
         rows.append(
             f"| Runtime | `{rt['current_tag']}` | `{rt['target_tag']}` "
             f"| {TIER_BADGE.get(rt['tier'], rt['tier'])} | Airflow "
-            f"{rt.get('current_airflow','?')} → {rt.get('target_airflow','?')} |"
+            f"{rt.get('current_airflow','?')} → {rt.get('target_airflow','?')}{note} |"
         )
     for p in plan.get("providers", []):
         if p.get("current") and p.get("target") and p["current"] != p["target"]:
@@ -133,7 +149,7 @@ def main() -> int:
     # (digest-pinned runtime, unpinned provider, PyPI lookup failure, …) so the
     # PR doesn't silently look like it covered everything.
     skipped = []
-    if rt and rt.get("note"):
+    if rt and rt.get("note") and not runtime_bumped:
         skipped.append(f"- **Runtime** (`{rt.get('current_tag','?')}`): {rt['note']}")
     for p in plan.get("providers", []):
         if p.get("note") and not (p.get("current") and p.get("target") and p["current"] != p["target"]):

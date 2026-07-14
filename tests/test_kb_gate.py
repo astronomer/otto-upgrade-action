@@ -122,12 +122,13 @@ def test_rejected_airflow_with_no_candidates_holds_runtime(tmp_path, monkeypatch
     assert summary["adjustments"][0]["kind"] == "runtime-held"
 
 
-def test_core_unreachable_degrades_to_unchecked_with_note(tmp_path, monkeypatch):
+def test_core_unreachable_degrades_to_unchecked_with_disclosure(tmp_path, monkeypatch):
     summary, plan, _ = _run(tmp_path, monkeypatch, _plan(),
                             [(0, "URLError: timed out")])
     assert summary["status"] == "unchecked"
     assert summary["checked"] is False
-    assert "NOT verified" in plan["runtime"]["note"]
+    # Plan-level flag: rendered by build_pr_body even for provider-only plans.
+    assert "Core unreachable" in plan["kb_gate_unchecked"]
     assert plan["providers"][0]["target"] == "0.6.0"  # plan not held
 
 
@@ -182,3 +183,129 @@ def test_probe_same_version_omits_target_param(monkeypatch):
     status, _ = kb_gate.probe("https://api.x/base", "tok", "3.2.2", "3.2.2", [])
     assert status == 204
     assert "targetVersion" not in seen["url"]
+
+
+def test_budget_exhaustion_fails_closed_not_half_adjusted(tmp_path, monkeypatch):
+    # Backstop: if the probe budget somehow exhausts with rejections still
+    # standing (unreachable under normal Core semantics — every attributable
+    # 400 shrinks work), the leftovers must be held, never leaked to Otto's
+    # own fetch as a mid-run 400.
+    plan = _plan()
+    plan["providers"] = [
+        {"package": f"apache-airflow-providers-p{i}", "current": "1.0.0",
+         "target": "2.0.0", "tier": "major", "note": ""}
+        for i in range(30)
+    ]
+    monkeypatch.setattr(kb_gate, "_probe_budget", lambda *_a: 3)
+    rejects = [(400, f'provider apache-airflow-providers-p{i} target "2.0.0" '
+                     "is not a known version") for i in range(3)]
+    summary, updated, calls = _run(tmp_path, monkeypatch, plan, rejects)
+    assert summary["status"] == "held-all"
+    assert "budget exhausted" in summary["reason"]
+    assert all(p["target"] == p["current"] for p in updated["providers"])
+    assert updated["runtime"]["target_tag"] == "3.2-3"  # runtime held too
+
+
+def test_budget_scales_with_plan_size(tmp_path, monkeypatch):
+    # 10 providers all rejected one-by-one then covered: the dynamic budget
+    # (bumped + candidates + 2) must allow every hold plus the final pass.
+    plan = _plan()
+    plan["providers"] = [
+        {"package": f"apache-airflow-providers-p{i}", "current": "1.0.0",
+         "target": "2.0.0", "tier": "major", "note": ""}
+        for i in range(10)
+    ]
+    probes = [(400, f'provider apache-airflow-providers-p{i} target "2.0.0" '
+                    "is not a known version") for i in range(10)] + [(200, "")]
+    summary, updated, calls = _run(tmp_path, monkeypatch, plan, probes)
+    assert summary["status"] == "covered"
+    assert all(p["target"] == p["current"] for p in updated["providers"])
+    assert len(calls) == 11
+
+
+def test_provider_overflow_beyond_probe_cap_is_held_upfront(tmp_path, monkeypatch):
+    plan = _plan()
+    plan["providers"] = [
+        {"package": f"apache-airflow-providers-p{i}", "current": "1.0.0",
+         "target": "2.0.0", "tier": "major", "note": ""}
+        for i in range(55)
+    ]
+    summary, updated, calls = _run(tmp_path, monkeypatch, plan, [(200, "")])
+    held = [p for p in updated["providers"] if p["target"] == p["current"]]
+    assert len(held) == 5  # the overflow past the 50-provider probe cap
+    assert all("probe limit" in p["note"] for p in held)
+    assert len(calls[0][1]) == 50  # probe carries exactly the cap
+
+
+def test_bad_token_401_discloses_in_plan(tmp_path, monkeypatch):
+    summary, updated, _ = _run(tmp_path, monkeypatch, _plan(),
+                               [(401, "unauthorized")])
+    assert summary["status"] == "unchecked"
+    assert summary["checked"] is False
+    assert "HTTP 401" in updated["kb_gate_unchecked"]
+    assert updated["providers"][0]["target"] == "0.6.0"  # not held
+
+
+def test_stepdown_reclamps_providers_against_new_airflow(tmp_path, monkeypatch):
+    # Provider targets were compat-clamped against the REJECTED Airflow; the
+    # step-down must re-clamp them against where we actually land.
+    reclamped = []
+
+    def fake_latest(pkg, cur, scope, target_airflow=None):
+        reclamped.append((pkg, target_airflow))
+        return {"package": pkg, "current": cur, "target": "0.5.5",
+                "tier": "patch", "clamped": True,
+                "note": f"held at 0.5.5 — newest release compatible with Airflow {target_airflow}"}
+
+    monkeypatch.setattr(kb_gate.rt, "_provider_latest", fake_latest)
+    monkeypatch.setenv("MAX_SCOPE", "minor")
+    reject = (400, 'targetVersion "3.3.0" is not a known version')
+    summary, plan, _ = _run(tmp_path, monkeypatch, _plan(), [reject, (200, "")])
+    assert plan["runtime"]["target_tag"] == "3.2-6"
+    assert all(af == "3.2.2" for _, af in reclamped)
+    assert plan["providers"][0]["target"] == "0.5.5"
+    assert "re-resolved from 0.6.0 for Airflow 3.2.2" in plan["providers"][0]["note"]
+    kinds = [a["kind"] for a in summary["adjustments"]]
+    assert "runtime-stepped" in kinds and "provider-reclamped" in kinds
+
+
+def test_regate_mode_syncs_held_provider_back_into_files(tmp_path, monkeypatch):
+    # Re-gate pass (PROJECT_PATH set): the tree already carries the reconciled
+    # pins, so a hold must land in requirements.txt too.
+    (tmp_path / "requirements.txt").write_text(
+        "apache-airflow-providers-common-ai==0.6.0\n"
+        "apache-airflow-providers-amazon==9.32.0\n")
+    (tmp_path / "Dockerfile").write_text(
+        "FROM astrocrpublic.azurecr.io/runtime:3.3-2\n")
+    monkeypatch.setenv("PROJECT_PATH", str(tmp_path))
+    reject = (400, 'provider apache-airflow-providers-common-ai target "0.6.0" '
+                   "is not a known version")
+    _, plan, _ = _run(tmp_path, monkeypatch, _plan(), [reject, (200, "")])
+    reqs = (tmp_path / "requirements.txt").read_text()
+    assert "apache-airflow-providers-common-ai==0.5.0" in reqs  # held -> synced
+    assert "apache-airflow-providers-amazon==9.32.0" in reqs    # untouched
+
+
+def test_regate_mode_syncs_runtime_stepdown_into_dockerfile(tmp_path, monkeypatch):
+    (tmp_path / "requirements.txt").write_text(
+        "apache-airflow-providers-common-ai==0.6.0\n"
+        "apache-airflow-providers-amazon==9.32.0\n")
+    (tmp_path / "Dockerfile").write_text(
+        "FROM astrocrpublic.azurecr.io/runtime:3.3-2\n")
+    monkeypatch.setenv("PROJECT_PATH", str(tmp_path))
+    monkeypatch.setattr(kb_gate, "_reclamp_providers", lambda *_a: None)
+    reject = (400, 'targetVersion "3.3.0" is not a known version')
+    _, plan, _ = _run(tmp_path, monkeypatch, _plan(), [reject, (200, "")])
+    assert "runtime:3.2-6" in (tmp_path / "Dockerfile").read_text()
+
+
+def test_plan_only_mode_never_touches_files(tmp_path, monkeypatch):
+    # First-gate pass (no PROJECT_PATH): plan-only, tree is pre-apply.
+    (tmp_path / "requirements.txt").write_text(
+        "apache-airflow-providers-common-ai==0.5.0\n")
+    monkeypatch.delenv("PROJECT_PATH", raising=False)
+    reject = (400, 'provider apache-airflow-providers-common-ai target "0.6.0" '
+                   "is not a known version")
+    _, plan, _ = _run(tmp_path, monkeypatch, _plan(), [reject, (200, "")])
+    assert (tmp_path / "requirements.txt").read_text() == \
+        "apache-airflow-providers-common-ai==0.5.0\n"

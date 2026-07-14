@@ -259,9 +259,16 @@ def resolve_runtime(current_tag: str, target: str, max_scope: str) -> dict[str, 
         same_major if max_scope == "minor" else cands)
     step_candidates: list[dict[str, str]] = []
     seen_af: set[str] = set()
+    pick_key = (version_tuple(pick["airflow"]), pick.get("release_date", ""),
+                version_tuple(pick["tag"]))
     for c in sorted(scope_pool, key=lambda c: (
             version_tuple(c["airflow"]), c["release_date"], version_tuple(c["tag"])),
             reverse=True):
+        # Never export a candidate above the actual pick: with target=patch
+        # under max_scope=minor the scope pool contains newer minors the
+        # TARGET policy already ruled out.
+        if (version_tuple(c["airflow"]), c["release_date"], version_tuple(c["tag"])) > pick_key:
+            continue
         if version_tuple(c["airflow"]) < cm or c["tag"] == current_tag:
             continue
         if c["airflow"] in seen_af:

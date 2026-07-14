@@ -350,3 +350,42 @@ def test_user_pin_bump_row_renders_in_version_table(tmp_path, monkeypatch):
     out = _render(tmp_path, monkeypatch, plan, {"files": []})
     assert ("| `pydantic-ai-slim[openai]` (your pin) | `1.107.0` | `2.1.3` | — | "
             "raised to take `common-ai` 0.6.0 (`bump-blocking-pins`) |") in out
+
+
+def test_kb_gate_unchecked_disclosure_renders(tmp_path, monkeypatch):
+    plan = dict(_SEC_PLAN)
+    plan["kb_gate_unchecked"] = "Core unreachable at plan time (URLError: timed out)"
+    out = _render(tmp_path, monkeypatch, plan, {"files": []})
+    assert "Upgrade-KB coverage was NOT verified" in out
+    assert "Core unreachable" in out
+
+
+def test_stepped_runtime_note_renders_in_its_table_row(tmp_path, monkeypatch):
+    plan = {
+        "overall_tier": "patch", "scope_exceeded": False, "needs_migration": False,
+        "advisory": "",
+        "runtime": {"current_tag": "3.2-3", "target_tag": "3.2-6", "tier": "patch",
+                    "current_airflow": "3.2.2", "target_airflow": "3.2.2",
+                    "note": "stepped down to 3.2-6: Airflow 3.3.0 isn't covered "
+                            "by the upgrade KB yet"},
+        "providers": [],
+    }
+    out = _render(tmp_path, monkeypatch, plan, {"files": []})
+    row = next(line for line in out.splitlines() if line.startswith("| Runtime |"))
+    assert "stepped down to 3.2-6" in row
+    assert "### Not changed" not in out  # note must NOT be mis-sectioned
+
+
+def test_held_runtime_note_still_renders_under_not_changed(tmp_path, monkeypatch):
+    plan = {
+        "overall_tier": "none", "scope_exceeded": False, "needs_migration": False,
+        "advisory": "",
+        "runtime": {"current_tag": "3.2-3", "target_tag": "3.2-3", "tier": "none",
+                    "current_airflow": "3.2.2", "target_airflow": "3.2.2",
+                    "note": "runtime held: Airflow 3.3.0 isn't covered by the "
+                            "upgrade KB yet and no covered candidate remains"},
+        "providers": [],
+    }
+    out = _render(tmp_path, monkeypatch, plan, {"files": []})
+    assert "### Not changed" in out
+    assert "runtime held" in out

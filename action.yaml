@@ -199,6 +199,7 @@ runs:
       shell: bash
       env:
         PLAN_FILE: /tmp/otto-upgrade/plan.json
+        MAX_SCOPE: ${{ inputs.max-upgrade-scope }}
         ASTRO_TOKEN: ${{ env.ASTRO_TOKEN }}
         ASTRO_API_TOKEN: ${{ env.ASTRO_API_TOKEN }}
         ASTRO_DOMAIN: ${{ env.ASTRO_DOMAIN }}
@@ -322,6 +323,45 @@ runs:
           echo "uv unavailable; skipping pin reconciliation (verification will catch conflicts)."
         fi
         P=/tmp/otto-upgrade/plan.json
+        C=/tmp/otto-upgrade/co-resolve.json
+        {
+          echo "overall-tier=$(jq -r '.overall_tier' "$P")"
+          echo "needs-migration=$(jq -r '.needs_migration' "$P")"
+          echo "no-update=$(jq -r '.no_update' "$P")"
+          echo "author-changes=$(jq -r '.author_changes' "$P")"
+          if [[ -f "$C" ]]; then
+            echo "pins-adjusted=$(jq -r '.adjustments | length' "$C")"
+          else
+            echo "pins-adjusted=0"
+          fi
+        } >> "$GITHUB_OUTPUT"
+
+    - name: KB coverage re-gate
+      id: kb-regate
+      # co_resolve's walk-backs can land on provider versions the first gate
+      # probe never saw. When it adjusted anything, validate the FINAL pin set
+      # the same way — and since the tree already carries the reconciled pins,
+      # this pass syncs any change back into the files (PROJECT_PATH set).
+      if: >-
+        steps.auth.outputs.enabled == 'true' &&
+        steps.reconcile.outputs.pins-adjusted != '' &&
+        steps.reconcile.outputs.pins-adjusted != '0'
+      shell: bash
+      env:
+        PLAN_FILE: /tmp/otto-upgrade/plan.json
+        PROJECT_PATH: ${{ inputs.project-path }}
+        MAX_SCOPE: ${{ inputs.max-upgrade-scope }}
+        ASTRO_TOKEN: ${{ env.ASTRO_TOKEN }}
+        ASTRO_API_TOKEN: ${{ env.ASTRO_API_TOKEN }}
+        ASTRO_DOMAIN: ${{ env.ASTRO_DOMAIN }}
+        ASTRO_ORGANIZATION: ${{ env.ASTRO_ORGANIZATION }}
+      run: |
+        set -euo pipefail
+        python3 "$GITHUB_ACTION_PATH/scripts/kb_gate.py" > /tmp/otto-upgrade/kb-regate.json
+        echo "::group::KB coverage re-gate"
+        cat /tmp/otto-upgrade/kb-regate.json
+        echo "::endgroup::"
+        P=/tmp/otto-upgrade/plan.json
         {
           echo "overall-tier=$(jq -r '.overall_tier' "$P")"
           echo "needs-migration=$(jq -r '.needs_migration' "$P")"
@@ -334,7 +374,7 @@ runs:
       # Reads the public Runtime release notes so the PR can show the security
       # payoff of merging. Best-effort: a fetch miss or page-shape change is
       # reported loudly in the PR body, never fails the run.
-      if: steps.resolve.outputs.no-update != 'true'
+      if: (steps.kb-regate.outputs.no-update || steps.reconcile.outputs.no-update || steps.kb-gate.outputs.no-update || steps.resolve.outputs.no-update) != 'true'
       shell: bash
       env:
         PLAN_FILE: /tmp/otto-upgrade/plan.json
@@ -352,7 +392,10 @@ runs:
         fi
 
     - name: Build Otto prompt
-      if: steps.auth.outputs.enabled == 'true'
+      if: >-
+        steps.auth.outputs.enabled == 'true' &&
+        (steps.kb-regate.outputs.no-update || steps.reconcile.outputs.no-update || steps.kb-gate.outputs.no-update || steps.resolve.outputs.no-update) != 'true' &&
+        (steps.kb-regate.outputs.author-changes || steps.reconcile.outputs.author-changes || steps.kb-gate.outputs.author-changes || steps.resolve.outputs.author-changes) == 'true'
       shell: bash
       env:
         WORKDIR: /tmp/otto-upgrade
@@ -361,7 +404,10 @@ runs:
       run: bash "$GITHUB_ACTION_PATH/scripts/build-prompt.sh"
 
     - name: Run Otto migration
-      if: steps.auth.outputs.enabled == 'true'
+      if: >-
+        steps.auth.outputs.enabled == 'true' &&
+        (steps.kb-regate.outputs.no-update || steps.reconcile.outputs.no-update || steps.kb-gate.outputs.no-update || steps.resolve.outputs.no-update) != 'true' &&
+        (steps.kb-regate.outputs.author-changes || steps.reconcile.outputs.author-changes || steps.kb-gate.outputs.author-changes || steps.resolve.outputs.author-changes) == 'true'
       shell: bash
       env:
         ASTRO_TOKEN: ${{ env.ASTRO_TOKEN }}
@@ -383,8 +429,8 @@ runs:
       # reported in the PR body, never fail the run.
       if: >-
         inputs.deprecation-cleanup != 'off' &&
-        steps.resolve.outputs.author-changes == 'true' &&
-        steps.resolve.outputs.no-update != 'true'
+        (steps.kb-regate.outputs.author-changes || steps.reconcile.outputs.author-changes || steps.kb-gate.outputs.author-changes || steps.resolve.outputs.author-changes) == 'true' &&
+        (steps.kb-regate.outputs.no-update || steps.reconcile.outputs.no-update || steps.kb-gate.outputs.no-update || steps.resolve.outputs.no-update) != 'true'
       shell: bash
       env:
         PROJECT_PATH: ${{ inputs.project-path }}
@@ -400,7 +446,9 @@ runs:
 
     - name: Verify upgrade
       id: verify
-      if: steps.resolve.outputs.author-changes == 'true' && steps.resolve.outputs.no-update != 'true'
+      if: >-
+        (steps.kb-regate.outputs.author-changes || steps.reconcile.outputs.author-changes || steps.kb-gate.outputs.author-changes || steps.resolve.outputs.author-changes) == 'true' &&
+        (steps.kb-regate.outputs.no-update || steps.reconcile.outputs.no-update || steps.kb-gate.outputs.no-update || steps.resolve.outputs.no-update) != 'true'
       shell: bash
       env:
         PROJECT_PATH: ${{ inputs.project-path }}
@@ -412,7 +460,9 @@ runs:
 
     - name: Open or update PR
       id: open-pr
-      if: steps.resolve.outputs.author-changes == 'true' && steps.resolve.outputs.no-update != 'true'
+      if: >-
+        (steps.kb-regate.outputs.author-changes || steps.reconcile.outputs.author-changes || steps.kb-gate.outputs.author-changes || steps.resolve.outputs.author-changes) == 'true' &&
+        (steps.kb-regate.outputs.no-update || steps.reconcile.outputs.no-update || steps.kb-gate.outputs.no-update || steps.resolve.outputs.no-update) != 'true'
       shell: bash
       env:
         GH_TOKEN: ${{ inputs.github-token }}
@@ -433,7 +483,9 @@ runs:
       run: bash "$GITHUB_ACTION_PATH/scripts/open-pr.sh"
 
     - name: Major-upgrade advisory
-      if: steps.resolve.outputs.author-changes != 'true' && steps.resolve.outputs.no-update != 'true'
+      if: >-
+        (steps.kb-regate.outputs.author-changes || steps.reconcile.outputs.author-changes || steps.kb-gate.outputs.author-changes || steps.resolve.outputs.author-changes) != 'true' &&
+        (steps.kb-regate.outputs.no-update || steps.reconcile.outputs.no-update || steps.kb-gate.outputs.no-update || steps.resolve.outputs.no-update) != 'true'
       shell: bash
       run: |
         set -euo pipefail
