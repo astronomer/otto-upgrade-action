@@ -267,26 +267,17 @@ def resolve_runtime(current_tag: str, target: str, max_scope: str) -> dict[str, 
         py_note = (f"the Runtime feed doesn't list Python support for this "
                    f"line; your Python {py_pin} pin was kept on the target "
                    "but couldn't be validated against it")
-    elif py_pin:
+    py_filtered = False
+    cands_unfiltered = list(cands)
+    if py_pin and not py_note:
         # Only builds that publish the pinned Python are upgrade candidates.
         # A build without pythonVersions metadata is excluded (fail closed:
-        # proposing a variant tag that may not exist beats guessing).
-        unfiltered_newest = _newest(cands)
+        # proposing a variant tag that may not exist beats guessing). The
+        # exclusion NOTE is computed after the pick, against the same scope
+        # pool — an all-majors comparison here cited out-of-scope builds
+        # (an Airflow-2 user being told about a 3.x build).
         cands = [c for c in cands if py_pin in c["python_versions"]]
-        newest = _newest(cands)
-        # Full ordering, not Airflow versions: a newer BUILD of the same
-        # Airflow (a patch/security refresh) blocked by the pin must be
-        # said out loud too, not read as a clean no-update.
-        if unfiltered_newest and (
-                newest is None or _order_key(newest) < _order_key(unfiltered_newest)):
-            if unfiltered_newest["tag"] == base_tag:
-                py_note = (f"your current build {base_tag} doesn't list Python "
-                           f"{py_pin} support in the feed; no in-scope upgrade "
-                           "is possible for this pin")
-            else:
-                py_note = (f"newer Runtime {unfiltered_newest['tag']} doesn't "
-                           f"list Python {py_pin} support, so it isn't a "
-                           "candidate for this python-pinned image")
+        py_filtered = True
 
     cur_af = cur["airflow"]
     cm = version_tuple(cur_af)
@@ -296,13 +287,20 @@ def resolve_runtime(current_tag: str, target: str, max_scope: str) -> dict[str, 
     # we upgrade onto a supported release, never another deprecated one.
     same_minor = [c for c in cands if (version_tuple(c["airflow"]) + (0, 0))[:2] == (cur_major, cur_minor)]
     same_major = [c for c in cands if version_tuple(c["airflow"])[0] == cur_major]
+    same_minor_all = [c for c in cands_unfiltered
+                      if (version_tuple(c["airflow"]) + (0, 0))[:2] == (cur_major, cur_minor)]
+    same_major_all = [c for c in cands_unfiltered
+                      if version_tuple(c["airflow"])[0] == cur_major]
 
     if target == "patch":
         pick = _newest(same_minor)
+        scope_pool_all = same_minor_all
     elif target == "latest":
         pick = _newest(cands)
+        scope_pool_all = cands_unfiltered
     else:  # latest-minor: newest within the current Airflow major
         pick = _newest(same_major)
+        scope_pool_all = same_major_all
 
     pick = pick or cur
     tier = _runtime_tier(base_tag, cur_af, pick)
@@ -320,8 +318,10 @@ def resolve_runtime(current_tag: str, target: str, max_scope: str) -> dict[str, 
         held_major = tier == "major"
         if max_scope == "patch":
             pick = _newest(same_minor) or cur
+            scope_pool_all = same_minor_all
         elif max_scope == "minor":
             pick = _newest(same_major) or cur
+            scope_pool_all = same_major_all
         tier = _runtime_tier(base_tag, cur_af, pick)
 
     # NEVER author a downgrade. The python filter can remove the CURRENT
@@ -331,9 +331,22 @@ def resolve_runtime(current_tag: str, target: str, max_scope: str) -> dict[str, 
         pick = cur
         tier = _runtime_tier(base_tag, cur_af, pick)
         clamped = False
-        if py_pin and not py_note:
-            py_note = (f"held at {current_tag}: no in-scope build newer than "
-                       f"the current one lists Python {py_pin} support")
+
+    if py_filtered and not py_note:
+        # The precise signal: is the newest IN-SCOPE build blocked by the
+        # pin? Covers a newer BUILD of the same Airflow (a blocked
+        # patch/security refresh must not read as a clean no-update) and the
+        # held-at-current case, while never citing an out-of-scope major.
+        scope_newest = _newest(scope_pool_all)
+        if scope_newest and py_pin not in scope_newest["python_versions"]:
+            if scope_newest["tag"] == base_tag:
+                py_note = (f"your current build {base_tag} doesn't list Python "
+                           f"{py_pin} support in the feed; no in-scope upgrade "
+                           "is possible for this pin")
+            else:
+                py_note = (f"newer Runtime {scope_newest['tag']} doesn't "
+                           f"list Python {py_pin} support, so it isn't a "
+                           "candidate for this python-pinned image")
 
     out: dict[str, Any] = {
         "current_tag": current_tag,
