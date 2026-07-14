@@ -68,6 +68,18 @@ def test_runtime_build_patch_same_airflow():
     assert r["tier"] == "patch"
 
 
+def test_newest_tiebreaks_on_build_number_when_date_ties():
+    # Field case: 3.3-1 and 3.3-2 both stable, same Airflow 3.3.0, same
+    # release date (2026-07-09). Without the tag tiebreak the winner was feed
+    # order — which handed out the older build.
+    cands = [
+        {"tag": "3.3-1", "airflow": "3.3.0", "release_date": "2026-07-09"},
+        {"tag": "3.3-2", "airflow": "3.3.0", "release_date": "2026-07-09"},
+    ]
+    assert rt._newest(cands)["tag"] == "3.3-2"
+    assert rt._newest(list(reversed(cands)))["tag"] == "3.3-2"
+
+
 def test_non_stable_channel_is_ignored():
     # 3.3-rc (alpha channel) and 3.3-1 (stable channel but Airflow 3.3.0rc1, a
     # prerelease Airflow) must never be picked even with target=latest.

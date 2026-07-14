@@ -159,10 +159,16 @@ def _runtime_candidates(channels: frozenset[str] = _STABLE) -> list[dict[str, An
 
 
 def _newest(cands: list[dict[str, Any]]) -> dict[str, Any] | None:
-    """Newest candidate, ordered by (airflow version, release date)."""
+    """Newest candidate, ordered by (airflow version, release date, tag).
+
+    The tag tuple is the tiebreak: two builds of the same Airflow can ship the
+    same day (field case: 3.3-1 and 3.3-2 both stable, both 2026-07-09), and
+    without it the winner is feed order — which handed out the older build.
+    """
     if not cands:
         return None
-    return max(cands, key=lambda c: (version_tuple(c["airflow"]), c["release_date"]))
+    return max(cands, key=lambda c: (
+        version_tuple(c["airflow"]), c["release_date"], version_tuple(c["tag"])))
 
 
 def _runtime_tier(current_tag: str, cur_af: str, pick: dict[str, Any]) -> str:
