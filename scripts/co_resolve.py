@@ -102,9 +102,14 @@ def _blocking_pin_for(err: str, pkg: str) -> str | None:
 def compile_requirements(project_path: str) -> tuple[int, str]:
     req = os.path.join(project_path, "requirements.txt")
     try:
+        # No -o: uv writes output ATOMICALLY via a temp file in the output
+        # file's directory, so `-o /dev/null` exits 2 on every SUCCESSFUL
+        # resolve for non-root users (/dev isn't writable) — which made the
+        # rc==0 keep-gate below unpassable on GitHub runners (field case:
+        # Tamara's bump-blocking-pins raise silently reverting). Discarding
+        # captured stdout is the only safe /dev/null here.
         proc = subprocess.run(  # noqa: S603 — fixed argv, no shell
-            ["uv", "pip", "compile", req, "-o", os.devnull, "--no-header"],  # noqa: S607 — uv from PATH by design
-
+            ["uv", "pip", "compile", req, "--no-header"],  # noqa: S607 — uv from PATH by design
             capture_output=True, text=True, timeout=300, check=False,
         )
     except (subprocess.TimeoutExpired, OSError) as exc:
@@ -195,6 +200,10 @@ def main() -> int:
     # verification like any other change.
     bump_pins = os.environ.get("BUMP_BLOCKING_PINS", "").lower() in ("true", "1", "yes")
     pin_raises: list[dict] = []
+    # pkg -> (pin name, from, tried) for raises that were APPLIED and failed
+    # the keep-gate: the hold note must say the raise was tried rather than
+    # advise the user to make the exact edit that just didn't resolve.
+    raise_attempts: dict[str, tuple[str, str, str]] = {}
     # (pin base, chosen version) pairs that already failed: retry a pin only
     # when the graph shift produces a NEW answer — re-verifying the same
     # failed choice on every walk step is pure compile churn.
@@ -251,6 +260,7 @@ def main() -> int:
                         # offender. A later iteration may retry this pin, but
                         # only if the shifting graph yields a DIFFERENT choice.
                         failed_raises.add((base, choice))
+                        raise_attempts[pkg] = (blk_name, cur_ver, choice)
                         apply_bump.bump_requirements(project_path, [revert])
                         rc, err = compile_requirements(project_path)
                     elif changed:
@@ -316,7 +326,12 @@ def main() -> int:
         why = (f"{orig} conflicts with your `{blk}` pin" if blk
                else f"{orig} does not resolve together with your other pins")
         advice = ""
-        if blk:
+        if pkg in raise_attempts:
+            blk_name, from_ver, tried = raise_attempts[pkg]
+            advice = (f" (raising your `{blk_name}` pin {from_ver} → {tried} "
+                      f"was tried under `bump-blocking-pins`, but the full "
+                      f"pin set still didn't resolve)")
+        elif blk:
             # The concrete requirement comes from the ORIGINAL target's own
             # metadata at note-build time — atomically scoped to this offender
             # and version, never scraped from the (multi-conflict) error text.
