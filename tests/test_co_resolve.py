@@ -5,6 +5,7 @@ apply_bump) so the file/plan stay consistent.
 """
 
 import json
+import os
 
 import co_resolve
 import pytest
@@ -427,6 +428,61 @@ def test_resolve_pin_choice_none_when_uv_fails(tmp_path, monkeypatch):
 
     monkeypatch.setattr(co_resolve.subprocess, "run", lambda *a, **k: P())
     assert co_resolve.resolve_pin_choice(str(tmp_path), "x") is None
+
+
+def test_compile_requirements_rc_zero_on_success_without_dev_write(tmp_path, monkeypatch):
+    # Real uv writes -o output ATOMICALLY via a temp file in the output file's
+    # directory, so `-o /dev/null` exits 2 on every SUCCESSFUL resolve for
+    # non-root users. That made the rc==0 keep-gate unpassable on GitHub
+    # runners (field case: a valid bump-blocking-pins raise silently
+    # reverted). The shim mimics that exact behavior; compile_requirements
+    # must not route output anywhere it can't write.
+    shim_dir = tmp_path / "bin"
+    shim_dir.mkdir()
+    shim = shim_dir / "uv"
+    shim.write_text(
+        "#!/usr/bin/env bash\n"
+        'out=""; prev=""\n'
+        'for a in "$@"; do [ "$prev" = "-o" ] && out="$a"; prev="$a"; done\n'
+        'if [ -n "$out" ]; then\n'
+        '  d=$(dirname "$out")\n'
+        '  if [ "$d" = "/dev" ] || [ ! -w "$d" ]; then\n'
+        '    echo "error: Permission denied (os error 13)'
+        ' at path \\"$d/.tmpTEST\\"" >&2\n'
+        "    exit 2\n"
+        "  fi\n"
+        '  echo "resolved-pkg==1.0" > "$out"\n'
+        "else\n"
+        '  echo "resolved-pkg==1.0"\n'
+        "fi\n"
+    )
+    shim.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{shim_dir}:{os.environ['PATH']}")
+    (tmp_path / "requirements.txt").write_text("resolved-pkg==1.0\n")
+    rc, err = co_resolve.compile_requirements(str(tmp_path))
+    assert rc == 0, err
+
+
+def test_failed_raise_note_discloses_the_attempt(tmp_path, monkeypatch):
+    # When the raise was applied and the keep-gate rejected it, the hold note
+    # must say so — advising the user to make the exact edit that just failed
+    # to resolve is worse than no advice (field theme: quiet skips).
+    plan_file = _project(
+        tmp_path,
+        "apache-airflow-providers-common-ai==0.6.0\npydantic-ai-slim[openai]==1.107.0\n",
+        _plan(),
+    )
+    _run_with_flag(
+        tmp_path, monkeypatch,
+        [(1, UV_CONFLICT.format(ver="0.6.0")),   # initial conflict
+         (1, UV_CONFLICT.format(ver="0.6.0")),   # after raise: still blocked
+         (1, UV_CONFLICT.format(ver="0.6.0")),   # after revert: original error
+         (0, "")],                                # after walk-back
+        versions=["0.5.2"])
+    note = json.loads(plan_file.read_text())["providers"][0]["note"]
+    assert "raising your `pydantic-ai-slim[openai]` pin 1.107.0 → 2.1.3 was tried" in note
+    assert "didn't resolve" in note
+    assert "to satisfy" not in note  # the failed edit must not be re-advised
 
 
 def test_flag_never_downgrades_a_user_pin(tmp_path, monkeypatch):
