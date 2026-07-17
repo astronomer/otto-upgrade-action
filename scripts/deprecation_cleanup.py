@@ -112,18 +112,18 @@ _F401_AIRFLOW = re.compile(r"^`(?P<q>airflow(?:\.[\w.]+)?)` imported but unused"
 
 
 def _f401_report(paths: list[str], project_path: str) -> dict:
-    """Unused airflow.* imports still in the tree — REPORT ONLY.
+    """Unused airflow.* imports in the tree — REPORT ONLY, never edit.
 
-    Removal is the skill's F401 step (scoped to dags/ and include/; plain
-    --fix); this discloses what remains — plugins/ (excluded there because
-    Airflow plugins register by being imported), noqa'd lines, re-exports,
-    or anything the migration missed. The AIR rules can't see these (they
-    flag usage sites), so without this note the PR reads clean while dead
-    deprecated imports ride along.
+    F401 proves a binding is unreferenced, NOT that the import is free of
+    side effects — plugins/ modules register functionality by being
+    imported, and removing "unused" imports also sweeps up re-export and
+    capability-probe conventions. Removal is therefore the user's call;
+    this pass only keeps the PR from reading clean while dead deprecated
+    imports (invisible to the usage-site-only AIR rules) ride along.
 
     Returns {status, items, reason?}: a tooling miss is status=unavailable,
-    never an empty ok — silence must not read as clean (the invariant this
-    feature exists for). It still never blocks the sweep."""
+    never an empty ok — a failed check must not read as a clean one. It
+    still never blocks the sweep."""
     cmd = [
         "uvx", f"ruff@{RUFF_VERSION}", "check", *paths,
         "--select", "F401", "--output-format", "json",
