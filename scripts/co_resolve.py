@@ -204,10 +204,15 @@ def main() -> int:
     # the keep-gate: the hold note must say the raise was tried rather than
     # advise the user to make the exact edit that just didn't resolve.
     raise_attempts: dict[str, tuple[str, str, str]] = {}
-    # (pin base, chosen version) pairs that already failed: retry a pin only
-    # when the graph shift produces a NEW answer — re-verifying the same
-    # failed choice on every walk step is pure compile churn.
-    failed_raises: set[tuple[str, str]] = set()
+    # Failed raises are scoped to the GRAPH they were tested against
+    # (pin base, choice, frozenset of live provider pins): a choice that
+    # failed with the provider at its original target can become valid once
+    # the provider walks back (the walked version may drop the second
+    # constraint that killed the raise) — a permanent (pin, choice) key
+    # suppressed that retry and silently walked back anyway. The ambiguous
+    # multi-line case keys with graph=None: the file shape never changes,
+    # so that failure IS permanent.
+    failed_raises: set[tuple[str, str, frozenset | None]] = set()
 
     rc, err = compile_requirements(project_path)
     for _ in range(_MAX_COMPILES):
@@ -233,10 +238,12 @@ def main() -> int:
             base = blk_name.split("[")[0]
             if bump_pins and cur_ver:
                 choice = resolve_pin_choice(project_path, base, blk_name)
+                graph = frozenset(live.items())
                 # Upward only: an upper-bound conflict makes uv pick a LOWER
                 # version, and silently downgrading a user pin under a flag
                 # named bump-* would be a lie — that case stays a hold+advice.
-                if (choice and (base, choice) not in failed_raises
+                if (choice and (base, choice, graph) not in failed_raises
+                        and (base, choice, None) not in failed_raises
                         and rt.version_tuple(choice) > rt.version_tuple(cur_ver)):
                     spec = {"package": normalize_name(base),
                             "current": cur_ver, "target": choice}
@@ -255,11 +262,15 @@ def main() -> int:
                             pin_raises.append({
                                 "pin": blk_name, "from": cur_ver, "to": choice,
                                 "unblocks": {"package": pkg, "version": live[pkg]}})
+                            # An earlier attempt for this provider failed at a
+                            # different graph; the raise ultimately stuck, so a
+                            # "was tried and didn't resolve" note would lie.
+                            raise_attempts.pop(pkg, None)
                             continue
                         # Anything else: undo and let the walk handle this
-                        # offender. A later iteration may retry this pin, but
-                        # only if the shifting graph yields a DIFFERENT choice.
-                        failed_raises.add((base, choice))
+                        # offender. A later iteration may retry this pin —
+                        # including the SAME choice once the graph shifts.
+                        failed_raises.add((base, choice, graph))
                         raise_attempts[pkg] = (blk_name, cur_ver, choice)
                         apply_bump.bump_requirements(project_path, [revert])
                         rc, err = compile_requirements(project_path)
@@ -267,7 +278,7 @@ def main() -> int:
                         # >1 line changed: the file pins this package more than
                         # once (per-marker variants) — too ambiguous to edit
                         # blind; restore and hold the provider instead.
-                        failed_raises.add((base, choice))
+                        failed_raises.add((base, choice, None))
                         apply_bump.bump_requirements(project_path, [revert])
         if pkg not in pools:
             pools[pkg] = in_scope_versions(pkg, offender["current"], original[pkg])
@@ -326,8 +337,20 @@ def main() -> int:
         why = (f"{orig} conflicts with your `{blk}` pin" if blk
                else f"{orig} does not resolve together with your other pins")
         advice = ""
-        if pkg in raise_attempts:
-            blk_name, from_ver, tried = raise_attempts[pkg]
+        kept_raise = next((r for r in pin_raises
+                           if r["unblocks"]["package"] == pkg), None)
+        attempt = raise_attempts.get(pkg)
+        if kept_raise:
+            # Walked AND raised: a retry at the walked-back version stuck.
+            # Spec advice would name an edit that is already made.
+            advice = (f" (your `{kept_raise['pin']}` pin was raised "
+                      f"{kept_raise['from']} → {kept_raise['to']} under "
+                      f"`bump-blocking-pins`; {orig} still doesn't co-resolve)")
+        elif attempt and blk and attempt[0] == blk.split("==")[0]:
+            # Disclose only the attempt on the pin this note blames — a
+            # different pin's failed raise (a later graph state) in the same
+            # sentence reads as a contradiction.
+            blk_name, from_ver, tried = attempt
             advice = (f" (raising your `{blk_name}` pin {from_ver} → {tried} "
                       f"was tried under `bump-blocking-pins`, but the full "
                       f"pin set still didn't resolve)")
