@@ -92,6 +92,14 @@ fi
   echo "list limitations of this CI environment (a missing tool, no Airflow"
   echo "instance, validation you could not run here) as follow-ups."
   echo
+  echo "changes_made is read by a human reviewing the PR. Every item must be"
+  echo "about THEIR code: an edit you made (file, what, why) or a decision"
+  echo "you took about their code (a usage you reviewed and deliberately left"
+  echo "unchanged, an edit you reverted — and the reason). Do not narrate your"
+  echo "process — loading guidance, running scanners or greps, or enumerating"
+  echo "the patterns you checked is not information a reviewer can act on."
+  echo "When the checks found nothing else to change, one line says so."
+  echo
   echo "## Resolved plan"
   echo
   echo '<plan>'
