@@ -48,6 +48,32 @@ else
   focus="Apply only the CODE migrations these provider version bumps require"
 fi
 
+# The verification promise must match the configured gate: syntax only
+# byte-compiles with the runner Python, none runs nothing, and EVERY
+# other value — parse, import, or a typo — goes through verify.sh's
+# target-aware path (its own dispatch special-cases only none/syntax).
+# Claiming "the action verifies" in the first two modes would suppress a
+# follow-up the user genuinely needs, so there the follow-ups fence also
+# stops banning the missing-validation item it asks for and names that
+# validation as a legitimate follow-up category.
+case "${VERIFY_LEVEL:-parse}" in
+  none)
+    verify_msg="The action runs NO post-migration verification in this configuration (verify-level: none). Add ONE manual_followups item telling the user to validate the project against the target image before merging."
+    fence_examples="a missing tool, no Airflow instance"
+    fence_allowed="RBAC, connections, deployment settings, validating the migrated project against the target image"
+    ;;
+  syntax)
+    verify_msg="The action only byte-compiles the code afterwards (verify-level: syntax) — nothing validates it against the target Airflow. Add ONE manual_followups item telling the user to validate the project against the target image before merging."
+    fence_examples="a missing tool, no Airflow instance"
+    fence_allowed="RBAC, connections, deployment settings, validating the migrated project against the target image"
+    ;;
+  *)
+    verify_msg="The action runs its own post-migration verification against the target versions, so do not treat skipped runtime validation as a gap to escalate."
+    fence_examples="a missing tool, no Airflow instance, validation you could not run here"
+    fence_allowed="RBAC, connections, deployment settings"
+    ;;
+esac
+
 {
   echo "# Upgrade context"
   echo
@@ -81,15 +107,14 @@ fi
   echo
   echo "This is an unattended CI run. There is NO local or remote Airflow"
   echo "instance: \`af\` commands, \`astro dev restart\`, and any rebuild-and-"
-  echo "validate phase of the skill CANNOT run here — skip them. The action"
-  echo "runs its own post-migration verification against the target versions,"
-  echo "so do not treat skipped runtime validation as a gap to escalate."
+  echo "validate phase of the skill CANNOT run here — skip them."
+  echo "$verify_msg"
   echo
   echo "Reserve manual_followups for action items the UPGRADE requires of a"
   echo "human — code changes you could not safely make, and platform or"
-  echo "control-plane steps (RBAC, connections, deployment settings). Do NOT"
-  echo "list limitations of this CI environment (a missing tool, no Airflow"
-  echo "instance, validation you could not run here) as follow-ups."
+  echo "control-plane steps (${fence_allowed}). Do NOT"
+  echo "list limitations of this CI environment (${fence_examples})"
+  echo "as follow-ups."
   echo
   echo "## Resolved plan"
   echo
@@ -129,9 +154,10 @@ fi
   fi
   echo
   echo "This is a headless CI run with no Airflow instance — skip any af/rebuild"
-  echo "validation steps (the action verifies separately), and keep environment"
-  echo "limitations OUT of manual_followups: follow-ups are only for code or"
-  echo "platform actions the upgrade itself requires of a human."
+  echo "validation steps (the context file states what verification the caller"
+  echo "runs), and keep environment limitations OUT of manual_followups:"
+  echo "follow-ups are only for code, validation, or platform actions the"
+  echo "upgrade itself requires of a human."
   echo
   echo "Submit your final answer via the submit_final_answer tool using the schema"
   echo "you were given (summary, changes_made, manual_followups, files_changed)."

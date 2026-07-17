@@ -10,20 +10,25 @@ import json
 import subprocess
 from pathlib import Path
 
+import pytest
+
 SCRIPT = Path(__file__).resolve().parent.parent / "scripts" / "build-prompt.sh"
 
 
-def _run(tmp_path, plan: dict, project="/proj") -> str:
+def _run(tmp_path, plan: dict, project="/proj", verify_level=None) -> str:
     plan_file = tmp_path / "plan.json"
     plan_file.write_text(json.dumps(plan))
+    env = {
+        "PATH": "/usr/bin:/bin:/usr/local/bin",
+        "WORKDIR": str(tmp_path),
+        "PLAN_FILE": str(plan_file),
+        "PROJECT_PATH": project,
+    }
+    if verify_level is not None:
+        env["VERIFY_LEVEL"] = verify_level
     subprocess.run(
         ["bash", str(SCRIPT)],
-        env={
-            "PATH": "/usr/bin:/bin:/usr/local/bin",
-            "WORKDIR": str(tmp_path),
-            "PLAN_FILE": str(plan_file),
-            "PROJECT_PATH": project,
-        },
+        env=env,
         check=True, capture_output=True, text=True,
     )
     return (tmp_path / "user-prompt.txt").read_text()
@@ -89,6 +94,32 @@ def test_schema_is_the_sole_home_of_the_changes_made_contract(tmp_path):
     _run(tmp_path, plan)
     context = (tmp_path / "upgrade-context.md").read_text()
     assert "changes_made is read by a human" not in context
+
+
+@pytest.mark.parametrize("level,claims_verified,asks_followup", [
+    ("parse", True, False),
+    ("import", True, False),
+    ("syntax", False, True),
+    ("none", False, True),
+    ("", True, False),        # unset env defaults to parse
+    ("imports", True, False),  # typo: verify.sh routes it target-aware too
+])
+def test_verification_promise_matches_the_configured_gate(
+        tmp_path, level, claims_verified, asks_followup):
+    # syntax only byte-compiles with the runner Python and none runs nothing;
+    # claiming "the action verifies" there suppresses a follow-up the user
+    # genuinely needs (codex finding on PR #23). In those modes the fence
+    # also stops banning the missing-validation item it now asks for.
+    plan = {"runtime": {"current_airflow": "3.2.2", "target_airflow": "3.3.0",
+                        "current_tag": "3.2-5", "target_tag": "3.3-2", "tier": "minor"},
+            "providers": []}
+    _run(tmp_path, plan, verify_level=level)
+    context = (tmp_path / "upgrade-context.md").read_text()
+    assert ("post-migration verification against the target versions"
+            in context) is claims_verified
+    assert ("validate the project against the target image"
+            in context) is asks_followup
+    assert ("validation you could not run here" in context) is claims_verified
 
 
 def test_patcher_edits_outside_scan_scope_are_kept(tmp_path):
