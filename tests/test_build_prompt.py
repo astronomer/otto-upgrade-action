@@ -68,22 +68,48 @@ def test_prompt_declares_headless_and_fences_followups(tmp_path):
     assert "platform or" in context and "control-plane steps" in context
 
 
-def test_context_pins_the_changes_made_reporting_contract(tmp_path):
-    # Field finding (astro-event-demo PR #3): without this, changes_made comes
-    # back padded with process narration — "loaded guidance", "ran the
-    # preflight scanner", inventories of clean-checked patterns — instead of
-    # edits/decisions about the user's code.
+def test_schema_is_the_sole_home_of_the_changes_made_contract(tmp_path):
+    # Field finding (astro-event-demo PR #3): without the contract,
+    # changes_made comes back padded with process narration — "loaded
+    # guidance", "ran the preflight scanner", inventories of clean-checked
+    # patterns — instead of edits/decisions about the user's code. The
+    # contract lives in the SCHEMA description (always in-context via
+    # --output-schema); the prompt audit removed the near-verbatim context
+    # copy as drift risk, so its reappearance there is a regression.
+    schema = (SCRIPT.parent / "upgrade-schema.json").read_text()
+    assert "Never narrate process" in schema
+    assert "ambiguous or risky cases belong in manual_followups" in schema
+    # No revert category: reverting is never a reportable outcome
+    # (the audit's H1 — it sanctioned the scope-revert the keep-rule forbids).
+    assert "an edit reverted" not in schema
+    assert "Never revert a bundled-tool edit" in schema
     plan = {"runtime": {"current_airflow": "3.2.2", "target_airflow": "3.3.0",
                         "current_tag": "3.2-5", "target_tag": "3.3-2", "tier": "minor"},
             "providers": []}
     _run(tmp_path, plan)
     context = (tmp_path / "upgrade-context.md").read_text()
-    assert "changes_made is read by a human" in context
-    assert "information a reviewer can act on" in context
-    # The manual_followups boundary: unconfident holds are follow-ups,
-    # not "decisions".
-    assert "ambiguous or risky cases go in manual_followups" in context
-    assert "say so in one changes_made item" in context
+    assert "changes_made is read by a human" not in context
+
+
+def test_patcher_edits_outside_scan_scope_are_kept(tmp_path):
+    # Field finding (astro-event-demo PR #3, three runs): the KB patcher
+    # rewrites the whole project by design, but the prompt's scan scope
+    # ("Scan dags/, include/, and plugins/") read as a touch boundary — so
+    # Otto flip-flopped between keeping and reverting the patcher's
+    # DagBag-import fix in tests/dags/test_dag_example.py, and the rolling
+    # force-push turned each revert into a visible regression on the PR.
+    plan = {"runtime": {"current_airflow": "3.2.2", "target_airflow": "3.3.0",
+                        "current_tag": "3.2-5", "target_tag": "3.3-2", "tier": "minor"},
+            "providers": []}
+    prompt = _run(tmp_path, plan)
+    # The keep-rule sits next to the scan-scope line it disambiguates, in
+    # the PRIMARY channel (user prompt), stated once — the audit removed
+    # the second copy in the context file as drift risk.
+    assert "Scan dags/, include/, and plugins/" in prompt
+    assert "Two actors edit this project" in prompt
+    assert "Never revert a bundled-tool edit" in prompt
+    # The wrong-patcher-edit case routes to followups, not a revert.
+    assert "keep it and flag it under" in prompt
 
 
 def test_raised_user_pins_get_reasoning_instructions(tmp_path):

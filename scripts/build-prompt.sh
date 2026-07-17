@@ -52,8 +52,8 @@ fi
   echo "# Upgrade context"
   echo
   echo "The version pins in this project have ALREADY been bumped (Dockerfile"
-  echo "Runtime tag and/or requirements.txt provider pins). Do NOT change version"
-  echo "pins again. Your job is the code-level migration only."
+  echo "Runtime tag and/or requirements.txt provider pins). Your job is the"
+  echo "code-level migration only."
   echo
   echo "- Scope: ${scope_line}"
   echo "- Project root: ${PROJECT_PATH}"
@@ -82,27 +82,14 @@ fi
   echo "This is an unattended CI run. There is NO local or remote Airflow"
   echo "instance: \`af\` commands, \`astro dev restart\`, and any rebuild-and-"
   echo "validate phase of the skill CANNOT run here — skip them. The action"
-  echo "performs its own post-migration verification (it imports every DAG"
-  echo "against the target Airflow and providers), so do not treat skipped"
-  echo "runtime validation as a gap to escalate."
+  echo "runs its own post-migration verification against the target versions,"
+  echo "so do not treat skipped runtime validation as a gap to escalate."
   echo
   echo "Reserve manual_followups for action items the UPGRADE requires of a"
   echo "human — code changes you could not safely make, and platform or"
   echo "control-plane steps (RBAC, connections, deployment settings). Do NOT"
   echo "list limitations of this CI environment (a missing tool, no Airflow"
   echo "instance, validation you could not run here) as follow-ups."
-  echo
-  echo "changes_made is read by a human reviewing the PR. Every item must be"
-  echo "about THEIR code: an edit you made (file, what, why) or a decision"
-  echo "you took about their code — a specific usage you reviewed and"
-  echo "deliberately left unchanged (only when you are confident no change is"
-  echo "needed; ambiguous or risky cases go in manual_followups), or an edit"
-  echo "you reverted, with the reason. A decision names the specific usage"
-  echo "and where it lives; a list of what you scanned is process, not a"
-  echo "decision. Do not narrate your process — loading guidance, running"
-  echo "scanners or greps, or enumerating the patterns you checked is not"
-  echo "information a reviewer can act on. When the checks found nothing"
-  echo "else to change, say so in one changes_made item."
   echo
   echo "## Resolved plan"
   echo
@@ -124,6 +111,15 @@ fi
   echo "Scan dags/, include/, and plugins/ under the project root. Make the edits"
   echo "directly. Do not guess: if a change is ambiguous or risky, leave the code"
   echo "as-is and record it under manual_followups instead."
+  echo
+  echo "Two actors edit this project: you, and the skill's bundled patcher."
+  echo "The scan scope above bounds only your own proactive edits — the"
+  echo "patcher rewrites the whole project by design. Keep every patcher"
+  echo "edit wherever it lands (tests/, scripts/, ...) and report it in"
+  echo "changes_made. Never revert a bundled-tool edit: if you believe one"
+  echo "is wrong for this project, keep it and flag it under"
+  echo "manual_followups. A test file that imports airflow breaks on the new"
+  echo "version just like a DAG does — reverting the fix ships that breakage."
   if [[ -n "$pin_lines" ]]; then
     echo
     echo "This run also raised user-owned dependency pins — see 'Raised user"
