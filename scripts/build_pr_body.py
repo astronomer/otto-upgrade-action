@@ -216,7 +216,7 @@ def main() -> int:
             out += [otto["summary"], ""]
         addressed = otto.get("changes_made") or otto.get("breaking_changes_addressed") or []
         if addressed:
-            out.append("**Breaking changes handled:**")
+            out.append("**Changes and decisions:**")
             out += [f"- {c}" for c in addressed] + [""]
         followups = otto.get("manual_followups") or []
         if followups:

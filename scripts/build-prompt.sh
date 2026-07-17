@@ -94,11 +94,15 @@ fi
   echo
   echo "changes_made is read by a human reviewing the PR. Every item must be"
   echo "about THEIR code: an edit you made (file, what, why) or a decision"
-  echo "you took about their code (a usage you reviewed and deliberately left"
-  echo "unchanged, an edit you reverted — and the reason). Do not narrate your"
-  echo "process — loading guidance, running scanners or greps, or enumerating"
-  echo "the patterns you checked is not information a reviewer can act on."
-  echo "When the checks found nothing else to change, one line says so."
+  echo "you took about their code — a specific usage you reviewed and"
+  echo "deliberately left unchanged (only when you are confident no change is"
+  echo "needed; ambiguous or risky cases go in manual_followups), or an edit"
+  echo "you reverted, with the reason. A decision names the specific usage"
+  echo "and where it lives; a list of what you scanned is process, not a"
+  echo "decision. Do not narrate your process — loading guidance, running"
+  echo "scanners or greps, or enumerating the patterns you checked is not"
+  echo "information a reviewer can act on. When the checks found nothing"
+  echo "else to change, say so in one changes_made item."
   echo
   echo "## Resolved plan"
   echo
