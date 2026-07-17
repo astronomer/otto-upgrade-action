@@ -106,12 +106,12 @@ def _rules_alive() -> bool:
             return False
 
 
-# F401's message carries the unused binding's qualified name:
-# "`airflow.decorators.task_group` imported but unused".
-_F401_AIRFLOW = re.compile(r"^`(?P<q>airflow\.[\w.]+)` imported but unused")
+# F401's message carries the unused binding's qualified name — including
+# the bare-module form: "`airflow` imported but unused".
+_F401_AIRFLOW = re.compile(r"^`(?P<q>airflow(?:\.[\w.]+)?)` imported but unused")
 
 
-def _f401_report(paths: list[str], project_path: str) -> list[str]:
+def _f401_report(paths: list[str], project_path: str) -> dict:
     """Unused airflow.* imports still in the tree — REPORT ONLY.
 
     Removal is the skill's F401 step (scoped to dags/ and include/; plain
@@ -119,8 +119,11 @@ def _f401_report(paths: list[str], project_path: str) -> list[str]:
     Airflow plugins register by being imported), noqa'd lines, re-exports,
     or anything the migration missed. The AIR rules can't see these (they
     flag usage sites), so without this note the PR reads clean while dead
-    deprecated imports ride along. Best-effort: any tooling miss reports
-    nothing rather than blocking the sweep."""
+    deprecated imports ride along.
+
+    Returns {status, items, reason?}: a tooling miss is status=unavailable,
+    never an empty ok — silence must not read as clean (the invariant this
+    feature exists for). It still never blocks the sweep."""
     cmd = [
         "uvx", f"ruff@{RUFF_VERSION}", "check", *paths,
         "--select", "F401", "--output-format", "json",
@@ -128,22 +131,27 @@ def _f401_report(paths: list[str], project_path: str) -> list[str]:
     try:
         proc = subprocess.run(  # noqa: S603 — fixed argv, no shell
             cmd, capture_output=True, text=True, timeout=300, check=False)
-    except (subprocess.TimeoutExpired, OSError):
-        return []
+    except (subprocess.TimeoutExpired, OSError) as exc:
+        return {"status": "unavailable", "items": [],
+                "reason": f"{type(exc).__name__}: {exc}"}
     if proc.returncode not in (0, 1):
-        return []
+        return {"status": "unavailable", "items": [],
+                "reason": f"ruff F401 run failed (rc={proc.returncode}): "
+                          f"{proc.stderr.strip()[:200]}"}
     try:
         diags = json.loads(proc.stdout)
     except json.JSONDecodeError:
-        return []
-    out = []
+        return {"status": "unavailable", "items": [],
+                "reason": "ruff F401 produced unparseable output"}
+    items = []
     for d in diags:
         m = _F401_AIRFLOW.match(d.get("message", ""))
         if m:
             row = (d.get("location") or {}).get("row", "?")
             loc = _relative(d.get("filename", "?"), project_path)
-            out.append(f"`{m.group('q')}` — `{loc}:{row}`")
-    return sorted(out)
+            items.append({"name": m.group("q"), "location": f"{loc}:{row}"})
+    items.sort(key=lambda i: (i["location"], i["name"]))
+    return {"status": "ok", "items": items}
 
 
 _FROM_IMPORT = re.compile(

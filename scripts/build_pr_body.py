@@ -237,7 +237,9 @@ def main() -> int:
     dep = _load("DEPRECATION_FILE")
     if dep:
         fixed, remaining = dep.get("fixed", 0), dep.get("remaining") or []
-        unused_imports = dep.get("unused_airflow_imports") or []
+        unused_rep = dep.get("unused_airflow_imports") or {}
+        unused_items = unused_rep.get("items") or []
+        unused_missing = unused_rep.get("status") == "unavailable"
         if dep.get("status") != "ok":
             out += [
                 "### Deprecation sweep",
@@ -246,7 +248,7 @@ def main() -> int:
                 f"{dep.get('reason', 'unknown')}",
                 "",
             ]
-        elif fixed or remaining or unused_imports:
+        elif fixed or remaining or unused_items or unused_missing:
             out += ["### Deprecation sweep", ""]
             if dep.get("demoted"):
                 out += [f"> {dep['demoted']}.", ""]
@@ -280,17 +282,41 @@ def main() -> int:
                         f"- **{g.get('rule', 'AIR?')}** ×{g.get('count', '?')}: "
                         f"{g.get('message', '')} — {locs}{more}")
                 out.append("")
-            if unused_imports:
+            if unused_missing:
+                out += ["> ⚠️ The leftover-import check could not run "
+                        f"({unused_rep.get('reason', 'unknown')}) — unused "
+                        "deprecated imports may remain undisclosed.", ""]
+            elif unused_items:
                 # Found-but-left is worth a note; silence reads as clean.
-                # These are invisible to the AIR rules (usage-site only) and
-                # deliberately not auto-removed (plugins/ imports can be
-                # load-bearing via registration side effects).
-                out.append("**Unused `airflow.*` import(s) left in place** "
-                           "(nothing imports them; remove when convenient):")
-                out += [f"- {u}" for u in unused_imports[:10]]
-                if len(unused_imports) > 10:
-                    out.append(f"- …and {len(unused_imports) - 10} more")
-                out.append("")
+                # plugins/ gets its own framing: F401 only proves the BINDING
+                # is unreferenced, and plugins can register functionality by
+                # being imported — advising removal there would be advising a
+                # possible breakage.
+                def _fmt(item):
+                    return f"- `{item['name']}` — `{item['location']}`"
+
+                plugin_items = [i for i in unused_items
+                                if i["location"].startswith("plugins/")]
+                other_items = [i for i in unused_items
+                               if not i["location"].startswith("plugins/")]
+                if other_items:
+                    out.append("**Unused `airflow.*` import(s) left in place** "
+                               "(unreferenced in their file; remove when "
+                               "convenient):")
+                    out += [_fmt(i) for i in other_items[:10]]
+                    if len(other_items) > 10:
+                        out.append(f"- …and {len(other_items) - 10} more")
+                    out.append("")
+                if plugin_items:
+                    out.append("**Unused `airflow.*` import(s) in `plugins/` — "
+                               "left deliberately**: plugins can register "
+                               "functionality by being imported, so an "
+                               "unreferenced import here may still be "
+                               "load-bearing. Validate before removing:")
+                    out += [_fmt(i) for i in plugin_items[:10]]
+                    if len(plugin_items) > 10:
+                        out.append(f"- …and {len(plugin_items) - 10} more")
+                    out.append("")
 
     # Verification — collapsible, with the outcome in the summary line so the
     # detail (and any Airflow import-time noise) stays tucked away. Failure and

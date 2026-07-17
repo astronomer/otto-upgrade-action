@@ -59,7 +59,10 @@ def _run(tmp_path, monkeypatch, mode, ruff_results, plan=None, project="/proj",
         return next(calls)
 
     monkeypatch.setattr(dc, "_ruff", fake_ruff)
-    monkeypatch.setattr(dc, "_f401_report", lambda _p, _proj: list(f401 or []))
+    monkeypatch.setattr(
+        dc, "_f401_report",
+        lambda _p, _proj: f401 if f401 is not None
+        else {"status": "ok", "items": []})
     buf = io.StringIO()
     with contextlib.redirect_stdout(buf):
         assert dc.main() == 0
@@ -315,7 +318,9 @@ class TestImportMerge:
 def test_unused_airflow_imports_reported_in_both_modes(tmp_path, monkeypatch):
     # Report-only: the list rides the summary in advisory AND fix mode; it
     # never edits, so no demotion logic applies to it.
-    left = ["`airflow.decorators.task_group` — `plugins/shim.py:3`"]
+    left = {"status": "ok", "items": [
+        {"name": "airflow.decorators.task_group",
+         "location": "plugins/shim.py:3"}]}
     for mode, results in (
             ("advisory", [(1, json.dumps(FOUND), "")]),
             ("fix", [(1, json.dumps(FOUND), ""), (1, json.dumps(REMAINING), "")])):
@@ -325,12 +330,16 @@ def test_unused_airflow_imports_reported_in_both_modes(tmp_path, monkeypatch):
 
 
 def test_f401_report_filters_to_airflow_and_formats(monkeypatch):
+    # Bare `import airflow` counts too — its F401 message has no dot
+    # (codex finding: the first regex dropped it).
     diags = [
         {"message": "`airflow.decorators.task_group` imported but unused",
          "filename": "/proj/plugins/shim.py", "location": {"row": 3}},
+        {"message": "`airflow` imported but unused",
+         "filename": "/proj/dags/b.py", "location": {"row": 4}},
         {"message": "`os` imported but unused",
          "filename": "/proj/dags/a.py", "location": {"row": 1}},
-        {"message": "`pandas.DataFrame` imported but unused",
+        {"message": "`airflow_provider_foo.bar` imported but unused",
          "filename": "/proj/dags/a.py", "location": {"row": 2}},
     ]
 
@@ -343,11 +352,38 @@ def test_f401_report_filters_to_airflow_and_formats(monkeypatch):
 
     monkeypatch.setattr(dc.subprocess, "run", fake_run)
     out = dc._f401_report(["/proj/dags", "/proj/plugins"], "/proj")
-    assert out == ["`airflow.decorators.task_group` — `plugins/shim.py:3`"]
+    assert out == {"status": "ok", "items": [
+        {"name": "airflow", "location": "dags/b.py:4"},
+        {"name": "airflow.decorators.task_group",
+         "location": "plugins/shim.py:3"},
+    ]}
 
 
-def test_f401_report_is_empty_on_tooling_failure(monkeypatch):
+def test_f401_report_failure_is_unavailable_not_empty_ok(monkeypatch):
+    # Silence must not read as clean — the invariant this feature exists
+    # for applies to its own tooling too (codex finding).
     def boom(*_a, **_k):
         raise OSError("uvx missing")
     monkeypatch.setattr(dc.subprocess, "run", boom)
-    assert dc._f401_report(["/proj/dags"], "/proj") == []
+    rep = dc._f401_report(["/proj/dags"], "/proj")
+    assert rep["status"] == "unavailable"
+    assert "uvx missing" in rep["reason"]
+    assert rep["items"] == []
+
+
+@pytest.mark.parametrize("rc,stdout,reason_frag", [
+    (2, "", "rc=2"),                 # ruff crash / bad invocation
+    (1, "garbage{", "unparseable"),  # broken JSON
+])
+def test_f401_report_bad_ruff_outcomes_are_unavailable(monkeypatch, rc, stdout, reason_frag):
+    def fake_run(*_a, **_k):
+        class P:
+            returncode = rc
+        P.stdout = stdout
+        P.stderr = "boom"
+        return P()
+
+    monkeypatch.setattr(dc.subprocess, "run", fake_run)
+    rep = dc._f401_report(["/proj/dags"], "/proj")
+    assert rep["status"] == "unavailable"
+    assert reason_frag in rep["reason"]

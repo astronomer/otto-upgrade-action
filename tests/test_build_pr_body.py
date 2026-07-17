@@ -368,30 +368,71 @@ def test_bumped_runtime_note_stays_in_its_row_not_not_changed(tmp_path, monkeypa
     assert "### Not changed" not in out
 
 
-def test_unused_airflow_imports_render_as_left_in_place(tmp_path, monkeypatch):
+def test_unused_airflow_imports_render_split_by_plugins(tmp_path, monkeypatch):
     # Found-but-left disclosure: dead airflow imports are invisible to the
     # AIR rules and deliberately not auto-removed everywhere — the PR must
     # say so instead of reading clean (field ask, astro-event-demo).
+    # plugins/ entries must NOT get remove-it advice: F401 only proves the
+    # binding is unreferenced, and plugins register by being imported.
     dep = {"mode": "fix", "status": "ok", "found": 0, "fixed": 0,
            "files_changed": [], "remaining": [],
-           "unused_airflow_imports": [
-               "`airflow.decorators.task_group` — `plugins/shim.py:3`"]}
+           "unused_airflow_imports": {"status": "ok", "items": [
+               {"name": "airflow.decorators.task_group",
+                "location": "plugins/shim.py:3"},
+               {"name": "airflow.operators.empty.EmptyOperator",
+                "location": "dags/x.py:7"}]}}
     dep_f = tmp_path / "deprecations.json"
     dep_f.write_text(json.dumps(dep))
     monkeypatch.setenv("DEPRECATION_FILE", str(dep_f))
     out = _render(tmp_path, monkeypatch, _SEC_PLAN, {"files": []})
     # The section renders even with zero rewrites and zero AIR debt.
     assert "### Deprecation sweep" in out
-    assert "Unused `airflow.*` import(s) left in place" in out
+    assert "remove when convenient" in out
+    assert "`airflow.operators.empty.EmptyOperator` — `dags/x.py:7`" in out
+    assert "left deliberately" in out and "Validate before removing" in out
     assert "`airflow.decorators.task_group` — `plugins/shim.py:3`" in out
+    # The plugins/ item must sit under the validate-first heading, not the
+    # remove-when-convenient one.
+    convenient = out.index("remove when convenient")
+    validate = out.index("Validate before removing")
+    assert convenient < out.index("dags/x.py:7") < validate
+    assert out.index("plugins/shim.py:3") > validate
+
+
+def test_unused_import_check_failure_renders_loudly(tmp_path, monkeypatch):
+    dep = {"mode": "fix", "status": "ok", "found": 0, "fixed": 0,
+           "files_changed": [], "remaining": [],
+           "unused_airflow_imports": {"status": "unavailable", "items": [],
+                                      "reason": "uvx missing"}}
+    dep_f = tmp_path / "deprecations.json"
+    dep_f.write_text(json.dumps(dep))
+    monkeypatch.setenv("DEPRECATION_FILE", str(dep_f))
+    out = _render(tmp_path, monkeypatch, _SEC_PLAN, {"files": []})
+    assert "leftover-import check could not run" in out
+    assert "uvx missing" in out
+
+
+def test_unused_imports_cap_at_ten_with_overflow_line(tmp_path, monkeypatch):
+    items = [{"name": f"airflow.mod.sym{i}", "location": f"dags/f{i}.py:1"}
+             for i in range(13)]
+    dep = {"mode": "fix", "status": "ok", "found": 0, "fixed": 0,
+           "files_changed": [], "remaining": [],
+           "unused_airflow_imports": {"status": "ok", "items": items}}
+    dep_f = tmp_path / "deprecations.json"
+    dep_f.write_text(json.dumps(dep))
+    monkeypatch.setenv("DEPRECATION_FILE", str(dep_f))
+    out = _render(tmp_path, monkeypatch, _SEC_PLAN, {"files": []})
+    assert "…and 3 more" in out
+    assert "airflow.mod.sym9" in out
+    assert "airflow.mod.sym10" not in out
 
 
 def test_no_unused_imports_means_no_left_in_place_block(tmp_path, monkeypatch):
     dep = {"mode": "fix", "status": "ok", "found": 1, "fixed": 1,
            "files_changed": ["dags/a.py"], "remaining": [],
-           "unused_airflow_imports": []}
+           "unused_airflow_imports": {"status": "ok", "items": []}}
     dep_f = tmp_path / "deprecations.json"
     dep_f.write_text(json.dumps(dep))
     monkeypatch.setenv("DEPRECATION_FILE", str(dep_f))
     out = _render(tmp_path, monkeypatch, _SEC_PLAN, {"files": []})
-    assert "left in place" not in out
+    assert "left in place" not in out and "left deliberately" not in out
