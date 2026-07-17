@@ -403,6 +403,83 @@ def test_failed_raise_is_reverted_before_walk_back(tmp_path, monkeypatch):
     assert "pydantic-ai-slim[openai]==1.107.0" in reqs  # pin restored
 
 
+UV_CONFLICT_HTTPX = """\
+  x No solution found when resolving dependencies:
+  |-> Because apache-airflow-providers-common-ai=={ver}
+      depends on httpx>=1.0 and you require httpx==0.9.0,
+      we can conclude that your requirements are unsatisfiable.
+"""
+
+
+def test_same_choice_retries_after_walk_and_sticks(tmp_path, monkeypatch):
+    # A raise that fails against the ORIGINAL target can become valid at the
+    # walked-back version (the walked version may drop the second constraint
+    # that killed it). A permanent (pin, choice) failed-key suppressed that
+    # retry and silently walked back anyway — failures are scoped to the
+    # graph they were tested against.
+    plan_file = _project(
+        tmp_path,
+        "apache-airflow-providers-common-ai==0.6.0\npydantic-ai-slim[openai]==1.107.0\n",
+        _plan(),
+    )
+    calls = _run_with_flag(
+        tmp_path, monkeypatch,
+        [(1, UV_CONFLICT.format(ver="0.6.0")),   # initial conflict at 0.6.0
+         (1, UV_CONFLICT.format(ver="0.6.0")),   # raise at 0.6.0: still blocked
+         (1, UV_CONFLICT.format(ver="0.6.0")),   # after revert
+         (1, UV_CONFLICT.format(ver="0.5.2")),   # walked to 0.5.2: pin still blocks
+         (0, "")],                                # raise retried at 0.5.2: sticks
+        versions=["0.5.2"])
+    assert len(calls) == 2  # one attempt per graph state, not one ever
+    plan = json.loads(plan_file.read_text())
+    provider = plan["providers"][0]
+    assert provider["target"] == "0.5.2"
+    assert plan["user_pin_bumps"] == [
+        {"pin": "pydantic-ai-slim[openai]", "from": "1.107.0", "to": "2.1.3",
+         "unblocks": {"package": "apache-airflow-providers-common-ai",
+                      "version": "0.5.2"}}]
+    reqs = (tmp_path / "requirements.txt").read_text()
+    assert "pydantic-ai-slim[openai]==2.1.3" in reqs
+    assert "apache-airflow-providers-common-ai==0.5.2" in reqs
+    note = provider["note"]
+    assert "was raised 1.107.0 → 2.1.3" in note
+    assert "was tried" not in note   # the eventual success clears the disclosure
+    assert "to satisfy" not in note  # spec advice would re-advise a made edit
+
+
+def test_disclosure_suppressed_when_attempt_is_on_a_different_pin(tmp_path, monkeypatch):
+    # The note blames the pin that blocked the ORIGINAL target (first
+    # recorded); a failed raise on a DIFFERENT pin from a later graph state
+    # must not be disclosed in the same sentence — it reads as contradictory.
+    plan_file = _project(
+        tmp_path,
+        "apache-airflow-providers-common-ai==0.6.0\n"
+        "pydantic-ai-slim[openai]==1.107.0\n"
+        "httpx==0.9.0\n",
+        _plan(),
+    )
+    calls = _run_with_flag(
+        tmp_path, monkeypatch,
+        [(1, UV_CONFLICT.format(ver="0.6.0")),        # blamed: pydantic pin
+         (1, UV_CONFLICT.format(ver="0.6.0")),        # raise fails
+         (1, UV_CONFLICT.format(ver="0.6.0")),        # after revert
+         (1, UV_CONFLICT_HTTPX.format(ver="0.5.2")),  # at 0.5.2: httpx blocks
+         (1, UV_CONFLICT_HTTPX.format(ver="0.5.2")),  # httpx raise fails
+         (1, UV_CONFLICT_HTTPX.format(ver="0.5.2")),  # after revert
+         (0, "")],                                     # walked to current
+        versions=["0.5.2"])
+    assert calls == [("pydantic-ai-slim", "pydantic-ai-slim[openai]"),
+                     ("httpx", "httpx")]
+    note = json.loads(plan_file.read_text())["providers"][0]["note"]
+    assert note.startswith("left at 0.5.0")
+    assert "pydantic-ai-slim[openai]==1.107.0" in note  # blames the first pin
+    assert "was tried" not in note                      # httpx attempt suppressed
+    assert "to satisfy" in note                         # plain spec advice stands
+    reqs = (tmp_path / "requirements.txt").read_text()
+    assert "httpx==0.9.0" in reqs                       # both pins restored
+    assert "pydantic-ai-slim[openai]==1.107.0" in reqs
+
+
 def test_resolve_pin_choice_reads_uv_lockfile(tmp_path, monkeypatch):
     (tmp_path / "requirements.txt").write_text("pydantic-ai-slim[openai]==1.107.0\n")
 
