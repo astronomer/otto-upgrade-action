@@ -106,6 +106,54 @@ def _rules_alive() -> bool:
             return False
 
 
+# F401's message carries the unused binding's qualified name — including
+# the bare-module form: "`airflow` imported but unused".
+_F401_AIRFLOW = re.compile(r"^`(?P<q>airflow(?:\.[\w.]+)?)` imported but unused")
+
+
+def _f401_report(paths: list[str], project_path: str) -> dict:
+    """Unused airflow.* imports in the tree — REPORT ONLY, never edit.
+
+    F401 proves a binding is unreferenced, NOT that the import is free of
+    side effects — plugins/ modules register functionality by being
+    imported, and removing "unused" imports also sweeps up re-export and
+    capability-probe conventions. Removal is therefore the user's call;
+    this pass only keeps the PR from reading clean while dead deprecated
+    imports (invisible to the usage-site-only AIR rules) ride along.
+
+    Returns {status, items, reason?}: a tooling miss is status=unavailable,
+    never an empty ok — a failed check must not read as a clean one. It
+    still never blocks the sweep."""
+    cmd = [
+        "uvx", f"ruff@{RUFF_VERSION}", "check", *paths,
+        "--select", "F401", "--output-format", "json",
+    ]
+    try:
+        proc = subprocess.run(  # noqa: S603 — fixed argv, no shell
+            cmd, capture_output=True, text=True, timeout=300, check=False)
+    except (subprocess.TimeoutExpired, OSError) as exc:
+        return {"status": "unavailable", "items": [],
+                "reason": f"{type(exc).__name__}: {exc}"}
+    if proc.returncode not in (0, 1):
+        return {"status": "unavailable", "items": [],
+                "reason": f"ruff F401 run failed (rc={proc.returncode}): "
+                          f"{proc.stderr.strip()[:200]}"}
+    try:
+        diags = json.loads(proc.stdout)
+    except json.JSONDecodeError:
+        return {"status": "unavailable", "items": [],
+                "reason": "ruff F401 produced unparseable output"}
+    items = []
+    for d in diags:
+        m = _F401_AIRFLOW.match(d.get("message", ""))
+        if m:
+            row = (d.get("location") or {}).get("row", "?")
+            loc = _relative(d.get("filename", "?"), project_path)
+            items.append({"name": m.group("q"), "location": f"{loc}:{row}"})
+    items.sort(key=lambda i: (i["location"], i["name"]))
+    return {"status": "ok", "items": items}
+
+
 _FROM_IMPORT = re.compile(
     r"^(?P<indent>[ \t]*)from[ \t]+(?P<mod>[\w.]+)[ \t]+import[ \t]+"
     r"(?P<names>[\w][\w \t.,]*)$")
@@ -306,6 +354,8 @@ def _sweep(plan: dict) -> dict:
         fixed=fixed,
         files_changed=files_changed,
         remaining=_group(remaining, project_path),
+        # Post-pass state: report-only in BOTH modes; it never edits.
+        unused_airflow_imports=_f401_report(paths, project_path),
     )
     return summary
 
