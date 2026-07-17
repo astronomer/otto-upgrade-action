@@ -106,6 +106,46 @@ def _rules_alive() -> bool:
             return False
 
 
+# F401's message carries the unused binding's qualified name:
+# "`airflow.decorators.task_group` imported but unused".
+_F401_AIRFLOW = re.compile(r"^`(?P<q>airflow\.[\w.]+)` imported but unused")
+
+
+def _f401_report(paths: list[str], project_path: str) -> list[str]:
+    """Unused airflow.* imports still in the tree — REPORT ONLY.
+
+    Removal is the skill's F401 step (scoped to dags/ and include/; plain
+    --fix); this discloses what remains — plugins/ (excluded there because
+    Airflow plugins register by being imported), noqa'd lines, re-exports,
+    or anything the migration missed. The AIR rules can't see these (they
+    flag usage sites), so without this note the PR reads clean while dead
+    deprecated imports ride along. Best-effort: any tooling miss reports
+    nothing rather than blocking the sweep."""
+    cmd = [
+        "uvx", f"ruff@{RUFF_VERSION}", "check", *paths,
+        "--select", "F401", "--output-format", "json",
+    ]
+    try:
+        proc = subprocess.run(  # noqa: S603 — fixed argv, no shell
+            cmd, capture_output=True, text=True, timeout=300, check=False)
+    except (subprocess.TimeoutExpired, OSError):
+        return []
+    if proc.returncode not in (0, 1):
+        return []
+    try:
+        diags = json.loads(proc.stdout)
+    except json.JSONDecodeError:
+        return []
+    out = []
+    for d in diags:
+        m = _F401_AIRFLOW.match(d.get("message", ""))
+        if m:
+            row = (d.get("location") or {}).get("row", "?")
+            loc = _relative(d.get("filename", "?"), project_path)
+            out.append(f"`{m.group('q')}` — `{loc}:{row}`")
+    return sorted(out)
+
+
 _FROM_IMPORT = re.compile(
     r"^(?P<indent>[ \t]*)from[ \t]+(?P<mod>[\w.]+)[ \t]+import[ \t]+"
     r"(?P<names>[\w][\w \t.,]*)$")
@@ -306,6 +346,8 @@ def _sweep(plan: dict) -> dict:
         fixed=fixed,
         files_changed=files_changed,
         remaining=_group(remaining, project_path),
+        # Post-pass state: report-only in BOTH modes; it never edits.
+        unused_airflow_imports=_f401_report(paths, project_path),
     )
     return summary
 

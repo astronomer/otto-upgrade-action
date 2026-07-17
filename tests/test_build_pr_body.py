@@ -366,3 +366,32 @@ def test_bumped_runtime_note_stays_in_its_row_not_not_changed(tmp_path, monkeypa
     row = next(line for line in out.splitlines() if line.startswith("| Runtime |"))
     assert "doesn't list Python 3.11" in row
     assert "### Not changed" not in out
+
+
+def test_unused_airflow_imports_render_as_left_in_place(tmp_path, monkeypatch):
+    # Found-but-left disclosure: dead airflow imports are invisible to the
+    # AIR rules and deliberately not auto-removed everywhere — the PR must
+    # say so instead of reading clean (field ask, astro-event-demo).
+    dep = {"mode": "fix", "status": "ok", "found": 0, "fixed": 0,
+           "files_changed": [], "remaining": [],
+           "unused_airflow_imports": [
+               "`airflow.decorators.task_group` — `plugins/shim.py:3`"]}
+    dep_f = tmp_path / "deprecations.json"
+    dep_f.write_text(json.dumps(dep))
+    monkeypatch.setenv("DEPRECATION_FILE", str(dep_f))
+    out = _render(tmp_path, monkeypatch, _SEC_PLAN, {"files": []})
+    # The section renders even with zero rewrites and zero AIR debt.
+    assert "### Deprecation sweep" in out
+    assert "Unused `airflow.*` import(s) left in place" in out
+    assert "`airflow.decorators.task_group` — `plugins/shim.py:3`" in out
+
+
+def test_no_unused_imports_means_no_left_in_place_block(tmp_path, monkeypatch):
+    dep = {"mode": "fix", "status": "ok", "found": 1, "fixed": 1,
+           "files_changed": ["dags/a.py"], "remaining": [],
+           "unused_airflow_imports": []}
+    dep_f = tmp_path / "deprecations.json"
+    dep_f.write_text(json.dumps(dep))
+    monkeypatch.setenv("DEPRECATION_FILE", str(dep_f))
+    out = _render(tmp_path, monkeypatch, _SEC_PLAN, {"files": []})
+    assert "left in place" not in out

@@ -32,7 +32,7 @@ REMAINING = [
 
 
 def _run(tmp_path, monkeypatch, mode, ruff_results, plan=None, project="/proj",
-         verify_level="parse", dirty=None):
+         verify_level="parse", dirty=None, f401=None):
     """ruff_results: list of (rc, stdout, stderr) consumed per _ruff call.
     dirty: list of git-dirty-file sets consumed per _dirty_files call
     (default: git unavailable -> Counter-based files_changed fallback)."""
@@ -59,6 +59,7 @@ def _run(tmp_path, monkeypatch, mode, ruff_results, plan=None, project="/proj",
         return next(calls)
 
     monkeypatch.setattr(dc, "_ruff", fake_ruff)
+    monkeypatch.setattr(dc, "_f401_report", lambda _p, _proj: list(f401 or []))
     buf = io.StringIO()
     with contextlib.redirect_stdout(buf):
         assert dc.main() == 0
@@ -309,3 +310,44 @@ class TestImportMerge:
             before="")
         assert changed
         assert out == "from a import x as y, z\r\n"
+
+
+def test_unused_airflow_imports_reported_in_both_modes(tmp_path, monkeypatch):
+    # Report-only: the list rides the summary in advisory AND fix mode; it
+    # never edits, so no demotion logic applies to it.
+    left = ["`airflow.decorators.task_group` — `plugins/shim.py:3`"]
+    for mode, results in (
+            ("advisory", [(1, json.dumps(FOUND), "")]),
+            ("fix", [(1, json.dumps(FOUND), ""), (1, json.dumps(REMAINING), "")])):
+        summary, _ = _run(tmp_path, monkeypatch, mode, results, f401=left)
+        assert summary["status"] == "ok"
+        assert summary["unused_airflow_imports"] == left
+
+
+def test_f401_report_filters_to_airflow_and_formats(monkeypatch):
+    diags = [
+        {"message": "`airflow.decorators.task_group` imported but unused",
+         "filename": "/proj/plugins/shim.py", "location": {"row": 3}},
+        {"message": "`os` imported but unused",
+         "filename": "/proj/dags/a.py", "location": {"row": 1}},
+        {"message": "`pandas.DataFrame` imported but unused",
+         "filename": "/proj/dags/a.py", "location": {"row": 2}},
+    ]
+
+    def fake_run(cmd, **_kw):
+        class P:
+            returncode = 1
+            stdout = json.dumps(diags)
+            stderr = ""
+        return P()
+
+    monkeypatch.setattr(dc.subprocess, "run", fake_run)
+    out = dc._f401_report(["/proj/dags", "/proj/plugins"], "/proj")
+    assert out == ["`airflow.decorators.task_group` — `plugins/shim.py:3`"]
+
+
+def test_f401_report_is_empty_on_tooling_failure(monkeypatch):
+    def boom(*_a, **_k):
+        raise OSError("uvx missing")
+    monkeypatch.setattr(dc.subprocess, "run", boom)
+    assert dc._f401_report(["/proj/dags"], "/proj") == []

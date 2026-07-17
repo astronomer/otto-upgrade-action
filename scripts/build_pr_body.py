@@ -237,6 +237,7 @@ def main() -> int:
     dep = _load("DEPRECATION_FILE")
     if dep:
         fixed, remaining = dep.get("fixed", 0), dep.get("remaining") or []
+        unused_imports = dep.get("unused_airflow_imports") or []
         if dep.get("status") != "ok":
             out += [
                 "### Deprecation sweep",
@@ -245,7 +246,7 @@ def main() -> int:
                 f"{dep.get('reason', 'unknown')}",
                 "",
             ]
-        elif fixed or remaining:
+        elif fixed or remaining or unused_imports:
             out += ["### Deprecation sweep", ""]
             if dep.get("demoted"):
                 out += [f"> {dep['demoted']}.", ""]
@@ -278,6 +279,17 @@ def main() -> int:
                     out.append(
                         f"- **{g.get('rule', 'AIR?')}** ×{g.get('count', '?')}: "
                         f"{g.get('message', '')} — {locs}{more}")
+                out.append("")
+            if unused_imports:
+                # Found-but-left is worth a note; silence reads as clean.
+                # These are invisible to the AIR rules (usage-site only) and
+                # deliberately not auto-removed (plugins/ imports can be
+                # load-bearing via registration side effects).
+                out.append("**Unused `airflow.*` import(s) left in place** "
+                           "(nothing imports them; remove when convenient):")
+                out += [f"- {u}" for u in unused_imports[:10]]
+                if len(unused_imports) > 10:
+                    out.append(f"- …and {len(unused_imports) - 10} more")
                 out.append("")
 
     # Verification — collapsible, with the outcome in the summary line so the
