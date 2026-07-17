@@ -253,7 +253,7 @@ runs:
         (steps.auth.outputs.enabled == 'true' ||
          inputs.verify-level == 'import' || inputs.verify-level == 'parse' ||
          inputs.deprecation-cleanup != 'off')
-      uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39  # v8.2.0
+      uses: astral-sh/setup-uv@11f9893b081a58869d3b5fccaea48c9e9e46f990  # v8.3.2
 
     - name: Reconcile provider bumps with project pins
       id: reconcile
