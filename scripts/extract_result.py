@@ -10,7 +10,7 @@ matching the required keys.
 Expected result shape (scripts/upgrade-schema.json):
   {
     "summary": "...",                 # one-line description of what changed
-    "changes_made": ["..."],          # breaking changes the agent migrated
+    "changes_made": ["..."],          # edits/decisions about the user's code
     "manual_followups": ["..."],      # things a human must finish
     "files_changed": ["..."]          # paths the agent edited
   }

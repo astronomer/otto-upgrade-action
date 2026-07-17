@@ -68,6 +68,24 @@ def test_prompt_declares_headless_and_fences_followups(tmp_path):
     assert "platform or" in context and "control-plane steps" in context
 
 
+def test_context_pins_the_changes_made_reporting_contract(tmp_path):
+    # Field finding (astro-event-demo PR #3): without this, changes_made comes
+    # back padded with process narration — "loaded guidance", "ran the
+    # preflight scanner", inventories of clean-checked patterns — instead of
+    # edits/decisions about the user's code.
+    plan = {"runtime": {"current_airflow": "3.2.2", "target_airflow": "3.3.0",
+                        "current_tag": "3.2-5", "target_tag": "3.3-2", "tier": "minor"},
+            "providers": []}
+    _run(tmp_path, plan)
+    context = (tmp_path / "upgrade-context.md").read_text()
+    assert "changes_made is read by a human" in context
+    assert "information a reviewer can act on" in context
+    # The manual_followups boundary: unconfident holds are follow-ups,
+    # not "decisions".
+    assert "ambiguous or risky cases go in manual_followups" in context
+    assert "say so in one changes_made item" in context
+
+
 def test_raised_user_pins_get_reasoning_instructions(tmp_path):
     plan = {"runtime": {"current_airflow": "3.2.1", "target_airflow": "3.3.0",
                         "current_tag": "3.2-3", "target_tag": "3.3-2", "tier": "minor"},
