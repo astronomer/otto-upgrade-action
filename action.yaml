@@ -319,6 +319,7 @@ runs:
         WORKDIR: /tmp/otto-upgrade
         PLAN_FILE: /tmp/otto-upgrade/plan.json
         PROJECT_PATH: ${{ inputs.project-path }}
+        VERIFY_LEVEL: ${{ inputs.verify-level }}
       run: bash "$GITHUB_ACTION_PATH/scripts/build-prompt.sh"
 
     - name: Run Otto migration

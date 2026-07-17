@@ -48,12 +48,38 @@ else
   focus="Apply only the CODE migrations these provider version bumps require"
 fi
 
+# The verification promise must match the configured gate: syntax only
+# byte-compiles with the runner Python, none runs nothing, and EVERY
+# other value — parse, import, or a typo — goes through verify.sh's
+# target-aware path (its own dispatch special-cases only none/syntax).
+# Claiming "the action verifies" in the first two modes would suppress a
+# follow-up the user genuinely needs, so there the follow-ups fence also
+# stops banning the missing-validation item it asks for and names that
+# validation as a legitimate follow-up category.
+case "${VERIFY_LEVEL:-parse}" in
+  none)
+    verify_msg="The action runs NO post-migration verification in this configuration (verify-level: none). Add ONE manual_followups item telling the user to validate the project against the target image before merging."
+    fence_examples="a missing tool, no Airflow instance"
+    fence_allowed="RBAC, connections, deployment settings, validating the migrated project against the target image"
+    ;;
+  syntax)
+    verify_msg="The action only byte-compiles the code afterwards (verify-level: syntax) — nothing validates it against the target Airflow. Add ONE manual_followups item telling the user to validate the project against the target image before merging."
+    fence_examples="a missing tool, no Airflow instance"
+    fence_allowed="RBAC, connections, deployment settings, validating the migrated project against the target image"
+    ;;
+  *)
+    verify_msg="The action runs its own post-migration verification against the target versions, so do not treat skipped runtime validation as a gap to escalate."
+    fence_examples="a missing tool, no Airflow instance, validation you could not run here"
+    fence_allowed="RBAC, connections, deployment settings"
+    ;;
+esac
+
 {
   echo "# Upgrade context"
   echo
   echo "The version pins in this project have ALREADY been bumped (Dockerfile"
-  echo "Runtime tag and/or requirements.txt provider pins). Do NOT change version"
-  echo "pins again. Your job is the code-level migration only."
+  echo "Runtime tag and/or requirements.txt provider pins). Your job is the"
+  echo "code-level migration only."
   echo
   echo "- Scope: ${scope_line}"
   echo "- Project root: ${PROJECT_PATH}"
@@ -81,28 +107,14 @@ fi
   echo
   echo "This is an unattended CI run. There is NO local or remote Airflow"
   echo "instance: \`af\` commands, \`astro dev restart\`, and any rebuild-and-"
-  echo "validate phase of the skill CANNOT run here — skip them. The action"
-  echo "performs its own post-migration verification (it imports every DAG"
-  echo "against the target Airflow and providers), so do not treat skipped"
-  echo "runtime validation as a gap to escalate."
+  echo "validate phase of the skill CANNOT run here — skip them."
+  echo "$verify_msg"
   echo
   echo "Reserve manual_followups for action items the UPGRADE requires of a"
   echo "human — code changes you could not safely make, and platform or"
-  echo "control-plane steps (RBAC, connections, deployment settings). Do NOT"
-  echo "list limitations of this CI environment (a missing tool, no Airflow"
-  echo "instance, validation you could not run here) as follow-ups."
-  echo
-  echo "changes_made is read by a human reviewing the PR. Every item must be"
-  echo "about THEIR code: an edit you made (file, what, why) or a decision"
-  echo "you took about their code — a specific usage you reviewed and"
-  echo "deliberately left unchanged (only when you are confident no change is"
-  echo "needed; ambiguous or risky cases go in manual_followups), or an edit"
-  echo "you reverted, with the reason. A decision names the specific usage"
-  echo "and where it lives; a list of what you scanned is process, not a"
-  echo "decision. Do not narrate your process — loading guidance, running"
-  echo "scanners or greps, or enumerating the patterns you checked is not"
-  echo "information a reviewer can act on. When the checks found nothing"
-  echo "else to change, say so in one changes_made item."
+  echo "control-plane steps (${fence_allowed}). Do NOT"
+  echo "list limitations of this CI environment (${fence_examples})"
+  echo "as follow-ups."
   echo
   echo "## Resolved plan"
   echo
@@ -124,6 +136,15 @@ fi
   echo "Scan dags/, include/, and plugins/ under the project root. Make the edits"
   echo "directly. Do not guess: if a change is ambiguous or risky, leave the code"
   echo "as-is and record it under manual_followups instead."
+  echo
+  echo "Two actors edit this project: you, and the skill's bundled patcher."
+  echo "The scan scope above bounds only your own proactive edits — the"
+  echo "patcher rewrites the whole project by design. Keep every patcher"
+  echo "edit wherever it lands (tests/, scripts/, ...) and report it in"
+  echo "changes_made. Never revert a bundled-tool edit: if you believe one"
+  echo "is wrong for this project, keep it and flag it under"
+  echo "manual_followups. A test file that imports airflow breaks on the new"
+  echo "version just like a DAG does — reverting the fix ships that breakage."
   if [[ -n "$pin_lines" ]]; then
     echo
     echo "This run also raised user-owned dependency pins — see 'Raised user"
@@ -133,9 +154,10 @@ fi
   fi
   echo
   echo "This is a headless CI run with no Airflow instance — skip any af/rebuild"
-  echo "validation steps (the action verifies separately), and keep environment"
-  echo "limitations OUT of manual_followups: follow-ups are only for code or"
-  echo "platform actions the upgrade itself requires of a human."
+  echo "validation steps (the context file states what verification the caller"
+  echo "runs), and keep environment limitations OUT of manual_followups:"
+  echo "follow-ups are only for code, validation, or platform actions the"
+  echo "upgrade itself requires of a human."
   echo
   echo "Submit your final answer via the submit_final_answer tool using the schema"
   echo "you were given (summary, changes_made, manual_followups, files_changed)."

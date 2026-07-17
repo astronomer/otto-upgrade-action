@@ -9,12 +9,12 @@
     "changes_made": {
       "type": "array",
       "items": { "type": "string" },
-      "description": "For the human reviewing the PR. Each item is either an edit made to their code (file, what, why — e.g. 'dags/etl.py: airflow.operators.python -> airflow.providers.standard.operators.python') or a decision about their code: a specific usage reviewed and deliberately left unchanged (only when confident no change is needed — ambiguous or risky cases belong in manual_followups), or an edit reverted, with the reason. A decision names the specific usage and where it lives; a list of what you scanned is process, not a decision. Never narrate process: no 'loaded guidance', 'ran scanner/greps', no lists of patterns or tools checked. If nothing else needed migration, say so in a single changes_made item."
+      "description": "For the human reviewing the PR. Each item is either an edit made to their code (file, what, why — e.g. 'dags/etl.py: airflow.operators.python -> airflow.providers.standard.operators.python') or a decision about their code: a specific usage reviewed and deliberately left unchanged (only when confident no change is needed — ambiguous or risky cases belong in manual_followups). A decision names the specific usage and where it lives; a list of what you scanned is process, not a decision. Never revert a bundled-tool edit — if you believe one is wrong for this project, keep it and record it under manual_followups. Never narrate process: no 'loaded guidance', 'ran scanner/greps', no lists of patterns or tools checked. If nothing else needed migration, say so in a single changes_made item."
     },
     "manual_followups": {
       "type": "array",
       "items": { "type": "string" },
-      "description": "Changes a human must finish — anything ambiguous or risky left unedited."
+      "description": "Changes a human must finish — anything ambiguous or risky left unedited, and any validation step the run's configuration leaves to the user."
     },
     "files_changed": {
       "type": "array",
