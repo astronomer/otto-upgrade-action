@@ -114,6 +114,57 @@ def test_collection_error_detected_with_cause(tmp_path):
 def test_unrecognized_output_is_infra(tmp_path):
     rc, result, *_ = _run(tmp_path, "docker daemon not running\n")
     assert rc == 2
+    # Nothing to quote: the caller falls back to its own catch-all wording.
+    assert "cli_error" not in result
+
+
+STANDALONE_NO_VENV_RUN = """\
+Checking your DAGs for errors…
+Error: something went wrong while parsing your DAGs: no virtual environment found \
+— run 'astro dev start' first
+"""
+
+STANDALONE_NO_PYTEST_RUN = """\
+Checking your DAGs for errors…
+Error: something went wrong while parsing your DAGs: exec: "pytest": \
+executable file not found in $PATH
+"""
+
+
+def test_cli_refusal_carries_its_own_reason(tmp_path):
+    # A project committing `dev.mode: standalone` sends the CLI to a gitignored
+    # local .venv no CI checkout has. Still no verdict (rc 2), but the reason
+    # must reach the caller — reporting only "produced no recognizable result"
+    # is what made this take a log dig to diagnose in the field.
+    rc, result, *_ = _run(tmp_path, STANDALONE_NO_VENV_RUN)
+    assert rc == 2
+    assert result["cli_error"] == "no virtual environment found — run 'astro dev start' first"
+
+
+def test_cli_refusal_half_provisioned_venv(tmp_path):
+    # The nastier standalone shape: the venv exists (so the CLI's own venv check
+    # passes) but nothing installed pytest into it.
+    rc, result, *_ = _run(tmp_path, STANDALONE_NO_PYTEST_RUN)
+    assert rc == 2
+    assert result["cli_error"] == 'exec: "pytest": executable file not found in $PATH'
+
+
+def test_build_failure_wrapper_is_not_demoted_to_cli_error(tmp_path):
+    # The image-build failure wears the same "something went wrong while parsing
+    # your DAGs" wrapper. It is a real verdict (rc 4) and must not be reclassified
+    # as a missing one just because the wrapper matches.
+    rc, result, *_ = _run(tmp_path, BUILD_FAILURE_RUN)
+    assert rc == 4
+    assert "cli_error" not in result
+
+
+def test_completed_run_never_gains_a_cli_error(tmp_path):
+    # Defensive: a finished run is a verdict. Even if the wrapper somehow appears
+    # alongside a closing summary, the summary wins.
+    text = FAILING_RUN + "Error: something went wrong while parsing your DAGs: noise\n"
+    rc, result, *_ = _run(tmp_path, text)
+    assert rc == 3
+    assert "cli_error" not in result
 
 
 def test_long_run_summary_with_hms_suffix_is_recognized(tmp_path):

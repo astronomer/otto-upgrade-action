@@ -238,7 +238,18 @@ verify_parse_level() {
     return 1
   elif [[ "$target_rc" -eq 2 ]]; then
     local reason="produced no recognizable result"
-    [[ "$target_run_rc" -eq 124 ]] && reason="timed out before completing"
+    local cli_error
+    if [[ "$target_run_rc" -eq 124 ]]; then
+      # A timeout kill leaves no explanation of its own, so keep ours.
+      reason="timed out before completing"
+    else
+      # The CLI usually states exactly why it refused (a project configured for
+      # standalone dev mode, a venv without pytest, …). Its words beat the
+      # catch-all: "produced no recognizable result" is what made a field case
+      # take a full log dig to explain.
+      cli_error=$(jq -r '.cli_error // empty' "$WORKDIR/import-failures.json" 2>/dev/null || true)
+      [[ -n "$cli_error" ]] && reason="failed: ${cli_error}"
+    fi
     fallback_note="ℹ️ Image-level verification could not run (\`astro dev parse\` ${reason}). Results below come from the import-level fallback."
     echo "::warning::verify-level parse: astro dev parse ${reason}; falling back to import-level verification."
     return 1
