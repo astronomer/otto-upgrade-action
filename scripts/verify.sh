@@ -126,6 +126,34 @@ fi
 # bundled providers, and the parse harness match a deployment, so a DAG that
 # parses on Astro parses here.
 
+# The parse invocation, gaining `--docker` from detect_parse_mode; see there.
+# Carrying the subcommand in the array keeps it non-empty, so expanding it can't
+# trip `set -u` on bash 3.2 (a self-hosted macOS runner), where "${arr[@]}" on an
+# empty array is an unbound-variable error rather than nothing.
+parse_cmd=(astro dev parse)
+
+# A project that commits `dev.mode: standalone` to .astro/config.yaml routes
+# `astro dev parse` to a local .venv instead of the image. That venv is
+# gitignored, so on a fresh CI checkout the CLI exits in ~75ms with "no virtual
+# environment found — run 'astro dev start' first" and image-level verification
+# silently never happens (field case: astronomer/circus, which drives standalone
+# locally on purpose). Building the image is the entire point of this level, so
+# state the mode explicitly rather than inheriting the project's local
+# preference. `--docker` is a persistent flag on `astro dev`, added with
+# standalone mode itself; probe for it so an older pinned `astro-cli-version`
+# degrades to the import-level fallback instead of dying on an unknown flag.
+detect_parse_mode() {
+  local help_out
+  # Capture-then-grep, not `grep -q` on a pipe: grep closing the pipe early
+  # kills astro with SIGPIPE (141), which pipefail surfaces as a false negative.
+  help_out="$(astro dev parse --help 2>&1 || true)"
+  if printf '%s\n' "$help_out" | grep -q -- '--docker'; then
+    parse_cmd+=(--docker)
+  else
+    echo "::warning::This Astro CLI has no 'astro dev parse --docker' flag; a project configured for standalone dev mode will fall back to import-level verification."
+  fi
+}
+
 # Strip secrets: the build and the in-image pytest execute repository code.
 # NO_COLOR/PY_COLORS: a runner exporting FORCE_COLOR would make the in-image
 # pytest emit ANSI codes that defeat parse_check's line-anchored patterns —
@@ -134,7 +162,7 @@ run_parse() {
   ( cd "$1" &&
     env -u ASTRO_TOKEN -u ASTRO_API_TOKEN -u GH_TOKEN -u GITHUB_TOKEN \
     NO_COLOR=1 PY_COLORS=0 FORCE_COLOR=0 \
-    timeout 1800 astro dev parse ) > "$2" 2>&1
+    timeout 1800 "${parse_cmd[@]}" ) > "$2" 2>&1
 }
 
 # Known astro-cli template incompatibility: the generated integrity test
@@ -171,6 +199,8 @@ verify_parse_level() {
     echo "::warning::verify-level parse unavailable (${prereq}); falling back to import-level verification."
     return 1
   fi
+
+  detect_parse_mode
 
   tgt_tag=$(jq -r '.runtime.target_tag // empty' "$PLAN_FILE")
 

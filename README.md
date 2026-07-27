@@ -310,6 +310,12 @@ The `verify-level` input controls the post-upgrade check:
   DAG that parses on Astro parses here. Needs Docker; without it the action
   falls back to `import` and says so on the PR. To exempt a known-unparseable
   DAG, list it in `.astro/dag_integrity_exceptions.txt`.
+
+  This runs `astro dev parse --docker` explicitly, so it builds the image even
+  when your project's `.astro/config.yaml` sets `dev.mode: standalone` for local
+  development. Standalone mode parses in a gitignored local `.venv` that no CI
+  checkout has, and it reads nothing from your Dockerfile but the `FROM` tag —
+  neither of which can give an image-level verdict.
 - `import` — import the files Airflow would discover — DAG files under
   `dags/` passing Airflow's safe-mode heuristic (honoring `.airflowignore`)
   plus plugin modules under `plugins/` — inside an ephemeral `uv` env built
