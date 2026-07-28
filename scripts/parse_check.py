@@ -33,6 +33,15 @@ import sys
 from report_fmt import failure
 
 BUILD_MARKER = "an error was encountered while building the image"
+# `astro dev parse` captures the image build and the DAG-integrity run in ONE
+# stream, and the build can contribute pytest output of its own (a Dockerfile
+# `RUN pytest`). Buildkit prefixes those lines ("#12 1.204 ") so they miss the
+# anchored patterns below, but the legacy builder emits RUN stdout verbatim — and
+# a stray "=== 4 passed in 0.21s ===" was enough to read a run that never tested
+# a DAG as a pass. Every pytest-shaped signal is therefore scoped to the LAST
+# session in the log: the image must exist before its container runs, so the
+# integrity session is always the final one.
+_SESSION_START = "test session starts"
 _COLLECTED = re.compile(r"^collected (\d+) items?")
 # pytest's closing summary line — its presence is the evidence the run FINISHED.
 # A timeout kill mid-run leaves "collected N items" with no summary; that must
@@ -44,6 +53,11 @@ _SUMMARY = re.compile(
     r"^=+ .*\b(passed|failed|error|no tests ran)\b.* in [0-9.]+s(?: \([0-9:]+\))?",
     re.MULTILINE,
 )
+# The same summary, but reporting something broken. Used to catch the one shape
+# where a completed run still must not read as a pass: pytest counted failures
+# that no test_file_imports[...] entry accounted for, so we cannot name what
+# broke and have nothing honest to report.
+_SUMMARY_BROKEN = re.compile(r"^=+ .*\b\d+ (?:failed|error)", re.MULTILINE)
 _FAILED_LINE = re.compile(r"^FAILED .*::test_file_imports\[(?P<path>[^\]]+)\]")
 _EXC_HEAD = re.compile(r"^E\s+Exception: (?P<path>\S+) failed to import with message")
 _EXC_CLASS = re.compile(r"^([A-Za-z_][A-Za-z0-9_.]*(?:Error|Exception|Warning))\b")
@@ -61,17 +75,28 @@ _CLI_ERROR = re.compile(
 def parse_output(text: str) -> tuple[int, dict]:
     if BUILD_MARKER in text:
         return 4, {"checked": 0, "failures": []}
-    if "error during collection" in text or "errors during collection" in text:
+
+    idx = text.rfind(_SESSION_START)
+    body = text[idx:] if idx != -1 else text
+
+    if "error during collection" in body or "errors during collection" in body:
         # Surface the terse cause (e.g. "TypeError: DagBag.__init__() got...")
         # from pytest's short summary so the caller can show why.
         cause = ""
-        for line in text.splitlines():
+        for line in body.splitlines():
             if line.startswith("ERROR ") and " - " in line:
                 cause = line.split(" - ", 1)[1].strip()
                 break
         return 5, {"checked": 0, "failures": [], "collection_error": cause}
 
-    lines = text.splitlines()
+    # The CLI wraps every Pytest outcome it cannot read as "tests failed" (exit 1
+    # gets its own "See above for errors detected in your DAGs") in this line: a
+    # missing venv, a venv without pytest, or pytest exiting 5 for "no tests ran".
+    # Its presence means this run produced no verdict, so it outranks any summary
+    # the stream happens to contain.
+    cli_err = _CLI_ERROR.search(text)
+
+    lines = body.splitlines()
     checked = 0
     for line in lines:
         m = _COLLECTED.match(line.strip())
@@ -107,18 +132,24 @@ def parse_output(text: str) -> tuple[int, dict]:
             failures[m.group("path")] = failure(
                 m.group("path"), "", "failed to import (see the CI log for the traceback)")
 
-    # A verdict requires evidence the run COMPLETED, not merely started:
-    # the astro clean marker or pytest's closing summary line. "collected N
-    # items" alone is what a timeout kill leaves behind.
-    completed = _CLEAN in text or _SUMMARY.search(text) is not None
-    if not completed:
+    sorted_failures = sorted(failures.values(), key=lambda f: f["path"])
+    # Real failures are reported even when the run was cut short or the CLI
+    # errored: they are evidence of genuine breakage, and reporting them is
+    # fail-closed where degrading to the fallback would discard them.
+    if failures:
+        return 3, {"checked": checked, "failures": sorted_failures}
+
+    # A pass requires evidence the run COMPLETED, not merely started: the astro
+    # clean marker (which only the CLI prints, and only on success) or the closing
+    # summary of the integrity session. "collected N items" alone is what a
+    # timeout kill leaves behind.
+    completed = _CLEAN in text or _SUMMARY.search(body) is not None
+    if cli_err is not None or not completed or _SUMMARY_BROKEN.search(body):
         result: dict = {"checked": 0, "failures": []}
-        m = _CLI_ERROR.search(text)
-        if m:
-            result["cli_error"] = m.group("cause").strip()
+        if cli_err is not None:
+            result["cli_error"] = cli_err.group("cause").strip()
         return 2, result
-    return (3 if failures else 0), {"checked": checked, "failures": sorted(
-        failures.values(), key=lambda f: f["path"])}
+    return 0, {"checked": checked, "failures": []}
 
 
 def main() -> int:

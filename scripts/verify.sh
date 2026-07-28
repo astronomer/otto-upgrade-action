@@ -227,6 +227,16 @@ verify_parse_level() {
   tail -n 40 "$WORKDIR/parse-target.log"
   echo "::endgroup::"
 
+  # The kill outranks the scrape. A `timeout` can land on a log that still looks
+  # finished — the image build's own pytest output, a session cut off after its
+  # summary — and nothing was fully verified either way, so decide on the signal
+  # we own rather than on what the output resembles.
+  if [[ "$target_run_rc" -eq 124 ]]; then
+    fallback_note="ℹ️ Image-level verification could not run (\`astro dev parse\` timed out before completing). Results below come from the import-level fallback."
+    echo "::warning::verify-level parse: astro dev parse timed out before completing; falling back to import-level verification."
+    return 1
+  fi
+
   # Both "harness produced no verdict" classes degrade to the import-level
   # check rather than reporting nothing: rc 5 = the project's integrity test is
   # incompatible with the target Airflow; rc 2 = the run never completed
@@ -237,19 +247,14 @@ verify_parse_level() {
     echo "::warning::verify-level parse: the project's DAG integrity test is incompatible with the target Airflow; falling back to import-level verification."
     return 1
   elif [[ "$target_rc" -eq 2 ]]; then
+    # The CLI usually states exactly why it refused (a project configured for
+    # standalone dev mode, a venv without pytest, …). Its words beat the
+    # catch-all: "produced no recognizable result" is what made a field case take
+    # a full log dig to explain. Timeouts already returned above.
     local reason="produced no recognizable result"
-    local cli_error
-    if [[ "$target_run_rc" -eq 124 ]]; then
-      # A timeout kill leaves no explanation of its own, so keep ours.
-      reason="timed out before completing"
-    else
-      # The CLI usually states exactly why it refused (a project configured for
-      # standalone dev mode, a venv without pytest, …). Its words beat the
-      # catch-all: "produced no recognizable result" is what made a field case
-      # take a full log dig to explain.
-      cli_error=$(jq -r '.cli_error // empty' "$WORKDIR/import-failures.json" 2>/dev/null || true)
-      [[ -n "$cli_error" ]] && reason="failed: ${cli_error}"
-    fi
+    local cli_error=""
+    cli_error=$(jq -r '.cli_error // empty' "$WORKDIR/import-failures.json" 2>/dev/null || true)
+    if [[ -n "$cli_error" ]]; then reason="failed: ${cli_error}"; fi
     fallback_note="ℹ️ Image-level verification could not run (\`astro dev parse\` ${reason}). Results below come from the import-level fallback."
     echo "::warning::verify-level parse: astro dev parse ${reason}; falling back to import-level verification."
     return 1
