@@ -114,6 +114,147 @@ def test_collection_error_detected_with_cause(tmp_path):
 def test_unrecognized_output_is_infra(tmp_path):
     rc, result, *_ = _run(tmp_path, "docker daemon not running\n")
     assert rc == 2
+    # Nothing to quote: the caller falls back to its own catch-all wording.
+    assert "cli_error" not in result
+
+
+STANDALONE_NO_VENV_RUN = """\
+Checking your DAGs for errors…
+Error: something went wrong while parsing your DAGs: no virtual environment found \
+— run 'astro dev start' first
+"""
+
+STANDALONE_NO_PYTEST_RUN = """\
+Checking your DAGs for errors…
+Error: something went wrong while parsing your DAGs: exec: "pytest": \
+executable file not found in $PATH
+"""
+
+
+def test_cli_refusal_carries_its_own_reason(tmp_path):
+    # A project committing `dev.mode: standalone` sends the CLI to a gitignored
+    # local .venv no CI checkout has. Still no verdict (rc 2), but the reason
+    # must reach the caller — reporting only "produced no recognizable result"
+    # is what made this take a log dig to diagnose in the field.
+    rc, result, *_ = _run(tmp_path, STANDALONE_NO_VENV_RUN)
+    assert rc == 2
+    assert result["cli_error"] == "no virtual environment found — run 'astro dev start' first"
+
+
+def test_cli_refusal_half_provisioned_venv(tmp_path):
+    # The nastier standalone shape: the venv exists (so the CLI's own venv check
+    # passes) but nothing installed pytest into it.
+    rc, result, *_ = _run(tmp_path, STANDALONE_NO_PYTEST_RUN)
+    assert rc == 2
+    assert result["cli_error"] == 'exec: "pytest": executable file not found in $PATH'
+
+
+def test_build_failure_wrapper_is_not_demoted_to_cli_error(tmp_path):
+    # The image-build failure wears the same "something went wrong while parsing
+    # your DAGs" wrapper. It is a real verdict (rc 4) and must not be reclassified
+    # as a missing one just because the wrapper matches.
+    rc, result, *_ = _run(tmp_path, BUILD_FAILURE_RUN)
+    assert rc == 4
+    assert "cli_error" not in result
+
+
+def test_failing_run_with_wrapper_still_reports_the_failures(tmp_path):
+    # A wrapper alongside real failures means the run was cut short after finding
+    # them (pytest exit 1 gets its own message, not the wrapper). Reporting the
+    # failures is fail-closed; degrading to the fallback would discard them.
+    text = FAILING_RUN + "Error: something went wrong while parsing your DAGs: noise\n"
+    rc, result, *_ = _run(tmp_path, text)
+    assert rc == 3
+    assert result["failures"][0]["path"] == "dags/format_probe.py"
+    assert "cli_error" not in result
+
+
+# A Dockerfile `RUN pytest` lands in the same captured stream as the integrity
+# run. Buildkit prefixes those lines ("#12 1.204 ") so they miss the anchored
+# patterns, but the legacy builder emits RUN stdout verbatim — and an unprefixed
+# summary was enough to manufacture a pass. Found by adversarial review.
+BUILD_PYTEST_NOISE = """\
+Checking your DAGs for errors…
+Step 6/7 : RUN pytest tests/unit -q
+ ---> Running in a1b2c3
+collected 4 items
+=========================== 4 passed in 0.21s ===========================
+ ---> d4e5f6
+Successfully built d4e5f6
+"""
+
+
+def test_build_pytest_summary_cannot_pass_a_refused_parse(tmp_path):
+    # The worst shape: the build's summary satisfies "completed" while the CLI is
+    # saying it never ran the parse at all.
+    text = BUILD_PYTEST_NOISE + (
+        "Error: something went wrong while parsing your DAGs: no virtual "
+        "environment found — run 'astro dev start' first\n"
+    )
+    rc, result, *_ = _run(tmp_path, text)
+    assert rc == 2, "a build's pytest summary must not stand in for the integrity run"
+    assert result["checked"] == 0, "the build's collected count must not be reported"
+    assert "virtual environment" in result["cli_error"]
+
+
+def test_build_pytest_summary_cannot_pass_a_truncated_integrity_run(tmp_path):
+    truncated = (
+        "============================= test session starts ==============================\n"
+        "collected 37 items\n\n"
+        ".astro/test_dag_integrity_default.py ......\n"
+    )
+    rc, result, *_ = _run(tmp_path, BUILD_PYTEST_NOISE + truncated)
+    assert rc == 2
+    assert result["checked"] == 0
+
+
+def test_no_tests_ran_is_not_a_pass(tmp_path):
+    # pytest exits 5 when it collects nothing, which the CLI wraps. Reporting
+    # "all 0 DAG file(s) import cleanly" over an untested project is the exact
+    # false green this level exists to prevent.
+    text = (
+        "Checking your DAGs for errors…\n"
+        "============================= test session starts ==============================\n"
+        "collected 0 items\n\n"
+        "==================== no tests ran in 0.12s ====================\n"
+        "Error: something went wrong while parsing your DAGs: "
+        "something went wrong while Pytesting your DAGs\n"
+    )
+    rc, result, *_ = _run(tmp_path, text)
+    assert rc == 2
+    assert "Pytesting" in result["cli_error"]
+
+
+def test_build_noise_does_not_hide_a_real_collection_error(tmp_path):
+    # The integrity session's own collection error must still win rc 5 even with a
+    # clean build-stage pytest run ahead of it in the stream.
+    rc, result, *_ = _run(tmp_path, BUILD_PYTEST_NOISE + COLLECTION_ERROR_RUN)
+    assert rc == 5
+    assert "DagBag.__init__()" in result["collection_error"]
+
+
+def test_counted_failures_we_cannot_name_are_not_a_pass(tmp_path):
+    # pytest counted a failure that no test_file_imports[...] entry accounts for
+    # (an unexpected harness shape). We can't name what broke, so the only honest
+    # answers are "no verdict" or a fabricated one — take the former.
+    text = (
+        "Checking your DAGs for errors…\n"
+        "============================= test session starts ==============================\n"
+        "collected 1 item\n\n"
+        "tests/test_something_else.py F                                           [100%]\n"
+        "=========================== 1 failed in 1.93s ===========================\n"
+    )
+    rc, result, *_ = _run(tmp_path, text)
+    assert rc == 2
+    assert result["checked"] == 0
+
+
+def test_build_noise_does_not_inflate_a_real_pass(tmp_path):
+    # The complement: with a genuine integrity run after the build noise, the
+    # count must come from the integrity session (21), not the build's (4).
+    rc, result, *_ = _run(tmp_path, BUILD_PYTEST_NOISE + CLEAN_RUN)
+    assert rc == 0
+    assert result["checked"] == 21
 
 
 def test_long_run_summary_with_hms_suffix_is_recognized(tmp_path):

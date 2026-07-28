@@ -126,6 +126,34 @@ fi
 # bundled providers, and the parse harness match a deployment, so a DAG that
 # parses on Astro parses here.
 
+# The parse invocation, gaining `--docker` from detect_parse_mode; see there.
+# Carrying the subcommand in the array keeps it non-empty, so expanding it can't
+# trip `set -u` on bash 3.2 (a self-hosted macOS runner), where "${arr[@]}" on an
+# empty array is an unbound-variable error rather than nothing.
+parse_cmd=(astro dev parse)
+
+# A project that commits `dev.mode: standalone` to .astro/config.yaml routes
+# `astro dev parse` to a local .venv instead of the image. That venv is
+# gitignored, so on a fresh CI checkout the CLI exits in ~75ms with "no virtual
+# environment found — run 'astro dev start' first" and image-level verification
+# silently never happens (field case: astronomer/circus, which drives standalone
+# locally on purpose). Building the image is the entire point of this level, so
+# state the mode explicitly rather than inheriting the project's local
+# preference. `--docker` is a persistent flag on `astro dev`, added with
+# standalone mode itself; probe for it so an older pinned `astro-cli-version`
+# degrades to the import-level fallback instead of dying on an unknown flag.
+detect_parse_mode() {
+  local help_out
+  # Capture-then-grep, not `grep -q` on a pipe: grep closing the pipe early
+  # kills astro with SIGPIPE (141), which pipefail surfaces as a false negative.
+  help_out="$(astro dev parse --help 2>&1 || true)"
+  if printf '%s\n' "$help_out" | grep -q -- '--docker'; then
+    parse_cmd+=(--docker)
+  else
+    echo "::warning::This Astro CLI has no 'astro dev parse --docker' flag; a project configured for standalone dev mode will fall back to import-level verification."
+  fi
+}
+
 # Strip secrets: the build and the in-image pytest execute repository code.
 # NO_COLOR/PY_COLORS: a runner exporting FORCE_COLOR would make the in-image
 # pytest emit ANSI codes that defeat parse_check's line-anchored patterns —
@@ -134,7 +162,7 @@ run_parse() {
   ( cd "$1" &&
     env -u ASTRO_TOKEN -u ASTRO_API_TOKEN -u GH_TOKEN -u GITHUB_TOKEN \
     NO_COLOR=1 PY_COLORS=0 FORCE_COLOR=0 \
-    timeout 1800 astro dev parse ) > "$2" 2>&1
+    timeout 1800 "${parse_cmd[@]}" ) > "$2" 2>&1
 }
 
 # Known astro-cli template incompatibility: the generated integrity test
@@ -172,6 +200,8 @@ verify_parse_level() {
     return 1
   fi
 
+  detect_parse_mode
+
   tgt_tag=$(jq -r '.runtime.target_tag // empty' "$PLAN_FILE")
 
   # Parse runs on a COPY: the build and any astro-generated files must never
@@ -197,6 +227,16 @@ verify_parse_level() {
   tail -n 40 "$WORKDIR/parse-target.log"
   echo "::endgroup::"
 
+  # The kill outranks the scrape. A `timeout` can land on a log that still looks
+  # finished — the image build's own pytest output, a session cut off after its
+  # summary — and nothing was fully verified either way, so decide on the signal
+  # we own rather than on what the output resembles.
+  if [[ "$target_run_rc" -eq 124 ]]; then
+    fallback_note="ℹ️ Image-level verification could not run (\`astro dev parse\` timed out before completing). Results below come from the import-level fallback."
+    echo "::warning::verify-level parse: astro dev parse timed out before completing; falling back to import-level verification."
+    return 1
+  fi
+
   # Both "harness produced no verdict" classes degrade to the import-level
   # check rather than reporting nothing: rc 5 = the project's integrity test is
   # incompatible with the target Airflow; rc 2 = the run never completed
@@ -207,8 +247,14 @@ verify_parse_level() {
     echo "::warning::verify-level parse: the project's DAG integrity test is incompatible with the target Airflow; falling back to import-level verification."
     return 1
   elif [[ "$target_rc" -eq 2 ]]; then
+    # The CLI usually states exactly why it refused (a project configured for
+    # standalone dev mode, a venv without pytest, …). Its words beat the
+    # catch-all: "produced no recognizable result" is what made a field case take
+    # a full log dig to explain. Timeouts already returned above.
     local reason="produced no recognizable result"
-    [[ "$target_run_rc" -eq 124 ]] && reason="timed out before completing"
+    local cli_error=""
+    cli_error=$(jq -r '.cli_error // empty' "$WORKDIR/import-failures.json" 2>/dev/null || true)
+    if [[ -n "$cli_error" ]]; then reason="failed: ${cli_error}"; fi
     fallback_note="ℹ️ Image-level verification could not run (\`astro dev parse\` ${reason}). Results below come from the import-level fallback."
     echo "::warning::verify-level parse: astro dev parse ${reason}; falling back to import-level verification."
     return 1
