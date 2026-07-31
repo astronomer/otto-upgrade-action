@@ -17,6 +17,8 @@ ignore = ["S101"]  # asserts are fine in tests
 
 [tool.ruff.lint.per-file-ignores]
 "tests/*" = ["S"]
+# Verbatim astro CLI help lines (the flag-probe fixtures) exceed the limit.
+"tests/test_verify_build_secrets.py" = ["E501"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

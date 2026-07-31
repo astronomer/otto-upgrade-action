@@ -168,7 +168,8 @@ detect_parse_mode() {
   # silently wrong for several. The trailing space in the first probe keeps it
   # from matching the plural form.
   if [[ -n "${BUILD_SECRETS:-}" ]]; then
-    local secret_flag="" line n=0
+    local secret_flag="" line n=0 proj_abs field rebuilt src
+    local -a fields
     if printf '%s\n' "$help_out" | grep -q -- '--build-secret '; then
       secret_flag="--build-secret"
     elif printf '%s\n' "$help_out" | grep -q -- '--build-secrets'; then
@@ -177,11 +178,35 @@ detect_parse_mode() {
     if [[ -z "$secret_flag" ]]; then
       echo "::warning::This Astro CLI has no build-secret flag; the image builds run WITHOUT the provided build-secrets and may fail."
     else
+      proj_abs=$(cd "$PROJECT_PATH" && pwd)
       while IFS= read -r line; do
         # Trim like the CLI's own env fallback does; skip blank lines.
         line="${line#"${line%%[![:space:]]*}"}"
         line="${line%"${line##*[![:space:]]}"}"
         [[ -z "$line" ]] && continue
+        # Resolve relative src= paths against the project root NOW. The two
+        # builds run from different directories — the target from an rsync
+        # copy (which has gitignored files), the baseline from a clean git
+        # worktree (which doesn't) — so a cwd-relative gitignored secret file
+        # would build one side and not the other, and that asymmetry could
+        # demote a genuine target-only regression to 'skipped'. Pinning the
+        # path makes both builds read the identical file.
+        IFS=',' read -r -a fields <<< "$line"
+        rebuilt=""
+        for field in "${fields[@]}"; do
+          case "$field" in
+            src=/*|source=/*) ;;
+            src=*|source=*) field="${field%%=*}=${proj_abs}/${field#*=}" ;;
+          esac
+          case "$field" in
+            src=*|source=*)
+              src="${field#*=}"
+              [[ -e "$src" ]] || echo "::warning::build secret file '$src' does not exist; the image builds will likely fail."
+              ;;
+          esac
+          rebuilt+="${field},"
+        done
+        line="${rebuilt%,}"
         parse_cmd+=("$secret_flag" "$line")
         n=$((n + 1))
       done <<< "$BUILD_SECRETS"

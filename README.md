@@ -381,6 +381,10 @@ name reaches `astro deploy`:
 - Multiple secrets (one spec per line) need Astro CLI >= 1.44 (`--build-secret`);
   older CLIs fold them into one malformed spec. A single secret works on any
   CLI version that has the flag.
+- Prefer env-backed specs (`env=`). File-backed specs (`src=`) work too;
+  a relative path is resolved against the project root before the builds run,
+  because the target and baseline images build from different copies of your
+  project — an unpinned relative path could reach one build and not the other.
 
 ## The rolling PR
 
