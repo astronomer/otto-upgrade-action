@@ -19,6 +19,10 @@
 #   WORKDIR       scratch dir (default /tmp/otto-upgrade)
 #   ACTION_PATH   path to this action's checkout
 #
+# Optional env:
+#   BUILD_SECRETS docker build --secret spec(s) for the parse-level image
+#                 builds, one per line (e.g. id=netrc,env=NETRC_CONTENT)
+#
 # Writes $WORKDIR/{verify-report.md,verify-status.txt} and a `status` step output.
 
 set -euo pipefail
@@ -152,9 +156,46 @@ detect_parse_mode() {
   else
     echo "::warning::This Astro CLI has no 'astro dev parse --docker' flag; a project configured for standalone dev mode will fall back to import-level verification."
   fi
+
+  # Forward the user's docker build secrets so a Dockerfile that needs
+  # credentials to build — e.g. `RUN --mount=type=secret,id=netrc` pip-installing
+  # from a private repo — builds here the way it does in their own CI. Both
+  # image builds (target and baseline) share parse_cmd, so both get them.
+  # Flag probe: `--build-secret` (CLI >= 1.44) takes one complete spec per
+  # occurrence; its predecessor `--build-secrets` (hidden as a deprecated alias
+  # on newer CLIs) comma-split each value and rejoined ALL values into a single
+  # `docker build --secret` spec — an identity transform for exactly one secret,
+  # silently wrong for several. The trailing space in the first probe keeps it
+  # from matching the plural form.
+  if [[ -n "${BUILD_SECRETS:-}" ]]; then
+    local secret_flag="" line n=0
+    if printf '%s\n' "$help_out" | grep -q -- '--build-secret '; then
+      secret_flag="--build-secret"
+    elif printf '%s\n' "$help_out" | grep -q -- '--build-secrets'; then
+      secret_flag="--build-secrets"
+    fi
+    if [[ -z "$secret_flag" ]]; then
+      echo "::warning::This Astro CLI has no build-secret flag; the image builds run WITHOUT the provided build-secrets and may fail."
+    else
+      while IFS= read -r line; do
+        # Trim like the CLI's own env fallback does; skip blank lines.
+        line="${line#"${line%%[![:space:]]*}"}"
+        line="${line%"${line##*[![:space:]]}"}"
+        [[ -z "$line" ]] && continue
+        parse_cmd+=("$secret_flag" "$line")
+        n=$((n + 1))
+      done <<< "$BUILD_SECRETS"
+      if [[ "$secret_flag" == "--build-secrets" && "$n" -gt 1 ]]; then
+        echo "::warning::This Astro CLI predates '--build-secret' (>= 1.44) and folds multiple build secrets into one malformed spec; only a single secret works reliably here. Pin astro-cli-version to 1.44+ or provide one secret."
+      fi
+    fi
+  fi
 }
 
 # Strip secrets: the build and the in-image pytest execute repository code.
+# Env vars named by BUILD_SECRETS specs intentionally pass through — supplying
+# them is the user's explicit opt-in to expose those to their own Dockerfile
+# (which is why the docs forbid reusing the four names stripped here).
 # NO_COLOR/PY_COLORS: a runner exporting FORCE_COLOR would make the in-image
 # pytest emit ANSI codes that defeat parse_check's line-anchored patterns —
 # the one path where scraping could mis-read a completed run.

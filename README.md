@@ -342,6 +342,46 @@ and an un-run verification never reads as success. Everything that executes
 repository code runs with the Astro and GitHub tokens stripped from its
 environment.
 
+### Private dependencies (build secrets)
+
+If your Dockerfile needs credentials to build — say it pip-installs a package
+from a private git repo behind `RUN --mount=type=secret,id=netrc` — the
+`parse`-level image build fails without them. The failure is classified
+honestly (your current image doesn't build in the action's environment either,
+so verification reports **skipped** rather than blaming the upgrade), but
+nothing gets verified, on every run. Forward the same build secrets your other
+CI jobs use via `build-secrets`; it reaches `astro dev parse` the way the
+[deploy-action](https://github.com/astronomer/deploy-action) input of the same
+name reaches `astro deploy`:
+
+```yaml
+- name: Mint a read token for the private dependency
+  id: octo-sts
+  uses: octo-sts/action@<sha>  # or however your CI obtains the credential
+  with:
+    scope: your-org
+    identity: your-repo-reader
+- uses: astronomer/otto-upgrade-action@v0
+  env:
+    NETRC_CONTENT: "machine github.com login oauth2 password ${{ steps.octo-sts.outputs.token }}"
+  with:
+    build-secrets: id=netrc,env=NETRC_CONTENT
+    # ...
+```
+
+- Applies to the `parse`-level builds only (target and baseline). The `import`
+  level installs from PyPI per your `requirements.txt` and never reads the
+  Dockerfile, so it needs no build credentials.
+- Set the env var the spec names on the action's **step** (`env:`), and don't
+  name it `ASTRO_TOKEN`, `ASTRO_API_TOKEN`, `GH_TOKEN`, or `GITHUB_TOKEN` — the
+  action strips those four before running anything that executes repository
+  code. Supplying `build-secrets` deliberately exposes the named env var to
+  your own Dockerfile's build; BuildKit mounts it for the `RUN` step only and
+  never writes it into image layers.
+- Multiple secrets (one spec per line) need Astro CLI >= 1.44 (`--build-secret`);
+  older CLIs fold them into one malformed spec. A single secret works on any
+  CLI version that has the flag.
+
 ## The rolling PR
 
 The action maintains **one** branch (`otto/airflow-upgrade` by default). Re-runs
@@ -363,6 +403,7 @@ don't race the branch.
 | `max-upgrade-scope` | `minor` | `patch`, `minor`, or `major`. Airflow majors stay advisory-only regardless. |
 | `include-providers` | `true` | Also bump pinned providers. Unpinned are reported, never changed. |
 | `verify-level` | `parse` | `parse` (build + test in the target Runtime image; falls back to `import` without Docker), `import`, `syntax`, or `none`. |
+| `build-secrets` | _(none)_ | `docker build --secret` spec(s) for the `parse`-level image builds, e.g. `id=netrc,env=NETRC_CONTENT` (one per line for multiple). For Dockerfiles that need credentials to build — see [Private dependencies](#private-dependencies-build-secrets). |
 | `bump-blocking-pins` | `false` | When a provider bump conflicts with one of your own pins, raise your pin to the newest version uv can co-resolve instead of holding the provider back. Off by default (it edits user-owned dependencies); every raise appears in the PR's version table and is gated by verification. |
 | `deprecation-cleanup` | `fix` | Sweep deprecated Airflow usage (ruff AIR3 rules, `dags/`+`plugins/`+`include/` only) beyond the hop's own migrations: `fix` rewrites what ruff can (e.g. operators moved to providers) and lists the rest as debt in the PR; `advisory` only lists; `off` skips. `fix` auto-demotes to advisory when the target Airflow isn't 3.x or when `verify-level` is below `import` — rewrites are only applied when verification gates them. Your ruff excludes, per-file-ignores, and `noqa` comments are honored. |
 | `base-branch` | _(repo default branch)_ | PR base. |
@@ -410,7 +451,9 @@ don't race the branch.
 - `verify-level: parse` and `import` run your repository's DAG code (building
   the image and importing the DAGs), with secrets stripped from those
   subprocesses; for repos with untrusted DAG authors, prefer
-  `verify-level: syntax`.
+  `verify-level: syntax`. The one exception is deliberate: env vars you name
+  in `build-secrets` pass through to the image build, because exposing them to
+  your Dockerfile is that input's entire purpose.
 - Run on a schedule / `workflow_dispatch` against your own default branch, never
   on `pull_request_target` from forks. The resolve step is intentionally
   unauthenticated so it works in CI / `act` without secrets.
