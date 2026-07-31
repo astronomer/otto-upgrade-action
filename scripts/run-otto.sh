@@ -9,6 +9,8 @@
 #   ACTION_PATH      - path to this action's checkout
 #   WORKDIR          - scratch dir holding the prompt (default /tmp/otto-upgrade)
 #   INPUT_MODEL      - optional --model override (empty = Otto default)
+#   BUILD_SECRETS    - optional; the action's build-secrets input, used only to
+#                      strip the env vars its specs name from Otto's process
 #
 # Writes $WORKDIR/{otto-stdout.jsonl,result.json}.
 
@@ -49,9 +51,20 @@ if [[ ! -s "$prompt_file" ]]; then
 fi
 prompt="$(cat "$prompt_file")"
 
+# Otto executes repository code with tools; the env vars named by the user's
+# build-secrets specs are for the verify step's image build only, so strip
+# them here the way verify.sh strips them from the import-level checks.
+# Seeded with BUILD_SECRETS itself so the array is never empty (bash 3.2's
+# set -u treats expanding an empty array as an unbound variable).
+secret_env_unsets=("-u" "BUILD_SECRETS")
+while IFS= read -r name; do
+  [[ -n "$name" ]] && secret_env_unsets+=("-u" "$name")
+done < <(python3 "$ACTION_PATH/scripts/build_secret_env_names.py")
+
 echo "::group::Otto run"
 set +e
-"$ASTRO_CLI_PATH" "${otto_args[@]}" "$prompt" \
+env "${secret_env_unsets[@]}" \
+  "$ASTRO_CLI_PATH" "${otto_args[@]}" "$prompt" \
   > "$WORKDIR/otto-stdout.jsonl" \
   2> "$WORKDIR/otto-stderr.log"
 otto_exit=$?

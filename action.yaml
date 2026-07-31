@@ -42,6 +42,10 @@ inputs:
     required: false
     default: "parse"
     description: "Post-upgrade verification: 'parse' (default — build the project's Docker image at the target Runtime and run Astro's DAG integrity tests inside it; catches image-build failures and verifies DAGs in the production-faithful environment; needs Docker, falls back to 'import' without it), 'import' (import the discovered DAG + plugin files in a PyPI-built env), 'syntax' (byte-compile only), or 'none'. Verification fails only on a NEW failure the upgrade introduces — failures that already occur at your current versions are reported but don't fail the run; env/setup problems report 'skipped'."
+  build-secrets:
+    required: false
+    default: ""
+    description: "Docker build secrets for the verify-level 'parse' image builds, in `docker build --secret` format (e.g. 'id=netrc,env=NETRC_CONTENT'; one spec per line for multiple — multiple need Astro CLI >= 1.44). Use when your Dockerfile needs credentials to build, e.g. a `RUN --mount=type=secret,id=netrc` pip install from a private repo — the same value the deploy-action's input of this name forwards to 'astro deploy'. Set the env var the spec names on this action's step; it must not be ASTRO_TOKEN, ASTRO_API_TOKEN, GH_TOKEN, or GITHUB_TOKEN (stripped before repo code runs). Relative src= paths are resolved against the project root so the target and baseline builds read the identical file. This deliberately exposes the secret to your Dockerfile's build (BuildKit never writes secret mounts into image layers); the env vars the specs name are stripped from the Otto migration and the import-level verifier, which execute repository code outside an image build."
   bump-blocking-pins:
     required: false
     default: "false"
@@ -336,6 +340,7 @@ runs:
         ACTION_PATH: ${{ github.action_path }}
         WORKDIR: /tmp/otto-upgrade
         INPUT_MODEL: ${{ inputs.model }}
+        BUILD_SECRETS: ${{ inputs.build-secrets }}
       run: bash "$GITHUB_ACTION_PATH/scripts/run-otto.sh"
 
     - name: Deprecation cleanup
@@ -368,6 +373,7 @@ runs:
         PROJECT_PATH: ${{ inputs.project-path }}
         PLAN_FILE: /tmp/otto-upgrade/plan.json
         VERIFY_LEVEL: ${{ inputs.verify-level }}
+        BUILD_SECRETS: ${{ inputs.build-secrets }}
         WORKDIR: /tmp/otto-upgrade
         ACTION_PATH: ${{ github.action_path }}
       run: bash "$GITHUB_ACTION_PATH/scripts/verify.sh"

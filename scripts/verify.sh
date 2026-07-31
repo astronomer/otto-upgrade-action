@@ -19,6 +19,10 @@
 #   WORKDIR       scratch dir (default /tmp/otto-upgrade)
 #   ACTION_PATH   path to this action's checkout
 #
+# Optional env:
+#   BUILD_SECRETS docker build --secret spec(s) for the parse-level image
+#                 builds, one per line (e.g. id=netrc,env=NETRC_CONTENT)
+#
 # Writes $WORKDIR/{verify-report.md,verify-status.txt} and a `status` step output.
 
 set -euo pipefail
@@ -33,6 +37,17 @@ mkdir -p "$WORKDIR"
 # Keep byte-compilation artifacts out of the project tree so open-pr.sh's
 # `git add -A` can't sweep __pycache__/*.pyc into the upgrade PR.
 export PYTHONPYCACHEPREFIX="$WORKDIR/pycache"
+
+# `env -u` args stripping the env vars named by BUILD_SECRETS specs from the
+# import-level checks: those execute repository DAG code directly (no image
+# in between), and the build-secrets contract is Dockerfile-build exposure
+# only. The parse-level build (run_parse) keeps them — it's the consumer.
+# Seeded with BUILD_SECRETS itself so the array is never empty (bash 3.2's
+# set -u treats expanding an empty array as an unbound variable).
+secret_env_unsets=("-u" "BUILD_SECRETS")
+while IFS= read -r name; do
+  [[ -n "$name" ]] && secret_env_unsets+=("-u" "$name")
+done < <(python3 "$ACTION_PATH/scripts/build_secret_env_names.py")
 
 report="$WORKDIR/verify-report.md"
 status="skipped"
@@ -152,9 +167,77 @@ detect_parse_mode() {
   else
     echo "::warning::This Astro CLI has no 'astro dev parse --docker' flag; a project configured for standalone dev mode will fall back to import-level verification."
   fi
+
+  # Forward the user's docker build secrets so a Dockerfile that needs
+  # credentials to build — e.g. `RUN --mount=type=secret,id=netrc` pip-installing
+  # from a private repo — builds here the way it does in their own CI. Both
+  # image builds (target and baseline) share parse_cmd, so both get them.
+  # Flag probe: `--build-secret` (CLI >= 1.44) takes one complete spec per
+  # occurrence; its predecessor `--build-secrets` (hidden as a deprecated alias
+  # on newer CLIs) comma-split each value and rejoined ALL values into a single
+  # `docker build --secret` spec — an identity transform for exactly one secret,
+  # silently wrong for several. The trailing space in the first probe keeps it
+  # from matching the plural form.
+  if [[ -n "${BUILD_SECRETS:-}" ]]; then
+    local secret_flag="" line n=0 proj_abs field rebuilt src
+    local -a fields
+    if printf '%s\n' "$help_out" | grep -q -- '--build-secret '; then
+      secret_flag="--build-secret"
+    elif printf '%s\n' "$help_out" | grep -q -- '--build-secrets'; then
+      secret_flag="--build-secrets"
+    fi
+    if [[ -z "$secret_flag" ]]; then
+      echo "::warning::This Astro CLI has no build-secret flag; the image builds run WITHOUT the provided build-secrets and may fail."
+    else
+      proj_abs=$(cd "$PROJECT_PATH" && pwd)
+      while IFS= read -r line; do
+        # Trim like the CLI's own env fallback does; skip blank lines.
+        line="${line#"${line%%[![:space:]]*}"}"
+        line="${line%"${line##*[![:space:]]}"}"
+        [[ -z "$line" ]] && continue
+        # Resolve relative src= paths against the project root NOW. The two
+        # builds run from different directories — the target from an rsync
+        # copy (which has gitignored files), the baseline from a clean git
+        # worktree (which doesn't) — so a cwd-relative gitignored secret file
+        # would build one side and not the other, and that asymmetry could
+        # demote a genuine target-only regression to 'skipped'. Pinning the
+        # path makes both builds read the identical file. A `type=env` spec's
+        # src names an env var, not a file — leave those verbatim.
+        case ",$line," in
+          *,type=env,*) ;;
+          *)
+            IFS=',' read -r -a fields <<< "$line"
+            rebuilt=""
+            for field in "${fields[@]}"; do
+              case "$field" in
+                src=/*|source=/*) ;;
+                src=*|source=*) field="${field%%=*}=${proj_abs}/${field#*=}" ;;
+              esac
+              case "$field" in
+                src=*|source=*)
+                  src="${field#*=}"
+                  [[ -e "$src" ]] || echo "::warning::build secret file '$src' does not exist; the image builds will likely fail."
+                  ;;
+              esac
+              rebuilt+="${field},"
+            done
+            line="${rebuilt%,}"
+            ;;
+        esac
+        parse_cmd+=("$secret_flag" "$line")
+        n=$((n + 1))
+      done <<< "$BUILD_SECRETS"
+      if [[ "$secret_flag" == "--build-secrets" && "$n" -gt 1 ]]; then
+        echo "::warning::This Astro CLI predates '--build-secret' (>= 1.44) and folds multiple build secrets into one malformed spec; only a single secret works reliably here. Pin astro-cli-version to 1.44+ or provide one secret."
+      fi
+    fi
+  fi
 }
 
 # Strip secrets: the build and the in-image pytest execute repository code.
+# Env vars named by BUILD_SECRETS specs intentionally pass through — supplying
+# them is the user's explicit opt-in to expose those to their own Dockerfile
+# (which is why the docs forbid reusing the four names stripped here).
 # NO_COLOR/PY_COLORS: a runner exporting FORCE_COLOR would make the in-image
 # pytest emit ANSI codes that defeat parse_check's line-anchored patterns —
 # the one path where scraping could mis-read a completed run.
@@ -434,6 +517,7 @@ import_report="$WORKDIR/import-report.md"
 run_import() {
   IMPORT_REPORT="$import_report" IMPORT_JSON="$WORKDIR/import-failures.json" \
     env -u ASTRO_TOKEN -u ASTRO_API_TOKEN -u GH_TOKEN -u GITHUB_TOKEN \
+    "${secret_env_unsets[@]}" \
     timeout 600 uv run --no-project "$@" "${with_args[@]}" -- \
     python3 "$ACTION_PATH/scripts/import_check.py" "${import_args[@]}"
 }
@@ -499,6 +583,7 @@ elif [[ "$rc" -eq 3 ]]; then
     run_baseline_import() {
       IMPORT_JSON="$WORKDIR/baseline-failures.json" IMPORT_REPORT="" \
         env -u ASTRO_TOKEN -u ASTRO_API_TOKEN -u GH_TOKEN -u GITHUB_TOKEN \
+        "${secret_env_unsets[@]}" \
         timeout 600 uv run --no-project "$@" "${bwith[@]}" -- \
         python3 "$ACTION_PATH/scripts/import_check.py" "${bargs[@]}" \
         >/dev/null 2>>"$WORKDIR/baseline-setup.err"
