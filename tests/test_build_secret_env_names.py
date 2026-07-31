@@ -10,6 +10,8 @@ from build_secret_env_names import env_names
         ("id=netrc,env=NETRC_CONTENT", ["NETRC_CONTENT"]),
         ("type=env,id=netrc,src=NETRC_CONTENT", ["NETRC_CONTENT"]),
         ("id=netrc,source=NETRC_CONTENT,type=env", ["NETRC_CONTENT"]),
+        # Explicit type=env with no src/source: buildx falls back to the id.
+        ("type=env,id=PRIVATE_TOKEN", ["PRIVATE_TOKEN"]),
         # Bare id: BuildKit falls back to the env var named by the id.
         ("id=NETRC_CONTENT", ["NETRC_CONTENT"]),
         # File-backed specs read no env var.

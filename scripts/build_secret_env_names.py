@@ -28,7 +28,9 @@ def env_names(specs: str) -> list[str]:
         if fields.get("env"):
             name = fields["env"]
         elif fields.get("type") == "env":
-            name = fields.get("src") or fields.get("source") or ""
+            # src/source name the env var here; a bare `type=env,id=NAME`
+            # falls back to the id, like buildx itself.
+            name = fields.get("src") or fields.get("source") or fields.get("id", "")
         elif "src" not in fields and "source" not in fields:
             name = fields.get("id", "")
         else:
