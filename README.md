@@ -375,9 +375,13 @@ name reaches `astro deploy`:
 - Set the env var the spec names on the action's **step** (`env:`), and don't
   name it `ASTRO_TOKEN`, `ASTRO_API_TOKEN`, `GH_TOKEN`, or `GITHUB_TOKEN` — the
   action strips those four before running anything that executes repository
-  code. Supplying `build-secrets` deliberately exposes the named env var to
-  your own Dockerfile's build; BuildKit mounts it for the `RUN` step only and
-  never writes it into image layers.
+  code. Like any step `env:`, the variable is visible to the action's process
+  tree, so the action also strips the vars your specs name from the two places
+  repository code executes outside your image build — the Otto migration and
+  the import-level verifier. What consumes the secret is your own Dockerfile's
+  build; BuildKit mounts it for the `RUN` step only and never writes it into
+  image layers. Mint short-lived, minimally-scoped credentials (as the octo-sts
+  pattern above does) regardless.
 - Multiple secrets (one spec per line) need Astro CLI >= 1.44 (`--build-secret`);
   older CLIs fold them into one malformed spec. A single secret works on any
   CLI version that has the flag.
@@ -457,7 +461,9 @@ don't race the branch.
   subprocesses; for repos with untrusted DAG authors, prefer
   `verify-level: syntax`. The one exception is deliberate: env vars you name
   in `build-secrets` pass through to the image build, because exposing them to
-  your Dockerfile is that input's entire purpose.
+  your Dockerfile is that input's entire purpose — and they are stripped from
+  the Otto migration and the import-level verifier, which execute repository
+  code without an image build in between.
 - Run on a schedule / `workflow_dispatch` against your own default branch, never
   on `pull_request_target` from forks. The resolve step is intentionally
   unauthenticated so it works in CI / `act` without secrets.

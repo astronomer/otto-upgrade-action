@@ -38,6 +38,17 @@ mkdir -p "$WORKDIR"
 # `git add -A` can't sweep __pycache__/*.pyc into the upgrade PR.
 export PYTHONPYCACHEPREFIX="$WORKDIR/pycache"
 
+# `env -u` args stripping the env vars named by BUILD_SECRETS specs from the
+# import-level checks: those execute repository DAG code directly (no image
+# in between), and the build-secrets contract is Dockerfile-build exposure
+# only. The parse-level build (run_parse) keeps them — it's the consumer.
+# Seeded with BUILD_SECRETS itself so the array is never empty (bash 3.2's
+# set -u treats expanding an empty array as an unbound variable).
+secret_env_unsets=("-u" "BUILD_SECRETS")
+while IFS= read -r name; do
+  [[ -n "$name" ]] && secret_env_unsets+=("-u" "$name")
+done < <(python3 "$ACTION_PATH/scripts/build_secret_env_names.py")
+
 report="$WORKDIR/verify-report.md"
 status="skipped"
 
@@ -190,23 +201,29 @@ detect_parse_mode() {
         # worktree (which doesn't) — so a cwd-relative gitignored secret file
         # would build one side and not the other, and that asymmetry could
         # demote a genuine target-only regression to 'skipped'. Pinning the
-        # path makes both builds read the identical file.
-        IFS=',' read -r -a fields <<< "$line"
-        rebuilt=""
-        for field in "${fields[@]}"; do
-          case "$field" in
-            src=/*|source=/*) ;;
-            src=*|source=*) field="${field%%=*}=${proj_abs}/${field#*=}" ;;
-          esac
-          case "$field" in
-            src=*|source=*)
-              src="${field#*=}"
-              [[ -e "$src" ]] || echo "::warning::build secret file '$src' does not exist; the image builds will likely fail."
-              ;;
-          esac
-          rebuilt+="${field},"
-        done
-        line="${rebuilt%,}"
+        # path makes both builds read the identical file. A `type=env` spec's
+        # src names an env var, not a file — leave those verbatim.
+        case ",$line," in
+          *,type=env,*) ;;
+          *)
+            IFS=',' read -r -a fields <<< "$line"
+            rebuilt=""
+            for field in "${fields[@]}"; do
+              case "$field" in
+                src=/*|source=/*) ;;
+                src=*|source=*) field="${field%%=*}=${proj_abs}/${field#*=}" ;;
+              esac
+              case "$field" in
+                src=*|source=*)
+                  src="${field#*=}"
+                  [[ -e "$src" ]] || echo "::warning::build secret file '$src' does not exist; the image builds will likely fail."
+                  ;;
+              esac
+              rebuilt+="${field},"
+            done
+            line="${rebuilt%,}"
+            ;;
+        esac
         parse_cmd+=("$secret_flag" "$line")
         n=$((n + 1))
       done <<< "$BUILD_SECRETS"
@@ -500,6 +517,7 @@ import_report="$WORKDIR/import-report.md"
 run_import() {
   IMPORT_REPORT="$import_report" IMPORT_JSON="$WORKDIR/import-failures.json" \
     env -u ASTRO_TOKEN -u ASTRO_API_TOKEN -u GH_TOKEN -u GITHUB_TOKEN \
+    "${secret_env_unsets[@]}" \
     timeout 600 uv run --no-project "$@" "${with_args[@]}" -- \
     python3 "$ACTION_PATH/scripts/import_check.py" "${import_args[@]}"
 }
@@ -565,6 +583,7 @@ elif [[ "$rc" -eq 3 ]]; then
     run_baseline_import() {
       IMPORT_JSON="$WORKDIR/baseline-failures.json" IMPORT_REPORT="" \
         env -u ASTRO_TOKEN -u ASTRO_API_TOKEN -u GH_TOKEN -u GITHUB_TOKEN \
+        "${secret_env_unsets[@]}" \
         timeout 600 uv run --no-project "$@" "${bwith[@]}" -- \
         python3 "$ACTION_PATH/scripts/import_check.py" "${bargs[@]}" \
         >/dev/null 2>>"$WORKDIR/baseline-setup.err"

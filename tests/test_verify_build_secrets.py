@@ -159,3 +159,19 @@ def test_absolute_src_left_alone_and_missing_file_warns(tmp_path):
 def test_env_specs_are_never_rewritten(tmp_path):
     cmd, _ = run_detect(tmp_path, MODERN_HELP, "id=netrc,env=NETRC_CONTENT,type=env")
     assert cmd[-1] == "id=netrc,env=NETRC_CONTENT,type=env"
+
+
+@pytest.mark.parametrize(
+    "spec",
+    [
+        # docker's other spelling of env-backed: src names an env VAR — the
+        # relative-path rewrite must never touch it, wherever type= sits.
+        "type=env,id=netrc,src=NETRC_CONTENT",
+        "id=netrc,src=NETRC_CONTENT,type=env",
+        "id=netrc,source=NETRC_CONTENT,type=env",
+    ],
+)
+def test_type_env_src_specs_are_never_rewritten(tmp_path, spec):
+    cmd, warnings = run_detect(tmp_path, MODERN_HELP, spec)
+    assert cmd[-1] == spec
+    assert warnings == []

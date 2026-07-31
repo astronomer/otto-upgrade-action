@@ -45,7 +45,7 @@ inputs:
   build-secrets:
     required: false
     default: ""
-    description: "Docker build secrets for the verify-level 'parse' image builds, in `docker build --secret` format (e.g. 'id=netrc,env=NETRC_CONTENT'; one spec per line for multiple — multiple need Astro CLI >= 1.44). Use when your Dockerfile needs credentials to build, e.g. a `RUN --mount=type=secret,id=netrc` pip install from a private repo — the same value the deploy-action's input of this name forwards to 'astro deploy'. Set the env var the spec names on this action's step; it must not be ASTRO_TOKEN, ASTRO_API_TOKEN, GH_TOKEN, or GITHUB_TOKEN (stripped before repo code runs). Relative src= paths are resolved against the project root so the target and baseline builds read the identical file. This deliberately exposes the secret to your Dockerfile's build; BuildKit never writes secret mounts into image layers."
+    description: "Docker build secrets for the verify-level 'parse' image builds, in `docker build --secret` format (e.g. 'id=netrc,env=NETRC_CONTENT'; one spec per line for multiple — multiple need Astro CLI >= 1.44). Use when your Dockerfile needs credentials to build, e.g. a `RUN --mount=type=secret,id=netrc` pip install from a private repo — the same value the deploy-action's input of this name forwards to 'astro deploy'. Set the env var the spec names on this action's step; it must not be ASTRO_TOKEN, ASTRO_API_TOKEN, GH_TOKEN, or GITHUB_TOKEN (stripped before repo code runs). Relative src= paths are resolved against the project root so the target and baseline builds read the identical file. This deliberately exposes the secret to your Dockerfile's build (BuildKit never writes secret mounts into image layers); the env vars the specs name are stripped from the Otto migration and the import-level verifier, which execute repository code outside an image build."
   bump-blocking-pins:
     required: false
     default: "false"
@@ -340,6 +340,7 @@ runs:
         ACTION_PATH: ${{ github.action_path }}
         WORKDIR: /tmp/otto-upgrade
         INPUT_MODEL: ${{ inputs.model }}
+        BUILD_SECRETS: ${{ inputs.build-secrets }}
       run: bash "$GITHUB_ACTION_PATH/scripts/run-otto.sh"
 
     - name: Deprecation cleanup
