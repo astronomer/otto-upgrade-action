@@ -64,8 +64,8 @@ inputs:
     description: "Head branch for the rolling upgrade PR. Re-runs force-push to it and update the same PR in place rather than opening a new one each run."
   labels:
     required: false
-    default: "airflow-upgrade,dependencies"
-    description: "Comma-separated labels applied to the PR (best-effort; missing labels are skipped with a warning)."
+    default: ""
+    description: "Comma-separated labels applied to the PR (best-effort; missing labels are skipped with a warning). Opt-in — none are applied by default."
   model:
     required: false
     default: ""
