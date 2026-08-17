@@ -416,7 +416,7 @@ don't race the branch.
 | `deprecation-cleanup` | `fix` | Sweep deprecated Airflow usage (ruff AIR3 rules, `dags/`+`plugins/`+`include/` only) beyond the hop's own migrations: `fix` rewrites what ruff can (e.g. operators moved to providers) and lists the rest as debt in the PR; `advisory` only lists; `off` skips. `fix` auto-demotes to advisory when the target Airflow isn't 3.x or when `verify-level` is below `import` — rewrites are only applied when verification gates them. Your ruff excludes, per-file-ignores, and `noqa` comments are honored. |
 | `base-branch` | _(repo default branch)_ | PR base. |
 | `branch` | `otto/airflow-upgrade` | Rolling head branch. |
-| `labels` | `airflow-upgrade,dependencies` | Comma-separated PR labels (best-effort). |
+| `labels` | _(none)_ | Comma-separated PR labels (best-effort). Opt-in — none are applied unless set. |
 | `model` | _(Otto default)_ | `--model` passed to Otto. |
 | `astro-cli-version` | _(latest)_ | Astro CLI version for the Otto step. |
 | `dry-run` | `false` | Compute + preview the would-be PR in the job summary, open nothing, don't mutate the tree. |
