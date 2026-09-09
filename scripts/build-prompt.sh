@@ -141,10 +141,13 @@ esac
   echo "The scan scope above bounds only your own proactive edits — the"
   echo "patcher rewrites the whole project by design. Keep every patcher"
   echo "edit wherever it lands (tests/, scripts/, ...) and report it in"
-  echo "changes_made. Never revert a bundled-tool edit: if you believe one"
-  echo "is wrong for this project, keep it and flag it under"
-  echo "manual_followups. A test file that imports airflow breaks on the new"
-  echo "version just like a DAG does — reverting the fix ships that breakage."
+  echo "changes_made. Never revert a bundled-tool edit: a test file that"
+  echo "imports airflow breaks on the new version just like a DAG does —"
+  echo "reverting the fix ships that breakage. Keep it and flag it under"
+  echo "manual_followups whenever you cannot name the specific migration the"
+  echo "edit implements, or it landed in a file that imports no airflow at"
+  echo "all. Deferring to the tool is not a reason to leave an edit"
+  echo "unexplained: an unexplained rename reaches the reviewer as noise."
   if [[ -n "$pin_lines" ]]; then
     echo
     echo "This run also raised user-owned dependency pins — see 'Raised user"
