@@ -1,8 +1,10 @@
 """security_fixes.py scrapes the Runtime release notes for shipped CVE fixes.
 
-The page fetch is stubbed with a fixture mirroring the real page shape
-(## Astro Runtime <tag> headings, ### Security fixes bullets with
-CVE/GHSA/PYSEC links, legacy X.Y.Z tags further down).
+The page fetch is stubbed with fixtures mirroring the real page shapes:
+PAGE is the legacy markdown-heading form (## Astro Runtime <tag>), MDX_PAGE
+the <Update label="Astro Runtime ..."> form the docs platform serves now.
+Both carry ### Security fixes bullets with CVE/GHSA/PYSEC links and legacy
+X.Y.Z tags further down.
 """
 
 import contextlib
@@ -193,6 +195,101 @@ def test_link_with_markdown_title_keeps_id_and_url():
     assert report["fixes"] == [
         {"id": "CVE-2026-1", "url": "https://example.com/cve-2026-1",
          "builds": ["3.3-2"]}]
+
+
+# Verbatim shape of the live page after the docs-platform migration: builds
+# are MDX <Update> blocks, sub-headings and bullets indented inside them, and
+# an llms.txt blockquote precedes the title. Parsing this is what regressed —
+# the whole page read as zero builds and every PR said "could not determine".
+MDX_PAGE = """\
+> ## Documentation Index
+> Fetch the complete documentation index at: https://astronomer.io/docs/llms.txt
+
+# Astro Runtime release notes
+
+Some intro prose and a subscribe link.
+
+<Update label="Astro Runtime 3.3-2" description="July 09, 2026">
+  * Airflow version: 3.3.0
+  * Runtime image: `astrocrpublic.azurecr.io/runtime:3.3-2`
+
+  ### Additional improvements
+
+  * Something unrelated with a [link](https://example.com) that must not count.
+
+  ### Security fixes
+
+  * Fixed [CVE-2026-49298](https://avd.aquasec.com/nvd/cve-2026-49298)
+  * Fixed [GHSA-65pc-fj4g-8rjx](https://github.com/advisories/GHSA-65pc-fj4g-8rjx)
+</Update>
+
+<Update label="Astro Runtime 3.3-1" description="July 09, 2026">
+  ### Security fixes
+
+  * Fixed [PYSEC-2026-24](https://osv.dev/vulnerability/PYSEC-2026-24)
+</Update>
+
+<Update label="Astro Runtime 3.2-5" description="June 01, 2026">
+  ### Security fixes
+
+  * Fixed [CVE-2026-11111](https://avd.aquasec.com/nvd/cve-2026-11111)
+</Update>
+
+* Stray page-level bullet citing [CVE-9999-0000](https://example.org/nope).
+"""
+
+
+class TestMdxUpdateBlocks:
+    def test_builds_parse_from_update_labels(self):
+        assert [tag for tag, _ in sf._parse_builds(MDX_PAGE)] == [
+            "3.3-2", "3.3-1", "3.2-5"]
+
+    def test_indented_security_bullets_are_collected(self):
+        report = sf.collect(MDX_PAGE, "3.3-1", "3.3-2")
+        assert report["status"] == "ok"
+        assert report["crossed"] == ["3.3-2"]
+        assert {f["id"] for f in report["fixes"]} == {
+            "CVE-2026-49298", "GHSA-65pc-fj4g-8rjx"}
+
+    def test_indented_non_security_section_does_not_leak(self):
+        report = sf.collect(MDX_PAGE, "3.3-1", "3.3-2")
+        assert all(f["url"] != "https://example.com" for f in report["fixes"])
+
+    def test_closing_tag_bounds_the_last_build(self):
+        # Page-level content after </Update> must not be donated to the final
+        # build: without the cut it lands inside that build's security section.
+        report = sf.collect(MDX_PAGE, "3.2-3", "3.2-5")
+        assert {f["id"] for f in report["fixes"]} == {"CVE-2026-11111"}
+
+    def test_cross_line_still_scopes_to_target_line(self):
+        report = sf.collect(MDX_PAGE, "3.2-3", "3.3-2")
+        assert report["crossed"] == ["3.3-1", "3.3-2"]
+        assert "CVE-2026-11111" not in {f["id"] for f in report["fixes"]}
+        assert report["lower_bound"] is True
+
+    def test_unrecognized_heading_inside_a_block_fails_closed(self):
+        page = MDX_PAGE.replace("### Security fixes", "### Security updates", 1)
+        report = sf.collect(page, "3.3-1", "3.3-2")
+        assert report["status"] == "shape-mismatch"
+        assert "unrecognized format" in report["reason"]
+
+    def test_both_page_shapes_parse_on_one_page(self):
+        # A mid-migration page, and the pre-migration archive pages that keep
+        # the heading form.
+        page = ('## Astro Runtime 3.3-1\n\n### Security fixes\n\n'
+                '* Fixed [CVE-2026-1](https://example.com/1)\n\n'
+                '<Update label="Astro Runtime 3.3-2" description="July 09, 2026">\n'
+                '  ### Security fixes\n\n'
+                '  * Fixed [CVE-2026-2](https://example.com/2)\n'
+                '</Update>\n')
+        assert [t for t, _ in sf._parse_builds(page)] == ["3.3-1", "3.3-2"]
+        report = sf.collect(page, "3.3-1", "3.3-2")
+        assert {f["id"] for f in report["fixes"]} == {"CVE-2026-2"}
+
+    def test_truly_unknown_shape_is_still_loud(self):
+        report = sf.collect("totally different page now", "3.2-3", "3.3-2")
+        assert report["status"] == "shape-mismatch"
+        assert "format may have changed" in report["reason"]
 
 
 class TestFetchHardening:

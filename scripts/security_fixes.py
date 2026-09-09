@@ -44,9 +44,21 @@ RELEASE_NOTES_URL = os.environ.get(
     "https://www.astronomer.io/docs/runtime/runtime-release-notes.md",
 )
 
-_BUILD_HEADING = re.compile(r"^##\s+Astro Runtime\s+(?P<tag>[A-Za-z0-9.\-]+)\s*$", re.M)
-_SECURITY_HEADING = re.compile(r"^###\s+Security fixes\s*$", re.M | re.I)
-_HEADING_LINE = re.compile(r"^#{1,6}\s.*$", re.M)
+# The docs site has published each build two ways: legacy markdown headings
+# (`## Astro Runtime 3.3-2`) and, since the docs-platform migration, an MDX
+# component (`<Update label="Astro Runtime 3.3-7" description="...">`). Match
+# both — only the second is live today, but the pre-migration archive pages
+# still carry headings, and a page can be mid-migration.
+_BUILD_HEADING = re.compile(
+    r"""^[ \t]*(?:
+          \#\#[ \t]+Astro[ \t]+Runtime[ \t]+(?P<heading_tag>[A-Za-z0-9.\-]+)[ \t]*$
+        | <Update\b[^>]*?\blabel="Astro[ \t]+Runtime[ \t]+(?P<mdx_tag>[A-Za-z0-9.\-]+)"
+        )""",
+    re.M | re.X,
+)
+# Sub-headings sit indented inside an MDX block, flush-left under a heading.
+_SECURITY_HEADING = re.compile(r"^[ \t]*###\s+Security fixes\s*$", re.M | re.I)
+_HEADING_LINE = re.compile(r"^[ \t]*#{1,6}\s.*$", re.M)
 _BULLET = re.compile(r"^\s*[*+-]\s+(?P<text>\S.*)$")
 _LINK = re.compile(r"\[(?P<id>[^\]]+)\]\((?P<url>[^)\s]+)(?:\s+\"[^\"]*\")?\)")
 
@@ -135,12 +147,23 @@ def _fetch_text(url: str) -> str:
 
 
 def _parse_builds(page: str) -> list[tuple[str, str]]:
-    """(tag, section body) per '## Astro Runtime <tag>' heading, page order."""
+    """(tag, section body) per build entry, page order.
+
+    A body runs to the next build entry, but an MDX block is closed by its
+    `</Update>`: without that cut, trailing page prose (or a block labelled
+    something other than a Runtime build) would read as part of the
+    preceding build and could donate it foreign "fixes".
+    """
     matches = list(_BUILD_HEADING.finditer(page))
-    return [
-        (m.group("tag"), page[m.end():matches[i + 1].start() if i + 1 < len(matches) else len(page)])
-        for i, m in enumerate(matches)
-    ]
+    builds = []
+    for i, m in enumerate(matches):
+        end = matches[i + 1].start() if i + 1 < len(matches) else len(page)
+        body = page[m.end():end]
+        close = body.find("</Update>")
+        if close != -1:
+            body = body[:close]
+        builds.append((m.group("heading_tag") or m.group("mdx_tag"), body))
+    return builds
 
 
 def _security_entries(body: str) -> list[dict] | None:
@@ -160,7 +183,7 @@ def _security_entries(body: str) -> list[dict] | None:
     if not m:
         return []
     section = body[m.end():]
-    nxt = re.search(r"^#{2,3}\s", section, re.M)
+    nxt = re.search(r"^[ \t]*#{2,3}\s", section, re.M)
     if nxt:
         section = section[:nxt.start()]
     entries = []
@@ -189,7 +212,9 @@ def collect(page: str, current: str, target: str) -> dict:
     builds = _parse_builds(page)
     if not builds:
         report.update(status="shape-mismatch",
-                      reason="no '## Astro Runtime <tag>' headings found; "
+                      reason="no Astro Runtime build entries found (neither "
+                             "'## Astro Runtime <tag>' headings nor "
+                             "'<Update label=\"Astro Runtime ...\">' blocks); "
                              "the release-notes page format may have changed")
         return report
     if target not in {tag for tag, _ in builds}:
