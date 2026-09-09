@@ -140,7 +140,31 @@ def test_patcher_edits_outside_scan_scope_are_kept(tmp_path):
     assert "Two actors edit this project" in prompt
     assert "Never revert a bundled-tool edit" in prompt
     # The wrong-patcher-edit case routes to followups, not a revert.
-    assert "keep it and flag it under" in prompt
+    assert "flag it under" in prompt and "manual_followups" in prompt
+
+
+def test_unexplainable_patcher_edits_must_be_flagged(tmp_path):
+    # cre-airline #809: the patcher renamed a local variable to `sql` in two
+    # dev/ scripts that import no airflow. Otto kept the edits (correct) and
+    # reported them in changes_made as "kept the patcher edit as required",
+    # but raised NO manual_followups, so the reviewer got an unexplained
+    # rename with no signal. The flag was conditioned on Otto BELIEVING the
+    # edit wrong, and deference to the tool means that never fires. The
+    # trigger is now objective, and the keep-rule is untouched.
+    plan = {"runtime": {"current_airflow": "3.2.2", "target_airflow": "3.3.0",
+                        "current_tag": "3.2-5", "target_tag": "3.3-2", "tier": "minor"},
+            "providers": []}
+    prompt = _run(tmp_path, plan)
+    schema = (SCRIPT.parent / "upgrade-schema.json").read_text()
+    for channel in (prompt, schema):
+        assert "Never revert a bundled-tool edit" in channel
+        assert "cannot name the specific migration" in channel
+        assert "imports no airflow" in channel
+    # Belief is no longer the trigger in either channel.
+    assert "if you believe one is wrong" not in prompt
+    assert "if you believe one is wrong" not in schema
+    # Reverting is still never a reportable outcome.
+    assert "an edit reverted" not in schema
 
 
 def test_raised_user_pins_get_reasoning_instructions(tmp_path):
