@@ -165,6 +165,29 @@ def _mergeable(m: re.Match | None) -> bool:
         _IMPORT_NAME.fullmatch(n.strip()) for n in m.group("names").split(","))
 
 
+def _merged_names(*groups: str) -> str:
+    """Union of import-name lists, first occurrence wins, order preserved.
+
+    Field case (cre-airline #809): two function-local
+    `from airflow.models import Variable` statements were rewritten to the
+    SDK path and merged into a top-level line that already imported
+    `Variable`, yielding `from airflow.sdk import Variable, dag, task,
+    Variable, Variable`. Duplicate imports are legal Python, so
+    parse/import verification passed and the line shipped in the PR.
+
+    Aliases are distinct bindings, so `x as y` never dedupes against `x`;
+    the key is the whole spec with internal whitespace normalized.
+    """
+    seen, names = set(), []
+    for group in groups:
+        for name in group.split(","):
+            spec = re.sub(r"\s+", " ", name.strip())
+            if spec and spec not in seen:
+                seen.add(spec)
+                names.append(spec)
+    return ", ".join(names)
+
+
 def _merge_adjacent_from_imports(path: str, before: str) -> bool:
     """Ruff's fixer inserts one `from M import x` line per applied fix, so two
     rewrites into the same module read as two lines (`from airflow.sdk import
@@ -190,8 +213,9 @@ def _merge_adjacent_from_imports(path: str, before: str) -> bool:
                 and (lines[i].strip() not in pre_lines
                      or lines[i + 1].strip() not in pre_lines)):
             ending = "\r\n" if lines[i].endswith("\r\n") else "\n"
+            merged = _merged_names(a.group("names"), b.group("names"))
             lines[i] = (f"{a.group('indent')}from {a.group('mod')} import "
-                        f"{a.group('names').strip()}, {b.group('names').strip()}{ending}")
+                        f"{merged}{ending}")
             del lines[i + 1]
             changed = True
             continue  # the merged line may merge again with the next one

@@ -306,6 +306,38 @@ class TestImportMerge:
         assert not changed
         assert out == text
 
+    def test_duplicate_names_collapse(self, tmp_path):
+        # cre-airline #809: ruff rewrote two function-local
+        # `from airflow.models import Variable` statements onto the SDK path
+        # next to a top-level line that already imported Variable, and the
+        # merge concatenated the name lists blind, shipping
+        # `Variable, dag, task, Variable, Variable` into the PR.
+        changed, out = self._merge(
+            tmp_path,
+            "from airflow.sdk import Variable, dag, task\n"
+            "from airflow.sdk import Variable\n"
+            "from airflow.sdk import Variable\n",
+            before="from airflow.sdk import Variable, dag, task\n")
+        assert changed
+        assert out == "from airflow.sdk import Variable, dag, task\n"
+
+    def test_alias_is_not_deduped_against_the_bare_name(self, tmp_path):
+        # `x as y` and `x` bind different names; both must survive.
+        changed, out = self._merge(
+            tmp_path,
+            "from a import x as y\nfrom a import x\n",
+            before="")
+        assert changed
+        assert out == "from a import x as y, x\n"
+
+    def test_whitespace_variant_duplicates_collapse(self, tmp_path):
+        changed, out = self._merge(
+            tmp_path,
+            "from a import x  as  y\nfrom a import x as y, z\n",
+            before="")
+        assert changed
+        assert out == "from a import x as y, z\n"
+
     def test_aliases_merge_and_crlf_preserved(self, tmp_path):
         changed, out = self._merge(
             tmp_path,
