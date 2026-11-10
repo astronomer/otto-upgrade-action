@@ -61,7 +61,9 @@ _SUMMARY_BROKEN = re.compile(r"^=+ .*\b\d+ (?:failed|error)", re.MULTILINE)
 _FAILED_LINE = re.compile(r"^FAILED .*::test_file_imports\[(?P<path>[^\]]+)\]")
 _EXC_HEAD = re.compile(r"^E\s+Exception: (?P<path>\S+) failed to import with message")
 _EXC_CLASS = re.compile(r"^([A-Za-z_][A-Za-z0-9_.]*(?:Error|Exception|Warning))\b")
-_CLEAN = "No errors detected in your DAGs"
+# Newer CLIs print "Dags"; colour codes wrap the pytest summary.
+_CLEAN = re.compile(r"No errors detected in your DAGs", re.IGNORECASE)
+_ANSI = re.compile(r"\x1b\[[0-9;]*m")
 # The CLI's own reason for not producing a result, e.g. a project configured for
 # standalone dev mode ("no virtual environment found — run 'astro dev start'
 # first") or a venv without pytest. Kept out of the rc contract: these are all
@@ -73,6 +75,7 @@ _CLI_ERROR = re.compile(
 
 
 def parse_output(text: str) -> tuple[int, dict]:
+    text = _ANSI.sub("", text)
     if BUILD_MARKER in text:
         return 4, {"checked": 0, "failures": []}
 
@@ -143,7 +146,7 @@ def parse_output(text: str) -> tuple[int, dict]:
     # clean marker (which only the CLI prints, and only on success) or the closing
     # summary of the integrity session. "collected N items" alone is what a
     # timeout kill leaves behind.
-    completed = _CLEAN in text or _SUMMARY.search(body) is not None
+    completed = _CLEAN.search(text) is not None or _SUMMARY.search(body) is not None
     if cli_err is not None or not completed or _SUMMARY_BROKEN.search(body):
         result: dict = {"checked": 0, "failures": []}
         if cli_err is not None:

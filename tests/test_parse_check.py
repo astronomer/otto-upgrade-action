@@ -305,3 +305,28 @@ def test_main_writes_import_json(tmp_path, monkeypatch):
     assert parse_check.main() == 3
     data = json.loads(out.read_text())
     assert data["failures"][0]["path"] == "dags/format_probe.py"
+
+
+# Astro CLI 1.4x: ANSI-coloured pytest output and "Dags" spelling.
+COLOURED_CLEAN_RUN = (
+    "Checking your Dags for errors…\n"
+    "\x1b[1m============================= test session starts ==============================\x1b[0m\n"
+    "collected 181 items\n\n"
+    ".astro/test_dag_integrity_default.py \x1b[32m.\x1b[0m\x1b[32m.\x1b[0m\x1b[32m    [100%]\x1b[0m\n\n"
+    "\x1b[32m=== \x1b[1m181 passed\x1b[0m\x1b[32m in 19.77s\x1b[0m\x1b[32m ===\x1b[0m\n"
+    "✔ No errors detected in your Dags\n"
+)
+
+
+def test_coloured_summary_and_dags_spelling_is_clean():
+    assert parse_check.parse_output(COLOURED_CLEAN_RUN) == (0, {"checked": 181, "failures": []})
+
+
+def test_coloured_summary_alone_is_clean():
+    text = COLOURED_CLEAN_RUN.replace("✔ No errors detected in your Dags\n", "")
+    assert parse_check.parse_output(text)[0] == 0
+
+
+def test_dags_spelling_alone_is_clean():
+    text = "collected 181 items\n✔ No errors detected in your Dags\n"
+    assert parse_check.parse_output(text) == (0, {"checked": 181, "failures": []})
