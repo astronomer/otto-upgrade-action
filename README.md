@@ -316,6 +316,17 @@ The `verify-level` input controls the post-upgrade check:
   development. Standalone mode parses in a gitignored local `.venv` that no CI
   checkout has, and it reads nothing from your Dockerfile but the `FROM` tag —
   neither of which can give an image-level verdict.
+
+  The run happens in a throwaway copy of your project, never your tree. Your
+  `.astro/test_dag_integrity_default.py` runs as is (apart from dropping the
+  `include_examples` argument Airflow 3.3 removed). In the copy, the action
+  appends a small reporter to `.astro/conftest.py` (creating it if needed)
+  that writes each DAG file's result as one JSON line, so the verdict doesn't
+  depend on how the run is formatted (your pytest `addopts`, colour, CLI
+  wording). Your own conftest hooks, fixtures and options keep working. A
+  project with no `.astro/`
+  scaffolding (not created by `astro dev init`) gets the Astro CLI's default
+  integrity test and config in the copy, so it is checked too.
 - `import` — import the files Airflow would discover — DAG files under
   `dags/` passing Airflow's safe-mode heuristic (honoring `.airflowignore`)
   plus plugin modules under `plugins/` — inside an ephemeral `uv` env built
@@ -329,16 +340,20 @@ The action provisions `uv` and the Astro CLI itself (you don't need separate
 setup steps). Verification reports **failed** only when the upgrade introduces
 a **new** failure — one that doesn't already occur at your current versions.
 When the target check fails, the action re-runs the same check at your current
-versions (a git worktree of the pre-upgrade state, built at your current
-image); anything failing on both sides is listed as **pre-existing** and does
-**not** fail the run. At `import` level, pre-existing entries describe the
+versions, on the same copy of your working tree with only this run's edits
+undone (so files your workflow wrote before the action, like a gitignored
+`.env`, are present on both sides); anything failing on both sides is listed
+as **pre-existing** and does **not** fail the run. At `import` level, pre-existing entries describe the
 check's CI environment, not your production — an env-dependent DAG can parse
 perfectly on your deployment and still be unparseable in a bare harness (at
 `parse` level this class largely disappears, because the image provides the
 real environment). If the check itself can't run (no Docker, no network,
 resolver cutoff, timeout) it reports **skipped** — loudly, with a warning
 banner on the PR — so infra flakiness never masquerades as a broken upgrade
-and an un-run verification never reads as success. Everything that executes
+and an un-run verification never reads as success. When the requested level
+can't run but a lower one gives a verdict (no Docker, so `parse` falls back to
+`import`), the PR leads with a warning naming both levels, and the
+`effective-verify-level` output says which level the result came from. Everything that executes
 repository code runs with the Astro and GitHub tokens stripped from its
 environment.
 
@@ -386,9 +401,10 @@ name reaches `astro deploy`:
   older CLIs fold them into one malformed spec. A single secret works on any
   CLI version that has the flag.
 - Prefer env-backed specs (`env=`). File-backed specs (`src=`) work too;
-  a relative path is resolved against the project root before the builds run,
-  because the target and baseline images build from different copies of your
-  project — an unpinned relative path could reach one build and not the other.
+  a relative path is resolved against the project root before the builds run.
+  A secret file your workflow writes before the action runs is never committed
+  to the PR branch, even if it isn't gitignored: the PR commits only what the
+  run itself changed.
 
 ## The rolling PR
 
@@ -429,6 +445,7 @@ don't race the branch.
 | `overall-scope` | Largest tier across the plan: `patch`/`minor`/`major`/`none`. |
 | `no-update` | `true` when nothing is behind. |
 | `verify-status` | `passed`/`failed`/`skipped` (`skipped` when verification didn't run). |
+| `effective-verify-level` | The level the verification result came from: `parse`, `import`, `syntax`, or `none`. Lower than `verify-level` when the requested check couldn't run and a fallback gave the result. |
 | `security-fixes` | Count of security fixes listed in the public [Runtime release notes](https://www.astronomer.io/docs/runtime/runtime-release-notes) for the target's release line — a lower bound when the upgrade crosses lines (inherited fixes aren't enumerable per line). `unknown` when the notes couldn't be read; empty when the Runtime didn't change. |
 | `pr-number` / `pr-url` / `branch` | The opened/updated PR (empty in dry-run / no-op). |
 

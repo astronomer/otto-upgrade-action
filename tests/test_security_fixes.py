@@ -13,6 +13,7 @@ import json
 
 import pytest
 import security_fixes as sf
+from conftest import FIXTURES
 
 PAGE = """\
 Some intro prose and a subscribe link.
@@ -443,3 +444,50 @@ def test_python_variant_tags_resolve_to_base_for_coverage(tmp_path, monkeypatch)
     )
     assert report["status"] == "ok"
     assert report["crossed"] == ["3.3-1", "3.3-2"]
+
+
+class TestBoldParagraphPage:
+    """The live page since 2026-11 marks each build with a bold paragraph
+    (`**Astro Runtime 3.3-12**`). Fixture is trimmed from the real page."""
+
+    PAGE = (FIXTURES / "runtime-release-notes-bold-2026-11.md").read_text()
+
+    def test_builds_parse_from_bold_lines(self):
+        tags = [tag for tag, _ in sf._parse_builds(self.PAGE)]
+        assert tags == ["3.3-12", "3.3-11", "3.3-10", "3.2-14"]
+
+    def test_same_line_upgrade_counts_fixes_from_the_live_shape(self):
+        report = sf.collect(self.PAGE, "3.3-10", "3.3-12")
+        assert report["status"] == "ok"
+        assert report["crossed"] == ["3.3-11", "3.3-12"]
+        assert report["total"] > 0
+
+    def test_image_scoped_fixes_keep_their_scope(self):
+        report = sf.collect(self.PAGE, "3.3-11", "3.3-12")
+        scoped = {f["id"]: f["scope"] for f in report["fixes"] if "scope" in f}
+        assert scoped == {"CVE-2024-3220": "Python 3.12 and 3.13 images",
+                          "CVE-2026-12345": "Python 3.13 image"}
+
+    def test_prose_mentioning_a_build_is_not_a_build(self):
+        # "See [Astro Runtime 3.3-12 provider packages](...)" sits inside a bullet.
+        assert "Astro Runtime 3.3-12 provider packages" in self.PAGE
+        assert len(sf._parse_builds(self.PAGE)) == 4
+
+
+@pytest.mark.parametrize("line", [
+    "## Astro Runtime 3.3-2", "**Astro Runtime 3.3-2**", "### **Astro Runtime 3.3-2**",
+    "__Astro Runtime 3.3-2__", "Astro Runtime 3.3-2",
+    '<Update label="Astro Runtime 3.3-2" description="July 09, 2026">',
+])
+def test_any_build_line_markup_is_recognized(line):
+    page = f"{line}\n\n### Security fixes\n\n* Fixed [CVE-2026-1](https://x/1)\n"
+    assert [tag for tag, _ in sf._parse_builds(page)] == ["3.3-2"]
+
+
+def test_fix_scoped_in_one_build_but_not_another_is_unscoped():
+    page = ("**Astro Runtime 3.3-3**\n\n### Security fixes\n\n"
+            "* Fixed [CVE-2026-1](https://x/1)\n\n"
+            "**Astro Runtime 3.3-2**\n\n### Security fixes\n\n"
+            "* Fixed [CVE-2026-1](https://x/1) (Python 3.13 image)\n")
+    (fix,) = sf.collect(page, "3.3-1", "3.3-3")["fixes"]
+    assert "scope" not in fix

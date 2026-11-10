@@ -1,332 +1,331 @@
-"""parse_check.py turns `astro dev parse` output into the verifier's JSON.
+"""parse_check.py reads the probe's result line, never pytest's or the CLI's text.
 
-Fixtures are trimmed from real `astro dev parse` runs (Runtime 3.2-3/3.3-1).
-Exit contract: 0 clean, 3 DAG import failures, 4 image build failure,
-2 unrecognized output (infra — never a code verdict).
+Most tests run a REAL pytest session with parse_probe/conftest.py installed next
+to a stand-in integrity test shaped like the Astro CLI template (parametrized
+test_file_imports, raising Exception("<path> failed to import with message
+<traceback>")), under project pytest options that reshape the text output. The
+verdict must not change with those options: that is the regression class this
+design exists to close (a consumer's `addopts = --color=yes --no-header
+--tb=short` once turned a passing 181-DAG parse into "no recognizable result").
 """
 
 import json
+import subprocess
+import sys
+import textwrap
+from pathlib import Path
 
 import parse_check
+import pytest
 
-CLEAN_RUN = """\
-Checking your DAGs for errors…
-Astro Runtime Version: 3.2-3
-============================= test session starts ==============================
-collected 21 items
+PROBE = Path(__file__).resolve().parent.parent / "scripts" / "parse_probe" / "conftest.py"
 
-.astro/test_dag_integrity_default.py .....................               [100%]
+INTEGRITY_TEST = '''\
+import pytest
 
-======================== 21 passed, 1 warning in 18.37s ========================
-✔ No errors detected in your DAGs
-"""
+RESULTS = {results!r}
 
-FAILING_RUN = """\
-Checking your DAGs for errors…
-Astro Runtime Version: 3.2-3
-============================= test session starts ==============================
-collected 22 items
 
-.astro/test_dag_integrity_default.py .........F............              [100%]
+@pytest.mark.parametrize("rel_path, rv", list(RESULTS.items()), ids=list(RESULTS))
+def test_file_imports(rel_path, rv):
+    if rv != "No import errors":
+        raise Exception(f"{{rel_path}} failed to import with message \\n {{rv}}")
+'''
 
-=================================== FAILURES ===================================
->           raise Exception(f"{rel_path} failed to import with message \\n {rv}")
-E           Exception: dags/format_probe.py failed to import with message
-E            Traceback (most recent call last):
-E             File "<frozen importlib._bootstrap>", line 488, in _call_with_frames_removed
-E             File "/usr/local/airflow/dags/format_probe.py", line 2, in <module>
-E               from airflow.thismoduledoesnotexist import Nope
-E           ModuleNotFoundError: No module named 'airflow.thismoduledoesnotexist'
+TRACEBACK = (
+    "Traceback (most recent call last):\n"
+    '  File "/usr/local/airflow/dags/broken.py", line 2, in <module>\n'
+    "    from airflow.thismoduledoesnotexist import Nope\n"
+    "ModuleNotFoundError: No module named 'airflow.thismoduledoesnotexist'"
+)
 
-.astro/test_dag_integrity_default.py:138: Exception
-=========================== short test summary info ============================
-FAILED .astro/test_dag_integrity_default.py::test_file_imports[dags/format_probe.py]
-================== 1 failed, 21 passed, 2 warnings in 17.71s ===================
-"""
+ADDOPTS = [
+    pytest.param("", id="no-addopts"),
+    pytest.param('addopts = ["--tb=short", "--no-header", "--color=yes"]', id="sirius-addopts"),
+    pytest.param('addopts = ["-q", "--tb=no", "-p", "no:warnings"]', id="quiet-no-tb"),
+    pytest.param('addopts = ["-rA", "--tb=line", "-v"]', id="verbose-line-tb"),
+]
+
+
+def _pytest(cwd):
+    proc = subprocess.run(
+        [sys.executable, "-m", "pytest", ".astro/test_dag_integrity_default.py",
+         "-p", "no:cacheprovider"],
+        cwd=cwd, capture_output=True, text=True, check=False,
+        env={"PATH": "/usr/bin:/bin", "FORCE_COLOR": "1"},
+    )
+    return proc.stdout + proc.stderr
+
+
+def run_probe_session(tmp_path, results, addopts="", project_conftest=None):
+    """Lay out an Astro-like project with the probe installed the way verify.sh
+    does, and run pytest the way the CLI does (`pytest
+    .astro/test_dag_integrity_default.py` from the project root)."""
+    layout_project(tmp_path, results, addopts, project_conftest)
+    return _pytest(tmp_path)
+
+
+def layout_project(tmp_path, results, addopts="", project_conftest=None):
+    astro = tmp_path / ".astro"
+    astro.mkdir()
+    (astro / "test_dag_integrity_default.py").write_text(INTEGRITY_TEST.format(results=results))
+    # What verify.sh does: append the reporter to the project's conftest.
+    (astro / "conftest.py").write_text((project_conftest or "") + "\n" + PROBE.read_text())
+    (tmp_path / "pyproject.toml").write_text(f"[tool.pytest.ini_options]\n{addopts}\n")
+
+
+@pytest.mark.parametrize("addopts", ADDOPTS)
+def test_clean_run_is_a_pass_whatever_the_output_format(tmp_path, addopts):
+    out = run_probe_session(tmp_path, {"dags/a.py": "No import errors",
+                                       "dags/b.py": "No import errors"}, addopts)
+    assert parse_check.parse_output(out) == (0, {"checked": 2, "failures": []})
+
+
+@pytest.mark.parametrize("addopts", ADDOPTS)
+def test_failure_names_the_file_and_terse_error_whatever_the_output_format(tmp_path, addopts):
+    out = run_probe_session(tmp_path, {"dags/a.py": "No import errors",
+                                       "dags/broken.py": TRACEBACK}, addopts)
+    rc, result = parse_check.parse_output(out)
+    assert rc == 3
+    assert result["checked"] == 2
+    assert result["failures"] == [{
+        "path": "dags/broken.py",
+        "exc_class": "ModuleNotFoundError",
+        "msg": "ModuleNotFoundError: No module named 'airflow.thismoduledoesnotexist'",
+    }]
+
+
+def test_collection_error_reports_its_cause(tmp_path):
+    # The shape of an old template calling DagBag(include_examples=False) on
+    # Airflow >= 3.3: the test module dies at import, so no DAG is tested.
+    layout_project(tmp_path, {"dags/a.py": "No import errors"})
+    (tmp_path / ".astro" / "test_dag_integrity_default.py").write_text(
+        "raise TypeError(\"DagBag.__init__() got an unexpected keyword argument "
+        "'include_examples'\")\n")
+    rc, result = parse_check.parse_output(_pytest(tmp_path))
+    assert rc == 5
+    assert result["collection_error"].startswith("TypeError: DagBag.__init__()")
+
+
+def test_session_that_tests_nothing_is_not_a_pass(tmp_path):
+    rc, result = parse_check.parse_output(run_probe_session(tmp_path, {}))
+    assert rc == 2
+    assert "tested no DAG files" in result["reason"]
+
+
+def test_project_conftest_keeps_its_hooks_fixtures_and_options(tmp_path):
+    # The reporter is appended to the project's .astro/conftest.py, so the
+    # project's own hooks (same names as the reporter's), fixtures and options
+    # must all still work.
+    project_conftest = textwrap.dedent("""\
+        import pytest
+
+        SEEN = []
+
+        def pytest_addoption(parser):
+            parser.addoption("--project-flag", action="store_true")
+
+        def pytest_runtest_logreport(report):
+            SEEN.append(report.when)
+
+        def pytest_sessionfinish(session, exitstatus):
+            print("PROJECT_HOOK_RAN", len(SEEN))
+
+        @pytest.fixture
+        def project_fixture(request):
+            return request.config.getoption("--project-flag")
+    """)
+    astro = tmp_path / ".astro"
+    layout_project(tmp_path, {}, addopts='addopts = ["--project-flag", "-s"]',
+                   project_conftest=project_conftest)
+    (astro / "test_dag_integrity_default.py").write_text(textwrap.dedent("""\
+        def test_file_imports(project_fixture):
+            assert project_fixture is True
+    """))
+    out = _pytest(tmp_path)
+    rc, result = parse_check.parse_output(out)
+    assert (rc, result["failures"]) == (0, [])
+    assert "PROJECT_HOOK_RAN 3" in out
+
+
+def test_project_exitfirst_does_not_leave_files_untested(tmp_path):
+    out = run_probe_session(tmp_path, {"dags/a.py": TRACEBACK, "dags/b.py": TRACEBACK},
+                            'addopts = ["-x"]')
+    rc, result = parse_check.parse_output(out)
+    assert rc == 3
+    assert [f["path"] for f in result["failures"]] == ["dags/a.py", "dags/b.py"]
+
+
+def test_result_line_survives_cli_and_build_noise_around_it(tmp_path):
+    session = run_probe_session(tmp_path, {"dags/a.py": "No import errors"})
+    noisy = (
+        "Checking your Dags for errors…\n"
+        "#12 1.204 ============ 4 failed in 0.21s ============\n"  # a Dockerfile RUN pytest
+        + session
+        + "\x1b[32m✔\x1b[0m No errors detected in your Dags \n"
+    )
+    assert parse_check.parse_output(noisy) == (0, {"checked": 1, "failures": []})
+
 
 BUILD_FAILURE_RUN = """\
-Checking your DAGs for errors…
-#9 1.057       depends on pydantic-ai-slim>=2.0.0 and you require
-#9 1.057       requirements and pydantic-ai-slim[openai]==1.107.0 are incompatible.
+Checking your Dags for errors…
 #9 1.057       And because you require pydantic-ai-slim[openai]==1.107.0, we can
 #9 1.057       conclude that your requirements are unsatisfiable.
 ERROR: failed to build: failed to solve: process \
 "/usr/local/bin/install-python-dependencies" did not complete successfully: exit code: 1
 
-Error: something went wrong while parsing your DAGs: an error was encountered \
+Error: something went wrong while parsing your Dags: an error was encountered \
 while building the image, see the build logs for details
 """
 
 
-def _run(tmp_path, text, monkeypatch=None):
-    log = tmp_path / "parse.log"
-    log.write_text(text)
-    out = tmp_path / "failures.json"
+@pytest.mark.parametrize("spelling", ["Dags", "DAGs"])
+def test_build_failure_is_a_build_verdict(spelling):
+    assert parse_check.parse_output(BUILD_FAILURE_RUN.replace("Dags", spelling))[0] == 4
+
+
+@pytest.mark.parametrize("spelling", ["Dags", "DAGs"])
+def test_cli_refusal_is_no_verdict_with_its_own_reason(spelling):
+    text = (f"Error: something went wrong while parsing your {spelling}: no virtual "
+            "environment found — run 'astro dev start' first\n")
     rc, result = parse_check.parse_output(text)
-    return rc, result, log, out
+    assert rc == 2
+    assert result["cli_error"].startswith("no virtual environment found")
 
 
-def test_clean_run(tmp_path):
-    rc, result, *_ = _run(tmp_path, CLEAN_RUN)
-    assert rc == 0
-    assert result == {"checked": 21, "failures": []}
+def test_pytest_text_without_a_result_line_is_never_a_pass():
+    # A clean-looking run whose reporter never loaded: no result line, no verdict.
+    text = ("============================= test session starts ==============================\n"
+            "collected 3 items\n\n"
+            ".astro/test_dag_integrity_default.py ...                                  [100%]\n\n"
+            "============================== 3 passed in 1.02s ===============================\n"
+            "✔ No errors detected in your Dags\n")
+    assert parse_check.parse_output(text)[0] == 2
 
 
-def test_failing_run_extracts_path_class_and_terse_message(tmp_path):
-    rc, result, *_ = _run(tmp_path, FAILING_RUN)
+def _payload(**overrides):
+    payload = {"version": 1, "nonce": "n1", "exitstatus": 0, "collected": 1,
+               "collect_errors": [],
+               "results": [{"id": "dags/a.py", "outcome": "passed", "msg": ""}]}
+    payload.update(overrides)
+    return parse_check.SENTINEL + json.dumps(payload) + "\n"
+
+
+def test_truncated_result_line_is_no_verdict():
+    text = parse_check.SENTINEL + '{"version": 1, "exitstatus": 0, "collec'
+    assert parse_check.parse_output(text)[0] == 2
+
+
+def test_interrupted_session_without_failures_is_no_verdict():
+    rc, result = parse_check.parse_output(_payload(exitstatus=2))
+    assert rc == 2
+    assert "pytest exit 2" in result["reason"]
+
+
+def test_failures_from_an_interrupted_session_are_still_reported():
+    text = _payload(exitstatus=2, collected=1, results=[
+        {"id": "dags/b.py", "outcome": "failed",
+         "msg": "dags/b.py failed to import with message \n " + TRACEBACK}])
+    rc, result = parse_check.parse_output(text)
     assert rc == 3
-    assert result["checked"] == 22
-    (failure,) = result["failures"]
-    assert failure["path"] == "dags/format_probe.py"
-    assert failure["exc_class"] == "ModuleNotFoundError"
-    assert failure["msg"] == "ModuleNotFoundError: No module named 'airflow.thismoduledoesnotexist'"
-
-
-def test_build_failure_detected(tmp_path):
-    rc, result, *_ = _run(tmp_path, BUILD_FAILURE_RUN)
-    assert rc == 4
-    assert result["failures"] == []
-
-
-COLLECTION_ERROR_RUN = """\
-Checking your DAGs for errors…
-============================= test session starts ==============================
-collected 0 items / 1 error
-==================================== ERRORS ====================================
-.astro/test_dag_integrity_default.py:106: in get_import_errors
-=========================== short test summary info ============================
-ERROR .astro/test_dag_integrity_default.py - TypeError: DagBag.__init__() got an unexpected keyword argument
-!!!!!!!!!!!!!!!!!!!! Interrupted: 1 error during collection !!!!!!!!!!!!!!!!!!!!
-========================= 2 warnings, 1 error in 1.83s =========================
-Error: something went wrong while parsing your DAGs: failed to execute cmd: exit status 2
-"""
-
-
-def test_collection_error_detected_with_cause(tmp_path):
-    # The repo's committed integrity test can be incompatible with the target
-    # Airflow (real case: DagBag signature change in 3.3). The DAGs were never
-    # tested — this must not read as pass, fail, OR unrecognized.
-    rc, result, *_ = _run(tmp_path, COLLECTION_ERROR_RUN)
-    assert rc == 5
-    assert "DagBag.__init__()" in result["collection_error"]
-
-
-def test_unrecognized_output_is_infra(tmp_path):
-    rc, result, *_ = _run(tmp_path, "docker daemon not running\n")
-    assert rc == 2
-    # Nothing to quote: the caller falls back to its own catch-all wording.
-    assert "cli_error" not in result
-
-
-STANDALONE_NO_VENV_RUN = """\
-Checking your DAGs for errors…
-Error: something went wrong while parsing your DAGs: no virtual environment found \
-— run 'astro dev start' first
-"""
-
-STANDALONE_NO_PYTEST_RUN = """\
-Checking your DAGs for errors…
-Error: something went wrong while parsing your DAGs: exec: "pytest": \
-executable file not found in $PATH
-"""
-
-
-def test_cli_refusal_carries_its_own_reason(tmp_path):
-    # A project committing `dev.mode: standalone` sends the CLI to a gitignored
-    # local .venv no CI checkout has. Still no verdict (rc 2), but the reason
-    # must reach the caller — reporting only "produced no recognizable result"
-    # is what made this take a log dig to diagnose in the field.
-    rc, result, *_ = _run(tmp_path, STANDALONE_NO_VENV_RUN)
-    assert rc == 2
-    assert result["cli_error"] == "no virtual environment found — run 'astro dev start' first"
-
-
-def test_cli_refusal_half_provisioned_venv(tmp_path):
-    # The nastier standalone shape: the venv exists (so the CLI's own venv check
-    # passes) but nothing installed pytest into it.
-    rc, result, *_ = _run(tmp_path, STANDALONE_NO_PYTEST_RUN)
-    assert rc == 2
-    assert result["cli_error"] == 'exec: "pytest": executable file not found in $PATH'
-
-
-def test_build_failure_wrapper_is_not_demoted_to_cli_error(tmp_path):
-    # The image-build failure wears the same "something went wrong while parsing
-    # your DAGs" wrapper. It is a real verdict (rc 4) and must not be reclassified
-    # as a missing one just because the wrapper matches.
-    rc, result, *_ = _run(tmp_path, BUILD_FAILURE_RUN)
-    assert rc == 4
-    assert "cli_error" not in result
-
-
-def test_failing_run_with_wrapper_still_reports_the_failures(tmp_path):
-    # A wrapper alongside real failures means the run was cut short after finding
-    # them (pytest exit 1 gets its own message, not the wrapper). Reporting the
-    # failures is fail-closed; degrading to the fallback would discard them.
-    text = FAILING_RUN + "Error: something went wrong while parsing your DAGs: noise\n"
-    rc, result, *_ = _run(tmp_path, text)
-    assert rc == 3
-    assert result["failures"][0]["path"] == "dags/format_probe.py"
-    assert "cli_error" not in result
-
-
-# A Dockerfile `RUN pytest` lands in the same captured stream as the integrity
-# run. Buildkit prefixes those lines ("#12 1.204 ") so they miss the anchored
-# patterns, but the legacy builder emits RUN stdout verbatim — and an unprefixed
-# summary was enough to manufacture a pass. Found by adversarial review.
-BUILD_PYTEST_NOISE = """\
-Checking your DAGs for errors…
-Step 6/7 : RUN pytest tests/unit -q
- ---> Running in a1b2c3
-collected 4 items
-=========================== 4 passed in 0.21s ===========================
- ---> d4e5f6
-Successfully built d4e5f6
-"""
-
-
-def test_build_pytest_summary_cannot_pass_a_refused_parse(tmp_path):
-    # The worst shape: the build's summary satisfies "completed" while the CLI is
-    # saying it never ran the parse at all.
-    text = BUILD_PYTEST_NOISE + (
-        "Error: something went wrong while parsing your DAGs: no virtual "
-        "environment found — run 'astro dev start' first\n"
-    )
-    rc, result, *_ = _run(tmp_path, text)
-    assert rc == 2, "a build's pytest summary must not stand in for the integrity run"
-    assert result["checked"] == 0, "the build's collected count must not be reported"
-    assert "virtual environment" in result["cli_error"]
-
-
-def test_build_pytest_summary_cannot_pass_a_truncated_integrity_run(tmp_path):
-    truncated = (
-        "============================= test session starts ==============================\n"
-        "collected 37 items\n\n"
-        ".astro/test_dag_integrity_default.py ......\n"
-    )
-    rc, result, *_ = _run(tmp_path, BUILD_PYTEST_NOISE + truncated)
-    assert rc == 2
-    assert result["checked"] == 0
-
-
-def test_no_tests_ran_is_not_a_pass(tmp_path):
-    # pytest exits 5 when it collects nothing, which the CLI wraps. Reporting
-    # "all 0 DAG file(s) import cleanly" over an untested project is the exact
-    # false green this level exists to prevent.
-    text = (
-        "Checking your DAGs for errors…\n"
-        "============================= test session starts ==============================\n"
-        "collected 0 items\n\n"
-        "==================== no tests ran in 0.12s ====================\n"
-        "Error: something went wrong while parsing your DAGs: "
-        "something went wrong while Pytesting your DAGs\n"
-    )
-    rc, result, *_ = _run(tmp_path, text)
-    assert rc == 2
-    assert "Pytesting" in result["cli_error"]
-
-
-def test_build_noise_does_not_hide_a_real_collection_error(tmp_path):
-    # The integrity session's own collection error must still win rc 5 even with a
-    # clean build-stage pytest run ahead of it in the stream.
-    rc, result, *_ = _run(tmp_path, BUILD_PYTEST_NOISE + COLLECTION_ERROR_RUN)
-    assert rc == 5
-    assert "DagBag.__init__()" in result["collection_error"]
-
-
-def test_counted_failures_we_cannot_name_are_not_a_pass(tmp_path):
-    # pytest counted a failure that no test_file_imports[...] entry accounts for
-    # (an unexpected harness shape). We can't name what broke, so the only honest
-    # answers are "no verdict" or a fabricated one — take the former.
-    text = (
-        "Checking your DAGs for errors…\n"
-        "============================= test session starts ==============================\n"
-        "collected 1 item\n\n"
-        "tests/test_something_else.py F                                           [100%]\n"
-        "=========================== 1 failed in 1.93s ===========================\n"
-    )
-    rc, result, *_ = _run(tmp_path, text)
-    assert rc == 2
-    assert result["checked"] == 0
-
-
-def test_build_noise_does_not_inflate_a_real_pass(tmp_path):
-    # The complement: with a genuine integrity run after the build noise, the
-    # count must come from the integrity session (21), not the build's (4).
-    rc, result, *_ = _run(tmp_path, BUILD_PYTEST_NOISE + CLEAN_RUN)
-    assert rc == 0
-    assert result["checked"] == 21
-
-
-def test_long_run_summary_with_hms_suffix_is_recognized(tmp_path):
-    # pytest switches the summary duration format at 60s: "in 62.50s (0:01:02)".
-    # Missing that form silently disabled parse-level verdicts for any project
-    # whose in-image suite runs over a minute.
-    text = FAILING_RUN.replace("in 17.71s", "in 62.50s (0:01:02)")
-    rc, result, *_ = _run(tmp_path, text)
-    assert rc == 3
-    assert result["failures"][0]["path"] == "dags/format_probe.py"
-
-
-def test_timeout_truncated_run_is_not_a_verdict(tmp_path):
-    # A `timeout` kill mid-pytest leaves "collected N items" and progress dots
-    # but no closing summary. That must never read as a pass — it's what a
-    # green "all N import cleanly" over untested DAGs looks like.
-    truncated = (
-        "Checking your DAGs for errors…\n"
-        "============================= test session starts ==============================\n"
-        "collected 37 items\n\n"
-        ".astro/test_dag_integrity_default.py ...........\n"
-    )
-    rc, result, *_ = _run(tmp_path, truncated)
-    assert rc == 2
-
-
-def test_failed_line_without_e_block_still_reported(tmp_path):
-    # If pytest output formatting changes and the E-block regex misses, the
-    # short-summary FAILED line must still produce an entry (fail-closed).
-    text = (
-        "collected 3 items\n"
-        "FAILED .astro/test_dag_integrity_default.py::test_file_imports[dags/x.py]\n"
-        "=== 1 failed, 2 passed in 1.00s ===\n"
-    )
-    rc, result, *_ = _run(tmp_path, text)
-    assert rc == 3
-    (failure,) = result["failures"]
-    assert failure["path"] == "dags/x.py"
-    assert "see the CI log" in failure["msg"]
+    assert result["failures"][0]["path"] == "dags/b.py"
 
 
 def test_main_writes_import_json(tmp_path, monkeypatch):
     log = tmp_path / "parse.log"
-    log.write_text(FAILING_RUN)
-    out = tmp_path / "failures.json"
+    log.write_text(_payload())
+    out = tmp_path / "out.json"
     monkeypatch.setenv("IMPORT_JSON", str(out))
-    monkeypatch.setattr("sys.argv", ["parse_check.py", str(log)])
-    assert parse_check.main() == 3
-    data = json.loads(out.read_text())
-    assert data["failures"][0]["path"] == "dags/format_probe.py"
+    monkeypatch.setattr(sys, "argv", ["parse_check.py", str(log)])
+    assert parse_check.main() == 0
+    assert json.loads(out.read_text()) == {"checked": 1, "failures": []}
 
 
-# Astro CLI 1.4x: ANSI-coloured pytest output and "Dags" spelling.
-COLOURED_CLEAN_RUN = (
-    "Checking your Dags for errors…\n"
-    "\x1b[1m============================= test session starts ==============================\x1b[0m\n"
-    "collected 181 items\n\n"
-    ".astro/test_dag_integrity_default.py \x1b[32m.\x1b[0m\x1b[32m.\x1b[0m\x1b[32m    [100%]\x1b[0m\n\n"
-    "\x1b[32m=== \x1b[1m181 passed\x1b[0m\x1b[32m in 19.77s\x1b[0m\x1b[32m ===\x1b[0m\n"
-    "✔ No errors detected in your Dags\n"
-)
+def test_result_line_inside_a_build_step_is_not_the_verdict():
+    text = "#12 1.204 " + _payload()
+    assert parse_check.parse_output(text)[0] == 2
 
 
-def test_coloured_summary_and_dags_spelling_is_clean():
-    assert parse_check.parse_output(COLOURED_CLEAN_RUN) == (0, {"checked": 181, "failures": []})
+def test_failed_build_outranks_a_result_line():
+    # A Dockerfile step that ran pytest printed a result, then the build failed:
+    # no integrity run happened inside a built image.
+    text = _payload() + BUILD_FAILURE_RUN
+    assert parse_check.parse_output(text)[0] == 4
 
 
-def test_coloured_summary_alone_is_clean():
-    text = COLOURED_CLEAN_RUN.replace("✔ No errors detected in your Dags\n", "")
-    assert parse_check.parse_output(text)[0] == 0
+def test_session_shorter_than_its_collection_is_no_verdict():
+    rc, result = parse_check.parse_output(_payload(collected=3, ran=1))
+    assert rc == 2
+    assert "stopped after 1 of 3" in result["reason"]
 
 
-def test_dags_spelling_alone_is_clean():
-    text = "collected 181 items\n✔ No errors detected in your Dags\n"
-    assert parse_check.parse_output(text) == (0, {"checked": 181, "failures": []})
+def test_collection_error_next_to_passing_results_is_not_a_pass():
+    text = _payload(collect_errors=[{"nodeid": "x", "msg": "ImportError: boom"}], exitstatus=1)
+    assert parse_check.parse_output(text)[0] == 5
+
+
+def test_only_the_runs_own_nonce_counts():
+    # A line from a pytest step in the image build carries no (or another) nonce.
+    assert parse_check.parse_output(_payload(nonce=""), nonce="n1")[0] == 2
+    stale_then_real = _payload(nonce="n1") + _payload(nonce="other")
+    assert parse_check.parse_output(stale_then_real, nonce="n1")[0] == 0
+
+
+def test_session_stopped_early_is_no_verdict_even_with_failures():
+    # Its failures could match the baseline's while unreached files go unchecked.
+    text = _payload(exitstatus=1, collected=3, ran=1, results=[
+        {"id": "dags/a.py", "outcome": "failed", "msg": "KeyError: 'x'"}])
+    assert parse_check.parse_output(text)[0] == 2
+
+
+def test_unparseable_last_line_does_not_hide_the_real_result():
+    assert parse_check.parse_output(_payload() + parse_check.SENTINEL + '{"trunc')[0] == 0
+
+
+OLD_TEMPLATE_TEST = """\
+import pytest
+
+@pytest.mark.parametrize("rel_path, rv", [(None, None)] + {errors!r}, ids=["placeholder"] + {ids!r})
+def test_file_imports(rel_path, rv):
+    if rel_path and rv:
+        raise Exception(f"{{rel_path}} failed to import with message \\n {{rv}}")
+"""
+
+
+def test_older_templates_placeholder_is_not_a_checked_file(tmp_path):
+    layout_project(tmp_path, {})
+    (tmp_path / ".astro" / "test_dag_integrity_default.py").write_text(
+        OLD_TEMPLATE_TEST.format(errors=[], ids=[]))
+    rc, result = parse_check.parse_output(_pytest(tmp_path))
+    assert rc == 2
+    assert "tested no DAG files" in result["reason"]
+
+
+def test_several_tests_per_file_is_a_complete_session(tmp_path):
+    # A customised template testing each file twice: results are per file,
+    # the completeness check is per test.
+    layout_project(tmp_path, {})
+    (tmp_path / ".astro" / "test_dag_integrity_default.py").write_text(textwrap.dedent("""\
+        import pytest
+
+        FILES = ["dags/a.py", "dags/b.py"]
+
+        @pytest.mark.parametrize("rel_path", FILES, ids=FILES)
+        def test_file_imports(rel_path):
+            assert rel_path != "dags/b.py", "b is broken"
+
+        @pytest.mark.parametrize("rel_path", FILES, ids=FILES)
+        def test_dag_tags(rel_path):
+            pass
+    """))
+    rc, result = parse_check.parse_output(_pytest(tmp_path))
+    assert rc == 3
+    assert [f["path"] for f in result["failures"]] == ["dags/b.py"]
+
+
+def test_collection_error_keeps_its_cause_when_nothing_ran():
+    text = _payload(results=[], collected=2, ran=0,
+                    collect_errors=[{"nodeid": "x", "msg": "TypeError: DagBag.__init__() boom"}])
+    rc, result = parse_check.parse_output(text)
+    assert rc == 5
+    assert result["collection_error"].startswith("TypeError")

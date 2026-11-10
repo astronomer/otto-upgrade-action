@@ -95,6 +95,9 @@ outputs:
   verify-status:
     description: "Verification result: passed, failed, or skipped (skipped when verification didn't run)."
     value: ${{ steps.verify.outputs.status || 'skipped' }}
+  effective-verify-level:
+    description: "The level the verification verdict actually came from: parse, import, syntax, or none. Lower than verify-level when the requested check could not run and a fallback produced the result (the PR then leads with a warning)."
+    value: ${{ steps.verify.outputs.effective-level || 'none' }}
   security-fixes:
     description: "Count of security fixes listed in the Runtime release notes for the target's release line — a lower bound for cross-line upgrades. 'unknown' when it couldn't be determined, empty when the runtime didn't change."
     value: ${{ steps.security.outputs.security-fixes }}
@@ -119,6 +122,15 @@ runs:
       run: |
         set -euo pipefail
         mkdir -p /tmp/otto-upgrade
+        # Snapshot the project before this run changes anything, so the
+        # verifier's baseline and the PR commit agree on what the run did
+        # (run_changes.py). Exit 2 means no git work tree, so nothing to snapshot.
+        rm -f /tmp/otto-upgrade/pre-tree
+        snap_rc=0
+        python3 "$GITHUB_ACTION_PATH/scripts/run_changes.py" snapshot "$PROJECT_PATH" /tmp/otto-upgrade || snap_rc=$?
+        if [[ "$snap_rc" -ne 0 && "$snap_rc" -ne 2 ]]; then
+          echo "::warning::Could not snapshot the project before the upgrade; the PR commit and the verification baseline will treat everything that differs from HEAD (including files your workflow wrote before this action) as part of the upgrade."
+        fi
         python3 "$GITHUB_ACTION_PATH/scripts/detect_versions.py" > /tmp/otto-upgrade/current.json
         echo "::group::Detected versions"
         cat /tmp/otto-upgrade/current.json
@@ -389,6 +401,8 @@ runs:
         OTTO_FILE: /tmp/otto-upgrade/result.json
         VERIFY_FILE: /tmp/otto-upgrade/verify-report.md
         VERIFY_STATUS_FILE: /tmp/otto-upgrade/verify-status.txt
+        VERIFY_EFFECTIVE_FILE: /tmp/otto-upgrade/verify-effective-level.txt
+        VERIFY_LEVEL: ${{ inputs.verify-level }}
         SECURITY_FILE: /tmp/otto-upgrade/security.json
         DEPRECATION_FILE: /tmp/otto-upgrade/deprecations.json
         ACTION_PATH: ${{ github.action_path }}

@@ -44,15 +44,20 @@ RELEASE_NOTES_URL = os.environ.get(
     "https://www.astronomer.io/docs/runtime/runtime-release-notes.md",
 )
 
-# The docs site has published each build two ways: legacy markdown headings
-# (`## Astro Runtime 3.3-2`) and, since the docs-platform migration, an MDX
-# component (`<Update label="Astro Runtime 3.3-7" description="...">`). Match
-# both — only the second is live today, but the pre-migration archive pages
-# still carry headings, and a page can be mid-migration.
+# A build entry is a line holding nothing but "Astro Runtime <tag>", whatever
+# markup wraps it. The docs site has restyled that line three times: markdown
+# headings (`## Astro Runtime 3.3-2`), an MDX component
+# (`<Update label="Astro Runtime 3.3-7" ...>`), and bold paragraphs
+# (`**Astro Runtime 3.3-12**`, live since 2026-11). Anchoring on the tag rather
+# than on one decoration keeps the next restyle from silently zeroing the
+# section. Prose that merely mentions a build ("See Astro Runtime 3.3-12
+# provider packages") never stands alone on its line, so it can't match.
 _BUILD_HEADING = re.compile(
     r"""^[ \t]*(?:
-          \#\#[ \t]+Astro[ \t]+Runtime[ \t]+(?P<heading_tag>[A-Za-z0-9.\-]+)[ \t]*$
-        | <Update\b[^>]*?\blabel="Astro[ \t]+Runtime[ \t]+(?P<mdx_tag>[A-Za-z0-9.\-]+)"
+          (?:\#{1,6}[ \t]+)?(?P<em>\*\*|__|\*|_)?
+          Astro[ \t]+Runtime[ \t]+(?P<heading_tag>[0-9][A-Za-z0-9.\-]*?)
+          (?P=em)?[ \t]*$
+        | <Update\b[^>]*?\blabel="Astro[ \t]+Runtime[ \t]+(?P<mdx_tag>[0-9][A-Za-z0-9.\-]*)"
         )""",
     re.M | re.X,
 )
@@ -60,6 +65,7 @@ _BUILD_HEADING = re.compile(
 _SECURITY_HEADING = re.compile(r"^[ \t]*###\s+Security fixes\s*$", re.M | re.I)
 _HEADING_LINE = re.compile(r"^[ \t]*#{1,6}\s.*$", re.M)
 _BULLET = re.compile(r"^\s*[*+-]\s+(?P<text>\S.*)$")
+_SCOPE = re.compile(r"^\s*\((?P<scope>[^)]*\bimages?\b[^)]*)\)", re.I)
 _LINK = re.compile(r"\[(?P<id>[^\]]+)\]\((?P<url>[^)\s]+)(?:\s+\"[^\"]*\")?\)")
 
 
@@ -194,7 +200,13 @@ def _security_entries(body: str) -> list[dict] | None:
         text = bullet.group("text")
         link = _LINK.search(text)
         if link:
-            entries.append({"id": link.group("id"), "url": link.group("url")})
+            entry = {"id": link.group("id"), "url": link.group("url")}
+            # A trailing "(Python 3.13 image)" / "(Debian images)" scopes the
+            # fix to some images only; dropping it would credit every image.
+            scope = _SCOPE.search(text[link.end():])
+            if scope:
+                entry["scope"] = scope.group("scope").strip()
+            entries.append(entry)
         else:
             entries.append({"id": re.sub(r"^Fixed\s+", "", text).strip(), "url": None})
     if not entries and section.strip():
@@ -212,10 +224,10 @@ def collect(page: str, current: str, target: str) -> dict:
     builds = _parse_builds(page)
     if not builds:
         report.update(status="shape-mismatch",
-                      reason="no Astro Runtime build entries found (neither "
-                             "'## Astro Runtime <tag>' headings nor "
-                             "'<Update label=\"Astro Runtime ...\">' blocks); "
-                             "the release-notes page format may have changed")
+                      reason="no Astro Runtime build entries found (no line "
+                             "reading 'Astro Runtime <tag>' as a heading, bold "
+                             "paragraph, or <Update> label); the release-notes "
+                             "page format may have changed")
         return report
     if target not in {tag for tag, _ in builds}:
         report.update(status="shape-mismatch",
@@ -250,8 +262,16 @@ def collect(page: str, current: str, target: str) -> dict:
     for tag in crossed:
         for entry in parsed[tag]:
             fix = fixes.setdefault(
-                entry["id"], {"id": entry["id"], "url": entry["url"], "builds": []})
+                entry["id"], {"id": entry["id"], "url": entry["url"], "builds": [],
+                              "_scopes": []})
             fix["builds"].append(tag)
+            fix["_scopes"].append(entry.get("scope"))
+    for fix in fixes.values():
+        # Scoped only when EVERY crossing build scoped it: one unscoped
+        # occurrence means some build fixed it for all images.
+        scopes = fix.pop("_scopes")
+        if all(scopes):
+            fix["scope"] = "; ".join(dict.fromkeys(scopes))
     # Cross-line upgrades under-claim by design (fixes the target line
     # inherited at its fork point are not enumerable from per-line notes) —
     # the count is a lower bound and consumers must present it as one.

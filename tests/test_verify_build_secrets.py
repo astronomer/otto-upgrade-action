@@ -136,9 +136,8 @@ def test_spec_lines_are_trimmed(tmp_path):
 
 @pytest.mark.parametrize("key", ["src", "source"])
 def test_relative_src_resolved_against_project_root(tmp_path, key):
-    # The target build (rsync copy, has gitignored files) and baseline build
-    # (clean worktree, committed files only) run from different directories; a
-    # relative path must be pinned so both read the identical file.
+    # The builds run from copies in other directories; a relative path must be
+    # pinned to the project so both read the identical file.
     project = tmp_path / "proj"
     project.mkdir()
     (project / ".netrc").write_text("machine github.com\n")

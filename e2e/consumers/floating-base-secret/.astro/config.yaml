@@ -1,0 +1,4 @@
+project:
+    name: floating-base-secret
+dev:
+    build_secrets: id=netrc,env=NETRC_CONTENT

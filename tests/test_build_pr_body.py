@@ -5,6 +5,7 @@ import io
 import json
 
 import build_pr_body as bpb
+import pytest
 
 
 def _render(tmp_path, monkeypatch, plan, apply, otto=None, verify=None, verify_status=None,
@@ -436,3 +437,42 @@ def test_no_unused_imports_means_no_left_in_place_block(tmp_path, monkeypatch):
     monkeypatch.setenv("DEPRECATION_FILE", str(dep_f))
     out = _render(tmp_path, monkeypatch, _SEC_PLAN, {"files": []})
     assert "left in place" not in out and "left deliberately" not in out
+
+
+_PASSING_PLAN = {"overall_tier": "patch", "needs_migration": False, "scope_exceeded": False,
+                 "advisory": "", "runtime": {"current_tag": "3.3-10", "target_tag": "3.3-12",
+                                             "tier": "patch", "current_airflow": "3.3.2",
+                                             "target_airflow": "3.3.2"}, "providers": []}
+
+
+def _render_levels(tmp_path, monkeypatch, requested, effective):
+    eff = tmp_path / "verify-effective-level.txt"
+    eff.write_text(effective + "\n")
+    monkeypatch.setenv("VERIFY_EFFECTIVE_FILE", str(eff))
+    monkeypatch.setenv("VERIFY_LEVEL", requested)
+    return _render(tmp_path, monkeypatch, _PASSING_PLAN, {"files": []},
+                   verify="✅ All 2 DAG file(s) import cleanly at the target version.",
+                   verify_status="passed")
+
+
+def test_pass_from_a_fallback_level_leads_with_a_warning(tmp_path, monkeypatch):
+    # The shape that hid a passing image parse behind an import-level pass.
+    out = _render_levels(tmp_path, monkeypatch, "parse", "import")
+    assert "> [!WARNING]" in out
+    assert "Verified at `import` level, not `parse`" in out
+
+
+@pytest.mark.parametrize("requested, effective", [("parse", "parse"), ("import", "import"),
+                                                  ("syntax", "syntax")])
+def test_pass_at_the_requested_level_has_no_banner(tmp_path, monkeypatch, requested, effective):
+    out = _render_levels(tmp_path, monkeypatch, requested, effective)
+    assert "[!WARNING]" not in out and "[!CAUTION]" not in out
+
+
+def test_image_scoped_security_fix_says_which_images(tmp_path, monkeypatch):
+    security = {"checked": True, "status": "ok", "current": "3.3-11", "target": "3.3-12",
+                "crossed": ["3.3-12"], "lower_bound": False, "total": 1,
+                "fixes": [{"id": "CVE-2026-12345", "url": "https://x", "builds": ["3.3-12"],
+                           "scope": "Python 3.13 image"}]}
+    out = _render(tmp_path, monkeypatch, _PASSING_PLAN, {"files": []}, security=security)
+    assert "(fixed in `3.3-12`, Python 3.13 image only)" in out

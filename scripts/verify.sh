@@ -23,7 +23,11 @@
 #   BUILD_SECRETS docker build --secret spec(s) for the parse-level image
 #                 builds, one per line (e.g. id=netrc,env=NETRC_CONTENT)
 #
-# Writes $WORKDIR/{verify-report.md,verify-status.txt} and a `status` step output.
+# Writes $WORKDIR/{verify-report.md,verify-status.txt,verify-effective-level.txt}
+# and `status` + `effective-level` step outputs. The effective level is the
+# level the verdict actually came from (parse, import, syntax, or none), which
+# is lower than VERIFY_LEVEL whenever a level couldn't run and the check fell
+# back; the PR leads with a warning when that happens.
 
 set -euo pipefail
 
@@ -34,8 +38,7 @@ VERIFY_LEVEL="${VERIFY_LEVEL:-import}"
 WORKDIR="${WORKDIR:-/tmp/otto-upgrade}"
 mkdir -p "$WORKDIR"
 
-# Keep byte-compilation artifacts out of the project tree so open-pr.sh's
-# `git add -A` can't sweep __pycache__/*.pyc into the upgrade PR.
+# Keep byte-compilation artifacts out of the project tree.
 export PYTHONPYCACHEPREFIX="$WORKDIR/pycache"
 
 # `env -u` args stripping the env vars named by BUILD_SECRETS specs from the
@@ -51,8 +54,8 @@ done < <(python3 "$ACTION_PATH/scripts/build_secret_env_names.py")
 
 report="$WORKDIR/verify-report.md"
 status="skipped"
+effective="none"
 
-worktree_top=""
 fallback_note=""
 # Invoked indirectly via `trap ... EXIT` below; shellcheck can't see that, so it
 # flags the function as never-invoked (SC2329, v0.11+) and its body as
@@ -65,30 +68,52 @@ emit() {
     { echo "$fallback_note"; echo; cat "$report"; } > "$report.tmp" && mv "$report.tmp" "$report"
   fi
   echo "$status" > "$WORKDIR/verify-status.txt"
-  if [[ -n "${GITHUB_OUTPUT:-}" ]]; then echo "status=$status" >> "$GITHUB_OUTPUT"; fi
-  if [[ -n "$worktree_top" && -d "$WORKDIR/baseline" ]]; then
-    git -C "$worktree_top" worktree remove --force "$WORKDIR/baseline" 2>/dev/null || true
-    rm -rf "$WORKDIR/baseline"
+  echo "$effective" > "$WORKDIR/verify-effective-level.txt"
+  if [[ -n "${GITHUB_OUTPUT:-}" ]]; then
+    { echo "status=$status"; echo "effective-level=$effective"; } >> "$GITHUB_OUTPUT"
   fi
+  rm -rf "$WORKDIR/baseline" "$WORKDIR/baseline-repo"
 }
 trap emit EXIT
 
-# Create the pre-upgrade worktree (HEAD = before apply_bump/Otto, since verify
-# runs before open-pr.sh commits). Sets baseline_dir + worktree_top on success.
+# Both sides of the comparison start as the same working-tree copy, so a file
+# the workflow wrote before the action (a gitignored .env the DAGs read) exists
+# on both. Otherwise an env-dependent DAG fails at the baseline for lack of
+# .env, and an upgrade-only failure in it reads as pre-existing.
+# Symlinks that point outside the tree are copied as the files they point to:
+# relative to the copy they'd dangle, and appending to one (the nonce in .env,
+# the reporter in .astro/conftest.py) would write through to the real file.
+copy_tree() {  # <src> <dest>
+  rm -rf "$2" && mkdir -p "$2" && rsync -a --copy-unsafe-links --exclude .git "$1/" "$2/"
+}
 baseline_dir=""
-make_baseline_worktree() {
-  local toplevel prefix
-  toplevel=$(git -C "$PROJECT_PATH" rev-parse --show-toplevel 2>/dev/null) || return 1
-  prefix=$(git -C "$PROJECT_PATH" rev-parse --show-prefix 2>/dev/null)
-  # A stale registration from a hard-killed prior run (self-hosted WORKDIR
-  # reuse) would fail the add and needlessly degrade to strict mode.
-  git -C "$toplevel" worktree prune 2>/dev/null || true
-  rm -rf "$WORKDIR/baseline"
-  git -C "$toplevel" worktree add --detach "$WORKDIR/baseline" HEAD >/dev/null 2>&1 || return 1
-  worktree_top="$toplevel"
-  baseline_dir="$WORKDIR/baseline/${prefix%/}"
-  baseline_dir="${baseline_dir%/}"
-  return 0
+# The target copy minus this run's edits (run_changes.py).
+make_baseline_copy() {
+  baseline_dir="$WORKDIR/baseline"
+  copy_tree "$PROJECT_PATH" "$baseline_dir" &&
+    python3 "$ACTION_PATH/scripts/run_changes.py" revert "$PROJECT_PATH" "$WORKDIR" "$baseline_dir"
+}
+# The import check runs the target in place, where paths above the project
+# resolve (a DAG adding ../shared to sys.path, `-r ../common.txt`), so its
+# baseline mirrors the whole work tree the same way, with the project's copy
+# inside it reverted.
+make_import_baseline() {
+  local top prefix
+  prefix=$(git -C "$PROJECT_PATH" rev-parse --show-prefix 2>/dev/null) || return 1
+  if [[ -z "$prefix" ]]; then make_baseline_copy; return; fi
+  top=$(git -C "$PROJECT_PATH" rev-parse --show-toplevel) || return 1
+  # Outside the project: what git sees (tracked and untracked, not ignored), so
+  # a monorepo's node_modules or .venv isn't copied. The project itself is
+  # copied whole, as for the target.
+  rm -rf "$WORKDIR/baseline-repo" && mkdir -p "$WORKDIR/baseline-repo" || return 1
+  (cd "$top" && git ls-files -z --cached --others --exclude-standard \
+    | python3 -c 'import os, sys; skip = sys.argv[1].encode()
+sys.stdout.buffer.write(b"".join(p + b"\0" for p in sys.stdin.buffer.read().split(b"\0")
+                                 if p and not p.startswith(skip) and os.path.lexists(p)))' "$prefix" \
+    | tar --null -T - -cf -) | tar -xf - -C "$WORKDIR/baseline-repo" || return 1
+  baseline_dir="$WORKDIR/baseline-repo/${prefix%/}"
+  copy_tree "$PROJECT_PATH" "$baseline_dir" &&
+    python3 "$ACTION_PATH/scripts/run_changes.py" revert "$PROJECT_PATH" "$WORKDIR" "$baseline_dir"
 }
 
 # Collect the source roots that exist.
@@ -103,6 +128,7 @@ if [[ ${#roots[@]} -eq 0 ]]; then
   exit 0
 fi
 
+# Every verdict below has at least passed the syntax check.
 if [[ "$VERIFY_LEVEL" == "none" ]]; then
   status="skipped"
   echo "ℹ️ Verification disabled (\`verify-level: none\`)." > "$report"
@@ -121,6 +147,7 @@ while IFS= read -r -d '' f; do
   fi
 done < <(find "${roots[@]}" -name '*.py' ! -name '.*' -print0)
 
+effective="syntax"
 if [[ "$syntax_fail" -gt 0 ]]; then
   status="failed"
   { echo "❌ $syntax_fail file(s) failed to byte-compile:"; echo; echo "$syntax_errs"; } > "$report"
@@ -195,14 +222,11 @@ detect_parse_mode() {
         line="${line#"${line%%[![:space:]]*}"}"
         line="${line%"${line##*[![:space:]]}"}"
         [[ -z "$line" ]] && continue
-        # Resolve relative src= paths against the project root NOW. The two
-        # builds run from different directories — the target from an rsync
-        # copy (which has gitignored files), the baseline from a clean git
-        # worktree (which doesn't) — so a cwd-relative gitignored secret file
-        # would build one side and not the other, and that asymmetry could
-        # demote a genuine target-only regression to 'skipped'. Pinning the
-        # path makes both builds read the identical file. A `type=env` spec's
-        # src names an env var, not a file — leave those verbatim.
+        # Resolve relative src= paths against the project root NOW: the builds
+        # run from copies in other directories, and a path relative to the
+        # project (including one above it, ../netrc) must still name the same
+        # file for both. A `type=env` spec's src names an env var, not a
+        # file — leave those verbatim.
         case ",$line," in
           *,type=env,*) ;;
           *)
@@ -238,9 +262,7 @@ detect_parse_mode() {
 # Env vars named by BUILD_SECRETS specs intentionally pass through — supplying
 # them is the user's explicit opt-in to expose those to their own Dockerfile
 # (which is why the docs forbid reusing the four names stripped here).
-# NO_COLOR/PY_COLORS: a runner exporting FORCE_COLOR would make the in-image
-# pytest emit ANSI codes that defeat parse_check's line-anchored patterns —
-# the one path where scraping could mis-read a completed run.
+# NO_COLOR/PY_COLORS keep the log readable; the verdict doesn't depend on them.
 run_parse() {
   ( cd "$1" &&
     env -u ASTRO_TOKEN -u ASTRO_API_TOKEN -u GH_TOKEN -u GITHUB_TOKEN \
@@ -265,6 +287,34 @@ shim_integrity_test() {
   fi
 }
 
+# Make a throwaway project copy ready for `astro dev parse`, and install the
+# result reporter (parse_probe/conftest.py) next to the integrity test. $2 is
+# the Airflow version that copy builds at. Fills in the scaffolding a project
+# made without `astro dev init` lacks: without it the CLI refuses the directory
+# ("not an Astro project") or exits 0 having run nothing (no integrity test).
+prepare_parse_dir() {
+  local dir="$1" af_major="${2%%.*}" astro_dir="$1/.astro"
+  mkdir -p "$astro_dir"
+  if [[ ! -f "$astro_dir/config.yaml" ]]; then
+    printf 'project:\n    name: otto-verify\n' > "$astro_dir/config.yaml"
+  fi
+  [[ -e "$dir/packages.txt" ]] || : > "$dir/packages.txt"
+  [[ -e "$dir/requirements.txt" ]] || : > "$dir/requirements.txt"
+  if [[ ! -f "$astro_dir/test_dag_integrity_default.py" ]]; then
+    [[ "$af_major" == "2" ]] || af_major=3
+    cp "$ACTION_PATH/scripts/parse_probe/dag_integrity_default_af${af_major}.py" \
+      "$astro_dir/test_dag_integrity_default.py"
+  fi
+  shim_integrity_test "$dir"
+  # Appended, so a conftest the project already has keeps loading as itself.
+  # The leading newline guards a project file without a trailing one.
+  { echo; cat "$ACTION_PATH/scripts/parse_probe/conftest.py"; } >> "$astro_dir/conftest.py"
+  # The CLI hands .env to the integrity container only (never to the image
+  # build), so a result line carrying this nonce came from that run.
+  [[ ! -s "$dir/.env" || -z "$(tail -c1 "$dir/.env")" ]] || echo >> "$dir/.env"
+  echo "OTTO_PARSE_NONCE=$parse_nonce" >> "$dir/.env"
+}
+
 # The whole image-level flow. Every genuine verdict (pass, new failures, image
 # build failure) sets status/report and exits the script. A harness-level miss
 # — no Astro CLI or Docker, the integrity test incompatible with the target,
@@ -284,26 +334,27 @@ verify_parse_level() {
   fi
 
   detect_parse_mode
+  parse_nonce=$(python3 -c 'import secrets; print(secrets.token_hex(12))')
 
   tgt_tag=$(jq -r '.runtime.target_tag // empty' "$PLAN_FILE")
 
   # Parse runs on a COPY: the build and any astro-generated files must never
   # dirty the tree open-pr.sh commits.
   parse_target_dir="$WORKDIR/parse-target"
-  rm -rf "$parse_target_dir"
-  mkdir -p "$parse_target_dir"
-  if ! rsync -a --exclude .git "$PROJECT_PATH/" "$parse_target_dir/"; then
+  if ! copy_tree "$PROJECT_PATH" "$parse_target_dir"; then
     fallback_note="ℹ️ Image-level verification could not run (the project copy failed). Results below come from the import-level fallback."
     echo "::warning::verify-level parse: project copy failed; falling back to import-level verification."
     return 1
   fi
-  shim_integrity_test "$parse_target_dir"
+  prepare_parse_dir "$parse_target_dir" \
+    "$(jq -r '.runtime.target_airflow // .runtime.current_airflow // empty' "$PLAN_FILE")"
 
   echo "::group::Image parse (target Runtime ${tgt_tag:-per project Dockerfile})"
+  rm -f "$WORKDIR/import-failures.json"
   set +e
   run_parse "$parse_target_dir" "$WORKDIR/parse-target.log"
   target_run_rc=$?
-  IMPORT_JSON="$WORKDIR/import-failures.json" \
+  IMPORT_JSON="$WORKDIR/import-failures.json" OTTO_PARSE_NONCE="$parse_nonce" \
     python3 "$ACTION_PATH/scripts/parse_check.py" "$WORKDIR/parse-target.log"
   target_rc=$?
   set -e
@@ -329,20 +380,26 @@ verify_parse_level() {
     fallback_note="ℹ️ Image-level verification could not run: the project's \`.astro/test_dag_integrity_default.py\` fails to start at the target Airflow${cause:+ (\`${cause}\`)}. Regenerate it with an updated Astro CLI (\`astro dev init\`). Results below come from the import-level fallback."
     echo "::warning::verify-level parse: the project's DAG integrity test is incompatible with the target Airflow; falling back to import-level verification."
     return 1
-  elif [[ "$target_rc" -eq 2 ]]; then
+  elif [[ "$target_rc" -ne 0 && "$target_rc" -ne 3 && "$target_rc" -ne 4 ]]; then
+    # 2 = no verdict; anything else is parse_check itself failing, which is no
+    # verdict either, never a code defect in the project.
     # The CLI usually states exactly why it refused (a project configured for
     # standalone dev mode, a venv without pytest, …). Its words beat the
     # catch-all: "produced no recognizable result" is what made a field case take
     # a full log dig to explain. Timeouts already returned above.
     local reason="produced no recognizable result"
-    local cli_error=""
+    local cli_error="" why=""
     cli_error=$(jq -r '.cli_error // empty' "$WORKDIR/import-failures.json" 2>/dev/null || true)
-    if [[ -n "$cli_error" ]]; then reason="failed: ${cli_error}"; fi
+    why=$(jq -r '.reason // empty' "$WORKDIR/import-failures.json" 2>/dev/null || true)
+    if [[ -n "$cli_error" ]]; then reason="failed: ${cli_error}"
+    elif [[ -n "$why" ]]; then reason="produced no verdict: ${why}"; fi
     fallback_note="ℹ️ Image-level verification could not run (\`astro dev parse\` ${reason}). Results below come from the import-level fallback."
     echo "::warning::verify-level parse: astro dev parse ${reason}; falling back to import-level verification."
     return 1
   fi
 
+  # From here on every outcome is a verdict from inside the image.
+  effective="parse"
   if [[ "$target_rc" -eq 0 ]]; then
     status="passed"
     checked=$(jq -r '.checked' "$WORKDIR/import-failures.json")
@@ -352,14 +409,14 @@ verify_parse_level() {
 
   # Baseline: the same parse at the pre-upgrade state (current image + pins).
   set +e
-  make_baseline_worktree
+  make_baseline_copy
   baseline_made=$?
   baseline_rc=""
   if [[ "$baseline_made" -eq 0 ]]; then
-    shim_integrity_test "$baseline_dir"
+    prepare_parse_dir "$baseline_dir" "$(jq -r '.runtime.current_airflow // empty' "$PLAN_FILE")"
     echo "::group::Image parse (baseline: current Runtime)"
     run_parse "$baseline_dir" "$WORKDIR/parse-baseline.log"
-    IMPORT_JSON="$WORKDIR/baseline-failures.json" \
+    IMPORT_JSON="$WORKDIR/baseline-failures.json" OTTO_PARSE_NONCE="$parse_nonce" \
       python3 "$ACTION_PATH/scripts/parse_check.py" "$WORKDIR/parse-baseline.log"
     baseline_rc=$?
     tail -n 20 "$WORKDIR/parse-baseline.log"
@@ -384,6 +441,7 @@ verify_parse_level() {
         printf '%s\n' "$build_excerpt"
         echo '```'
       } > "$report"
+      effective="syntax"  # no image-level verdict exists
       echo "::warning::Verification skipped: neither the current nor the target image builds."
     elif [[ "$baseline_rc" == "0" || "$baseline_rc" == "3" || "$baseline_rc" == "5" ]]; then
       # 0/3/5 all mean the current image BUILT (5 = built, then the integrity
@@ -398,7 +456,7 @@ verify_parse_level() {
         echo '```'
       } > "$report"
     else
-      # No baseline build verdict (worktree failed, baseline parse timed out
+      # No baseline build verdict (no baseline copy, baseline parse timed out
       # or was unrecognized). Fail closed, but never claim the current image
       # builds — we don't know.
       status="failed"
@@ -545,6 +603,7 @@ echo "::endgroup::"
 # Prefer the clean summary file; fall back to captured stdout if it's missing.
 clean_report() { if [[ -s "$import_report" ]]; then cat "$import_report"; else printf '%s\n' "$out"; fi; }
 
+if [[ "$rc" -eq 0 || "$rc" -eq 3 ]]; then effective="import"; fi
 if [[ "$rc" -eq 0 ]]; then
   status="passed"
   clean_report > "$report"
@@ -555,7 +614,7 @@ elif [[ "$rc" -eq 3 ]]; then
   # for the resolver's cutoff, a registry blip, etc. would red the run).
   #
   # Before failing the run, re-run the SAME check at the current (pre-upgrade)
-  # state — a git worktree at HEAD with the pre-bump requirements and the
+  # state — the baseline copy, with the pre-bump requirements and the
   # current Airflow. Failures present on both sides are pre-existing project
   # issues (field-verified: env-dependent dbt DAGs fail identically on both),
   # not upgrade breakage; only NEW failures fail verification.
@@ -570,8 +629,8 @@ elif [[ "$rc" -eq 3 ]]; then
       baseline_note="the current Airflow version is unknown"; return 1
     fi
     local bproj brc
-    make_baseline_worktree \
-      || { baseline_note="a baseline worktree could not be created"; return 1; }
+    make_import_baseline \
+      || { baseline_note="a baseline copy could not be created"; return 1; }
     bproj="$baseline_dir"
     local bargs=(--project-root "$bproj")
     [[ -d "$bproj/dags" ]] && bargs+=(--dags-root "$bproj/dags")

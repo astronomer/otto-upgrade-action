@@ -11,6 +11,8 @@ Env in:
   SECURITY_FILE     security_fixes.py output JSON   (optional)
   DEPRECATION_FILE  deprecation_cleanup.py JSON     (optional)
   ACTION_REF        action version, for the footer  (optional)
+  VERIFY_LEVEL      the requested verify-level      (optional)
+  VERIFY_EFFECTIVE_FILE  level the verdict came from (optional)
 Writes Markdown to stdout.
 """
 
@@ -22,6 +24,9 @@ import sys
 
 MARKER = "<!-- otto-upgrade-action -->"
 TIER_BADGE = {"patch": "🟢 patch", "minor": "🟡 minor", "major": "🔴 major", "none": "—"}
+# Verify levels, weakest first. A verdict from a lower level than requested
+# means a fallback ran, and the PR must say so up front.
+LEVEL_RANK = {"none": 0, "syntax": 1, "import": 2, "parse": 3}
 
 
 def _load(env_key: str):
@@ -34,22 +39,33 @@ def _load(env_key: str):
     return None
 
 
+def _read_text(env_key: str) -> str:
+    path = os.environ.get(env_key)
+    if path and os.path.isfile(path):
+        try:
+            return open(path).read().strip()
+        except OSError:
+            return ""
+    return ""
+
+
 def main() -> int:
     plan = json.load(open(os.environ["PLAN_FILE"]))
     otto = _load("OTTO_FILE")
-    verify_path = os.environ.get("VERIFY_FILE")
-    verify = open(verify_path).read().strip() if verify_path and os.path.isfile(verify_path) else ""
+    verify = _read_text("VERIFY_FILE")
     # The authoritative outcome comes from verify.sh's status file — several
     # skipped-path reports don't start with ℹ️, so sniffing the report emoji
     # misses them. The sniff remains only as a fallback for callers that don't
     # wire the status file.
-    status_path = os.environ.get("VERIFY_STATUS_FILE")
-    verify_status = (
-        open(status_path).read().strip()
-        if status_path and os.path.isfile(status_path) else ""
-    )
+    verify_status = _read_text("VERIFY_STATUS_FILE")
     if not verify_status and verify:
         verify_status = {"✅": "passed", "❌": "failed", "ℹ": "skipped"}.get(verify.lstrip()[:1], "")
+    requested = os.environ.get("VERIFY_LEVEL", "")
+    effective = _read_text("VERIFY_EFFECTIVE_FILE")
+    degraded = (
+        requested in LEVEL_RANK and effective in LEVEL_RANK
+        and LEVEL_RANK[effective] < LEVEL_RANK[requested]
+    )
 
     out: list[str] = [MARKER, "## Airflow upgrade", ""]
 
@@ -70,6 +86,16 @@ def main() -> int:
             "> **Verification did not run** — DAG imports at the target version were "
             "NOT checked. See the Verification section for why; review the changes "
             "manually, or fix the blocker and re-run.",
+            "",
+        ]
+    elif degraded:
+        # Passed, but at a weaker level than asked for: a fallback's pass must
+        # not read like the requested check's pass.
+        out += [
+            "> [!WARNING]",
+            f"> **Verified at `{effective}` level, not `{requested}`** — the "
+            f"`{requested}` check could not run, so this result comes from a "
+            "weaker fallback. See the Verification section for why.",
             "",
         ]
 
@@ -175,7 +201,8 @@ def main() -> int:
                 label = (f"[{fix['id']}]({fix['url']})"
                          if fix.get("id") and fix.get("url") else fix.get("id", "?"))
                 via = ", ".join(f"`{b}`" for b in fix.get("builds", []))
-                out.append(f"- {label}" + (f" (fixed in {via})" if via else ""))
+                scope = f", {fix['scope']} only" if fix.get("scope") else ""
+                out.append(f"- {label}" + (f" (fixed in {via}{scope})" if via else ""))
             if lower:
                 out += ["",
                         "_The new release line may also include fixes inherited "

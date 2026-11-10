@@ -10,6 +10,11 @@ on:
       - 'scripts/**'
       - 'e2e/**'
       - '.github/workflows/e2e-otto-upgrade.yaml'
+  # Daily, ahead of consumers' weekly runs: the consumer-shapes job installs the
+  # latest Astro CLI and reads the live Runtime release notes, so upstream drift
+  # in either shows up here before it reaches a customer's PR.
+  schedule:
+    - cron: "0 5 * * *"
   workflow_dispatch:
 
 permissions:
@@ -52,6 +57,103 @@ jobs:
           case "$SCOPE" in patch|minor|major) ;; *) echo "::error::unexpected scope '$SCOPE'"; exit 1;; esac
           [[ "$VERIFY" == "passed" ]] || { echo "::error::verify-status was '$VERIFY', expected passed"; exit 1; }
           echo "✅ dry-run produced a $SCOPE plan ($CURRENT -> $TARGET) and verification passed."
+
+  # One fixture per real consumer's project shape, verified at the default
+  # parse level in a tokenless dry-run. Each row pins what that shape must
+  # produce, so a change that improves one consumer can't quietly regress
+  # another. Shapes (see e2e/consumers/):
+  #   plain                  plain project, bump-blocking-pins
+  #   pytest-addopts-env     project pytest addopts that reshape output, and a
+  #                          gitignored .env the workflow writes before the action
+  #   ...-regression         same, with an upgrade-only failure in an env-dependent
+  #                          DAG: must FAIL, never pass as "pre-existing"
+  #   nested-standalone      project-path airflow/, dev.mode standalone, ENV lines
+  #   floating-base-secret   floating -base tag, build secret, packages.txt
+  #   no-astro-scaffolding   no .astro/ at all (not made by astro dev init)
+  consumer-shapes:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: plain
+            project: e2e/consumers/plain
+            bump-blocking-pins: true
+            expect-status: passed
+          - name: pytest-addopts-env
+            project: e2e/consumers/pytest-addopts-env
+            env-file: true
+            expect-status: passed
+          - name: pytest-addopts-env-regression
+            project: e2e/consumers/pytest-addopts-env
+            env-file: true
+            simulate-regression: true
+            expect-status: failed
+          - name: nested-standalone
+            project: e2e/consumers/nested-standalone/airflow
+            expect-status: passed
+          - name: floating-base-secret
+            project: e2e/consumers/floating-base-secret
+            build-secrets: id=netrc,env=NETRC_CONTENT
+            floating-runtime: true
+            expect-status: passed
+          - name: no-astro-scaffolding
+            project: e2e/astro-project
+            expect-status: passed
+    name: consumer-shapes (${{ matrix.name }})
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Write the gitignored .env, as the consumer's workflow does
+        if: matrix.env-file
+        env:
+          PROJECT: ${{ matrix.project }}
+          REGRESSION: ${{ matrix.simulate-regression && '1' || '' }}
+        run: |
+          set -euo pipefail
+          cp "$PROJECT/fixture.env" "$PROJECT/.env"
+          if [[ -n "$REGRESSION" ]]; then echo "FIXTURE_SIMULATE_REGRESSION=1" >> "$PROJECT/.env"; fi
+
+      - name: Otto Upgrade (dry-run, parse level)
+        id: upgrade
+        uses: ./
+        env:
+          NETRC_CONTENT: "machine example.invalid login x password y"
+        with:
+          project-path: ${{ matrix.project }}
+          target: latest-minor
+          max-upgrade-scope: minor
+          verify-level: parse
+          build-secrets: ${{ matrix.build-secrets || '' }}
+          bump-blocking-pins: ${{ matrix.bump-blocking-pins && 'true' || 'false' }}
+          dry-run: "true"
+
+      - name: Assert the outcome for this shape
+        env:
+          STATUS: ${{ steps.upgrade.outputs.verify-status }}
+          EFFECTIVE: ${{ steps.upgrade.outputs.effective-verify-level }}
+          SECURITY: ${{ steps.upgrade.outputs.security-fixes }}
+          NOUP: ${{ steps.upgrade.outputs.no-update }}
+          EXPECT_STATUS: ${{ matrix.expect-status }}
+          FLOATING: ${{ matrix.floating-runtime && 'true' || 'false' }}
+        run: |
+          set -euo pipefail
+          echo "verify=$STATUS effective=$EFFECTIVE security-fixes=$SECURITY no-update=$NOUP"
+          fail=0
+          [[ "$NOUP" != "true" ]] || { echo "::error::no-update; the fixture's pins no longer lag the feed"; fail=1; }
+          [[ "$STATUS" == "$EXPECT_STATUS" ]] || { echo "::error::verify-status '$STATUS', expected '$EXPECT_STATUS'"; fail=1; }
+          # The verdict must come from the image: a fallback's pass would hide
+          # that the parse-level check stopped working for this shape.
+          [[ "$EFFECTIVE" == "parse" ]] || { echo "::error::effective-verify-level '$EFFECTIVE', expected 'parse'"; fail=1; }
+          # Any Runtime bump must find its security notes; 'unknown' means the
+          # release-notes page changed shape.
+          if [[ "$FLOATING" != "true" && "$SECURITY" == "unknown" ]]; then
+            echo "::error::security-fixes is 'unknown': the Runtime release-notes format may have changed"; fail=1
+          fi
+          exit "$fail"
 
   # Real upgrade against the sample project. Runs only when the Astro secrets are
   # configured (skipped on forks / secret-less runs). Still dry-run so the e2e

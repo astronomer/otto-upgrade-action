@@ -62,6 +62,7 @@ body_file="$WORKDIR/pr-body.md"
 PLAN_FILE="$PLAN_FILE" OTTO_FILE="${OTTO_FILE:-}" VERIFY_FILE="${VERIFY_FILE:-}" \
   VERIFY_STATUS_FILE="${VERIFY_STATUS_FILE:-}" SECURITY_FILE="${SECURITY_FILE:-}" \
   DEPRECATION_FILE="${DEPRECATION_FILE:-}" ACTION_REF="${ACTION_REF:-}" \
+  VERIFY_LEVEL="${VERIFY_LEVEL:-}" VERIFY_EFFECTIVE_FILE="${VERIFY_EFFECTIVE_FILE:-}" \
   python3 "$ACTION_PATH/scripts/build_pr_body.py" > "$body_file"
 
 # Title from the resolved target.
@@ -82,7 +83,9 @@ fi
 # branch or committing (so a later step in the consumer's job sees a clean tree).
 if [[ "$DRY_RUN" == "true" ]]; then
   echo "Dry-run: not mutating the tree, pushing, or opening a PR."
-  diff_out="$(git -C "$GITHUB_WORKSPACE" diff -- "$PROJECT_PATH" || true)"
+  # The same change set a real run would commit (run_changes.py), not a diff
+  # against HEAD that would include what the workflow did before the action.
+  diff_out="$(python3 "$ACTION_PATH/scripts/run_changes.py" diff "$PROJECT_PATH" "$WORKDIR" || true)"
   if [[ -n "$diff_out" ]]; then step_output changed "true"; fi
   echo "----- would open: $title -----"
   cat "$body_file"
@@ -125,12 +128,17 @@ auth_remote="https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.
 # Create/reset the rolling branch from the current checkout (the base), stage
 # only what's under the project path, and commit.
 git checkout -B "$BRANCH"
-# Strip Python bytecode artifacts before staging. Otto and the import-level
-# verifier import the DAGs, which writes __pycache__/*.pyc into the project
-# tree; `git add -A` would otherwise sweep that generated noise into the PR.
+# Clear the bytecode importing DAGs wrote into the project, so it doesn't
+# linger in the workspace for later steps.
 find "$PROJECT_PATH" \( -type d -name '__pycache__' -o -name '*.py[co]' \) \
   -exec rm -rf {} + 2>/dev/null || true
-git add -A -- "$PROJECT_PATH"
+# Stage only what this run changed since the detect step's snapshot (Otto can
+# add and delete files too; bytecode never counts). What the workflow put in
+# place before the action, like a build-secrets `src=` file that isn't
+# gitignored, stays out of the commit.
+# Start from HEAD's index so nothing the workflow staged rides along.
+git reset -q
+python3 "$ACTION_PATH/scripts/run_changes.py" stage "$PROJECT_PATH" "$WORKDIR"
 # Belt-and-suspenders: drop any bytecode that slipped into the index anyway
 # (e.g. it was already tracked on the base branch).
 git rm -r --cached --quiet --ignore-unmatch -- "$PROJECT_PATH/**/__pycache__" "$PROJECT_PATH/**/*.pyc" 2>/dev/null || true
@@ -167,13 +175,14 @@ if [[ -n "$expected" ]]; then
   if [[ -n "$remote_tree" && "$local_tree" == "$remote_tree" ]]; then
     skip_push=true
     if [[ -n "$existing" ]]; then
-      echo "Rolling branch already reflects this target and PR #$existing is open — leaving it untouched."
       step_output changed "false"
-      step_output pr-number "$existing"
-      step_output pr-url "$(gh pr view "$existing" --repo "$GITHUB_REPOSITORY" --json url --jq '.url')"
-      exit 0
+      # The code is unchanged but this run's findings may not be (a newer
+      # verification verdict, a newer action version reading the same tree
+      # differently), so the body and labels are still refreshed below.
+      echo "Rolling branch already reflects this target and PR #$existing is open — not pushing; refreshing its description."
+    else
+      echo "Rolling branch already reflects this target but no PR is open — creating one (no push needed)."
     fi
-    echo "Rolling branch already reflects this target but no PR is open — creating one (no push needed)."
   fi
 fi
 
@@ -188,17 +197,23 @@ fi
 
 # Open or update the single rolling PR.
 if [[ -n "$existing" ]]; then
-  echo "Updating existing PR #$existing in place."
-  gh pr edit "$existing" --repo "$GITHUB_REPOSITORY" \
-    --title "$title" --body-file "$body_file" >/dev/null
+  current_body=$(gh pr view "$existing" --repo "$GITHUB_REPOSITORY" --json title,body \
+    --jq '.title + "\n" + .body' 2>/dev/null || true)
+  if [[ "$current_body" == "$title"$'\n'"$(cat "$body_file")" ]]; then
+    echo "PR #$existing already says this; leaving its description untouched."
+  else
+    echo "Updating existing PR #$existing in place."
+    gh pr edit "$existing" --repo "$GITHUB_REPOSITORY" \
+      --title "$title" --body-file "$body_file" >/dev/null
+  fi
   pr_number="$existing"
   pr_url=$(gh pr view "$existing" --repo "$GITHUB_REPOSITORY" --json url --jq '.url')
 else
   echo "Opening a new PR."
   if ! pr_url=$(gh pr create --repo "$GITHUB_REPOSITORY" \
       --base "$base_ref" --head "$BRANCH" \
-      --title "$title" --body-file "$body_file" 2>/tmp/otto-upgrade/pr-create.err); then
-    err="$(cat /tmp/otto-upgrade/pr-create.err 2>/dev/null || true)"
+      --title "$title" --body-file "$body_file" 2>"$WORKDIR/pr-create.err"); then
+    err="$(cat "$WORKDIR/pr-create.err" 2>/dev/null || true)"
     echo "$err" >&2
     if printf '%s' "$err" | grep -qi "not permitted to create or approve pull requests"; then
       echo "::error::The upgrade branch '$BRANCH' was pushed, but opening the PR was blocked: GitHub Actions isn't allowed to create PRs in this repo. Enable Settings → Actions → General → 'Allow GitHub Actions to create and approve pull requests', or pass a PAT / GitHub App token as the 'github-token' input. Re-run after fixing — the action will open the PR from the already-pushed branch."
