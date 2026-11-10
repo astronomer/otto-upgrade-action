@@ -222,13 +222,14 @@ def test_interrupted_session_without_failures_is_no_verdict():
     assert "pytest exit 2" in result["reason"]
 
 
-def test_failures_from_an_interrupted_session_are_still_reported():
+def test_failures_from_an_interrupted_session_are_reported_as_incomplete():
     text = _payload(exitstatus=2, collected=1, results=[
         {"id": "dags/b.py", "outcome": "failed",
          "msg": "dags/b.py failed to import with message \n " + TRACEBACK}])
     rc, result = parse_check.parse_output(text)
     assert rc == 3
     assert result["failures"][0]["path"] == "dags/b.py"
+    assert "pytest exit 2" in result["incomplete"]
 
 
 def test_main_writes_import_json(tmp_path, monkeypatch):
@@ -261,7 +262,9 @@ def test_session_shorter_than_its_collection_is_no_verdict():
 
 def test_collection_error_next_to_passing_results_is_not_a_pass():
     text = _payload(collect_errors=[{"nodeid": "x", "msg": "ImportError: boom"}], exitstatus=1)
-    assert parse_check.parse_output(text)[0] == 5
+    rc, result = parse_check.parse_output(text)
+    assert rc == 2
+    assert result["reason"].startswith("part of the DAG integrity test failed to collect")
 
 
 def test_only_the_runs_own_nonce_counts():
@@ -271,11 +274,20 @@ def test_only_the_runs_own_nonce_counts():
     assert parse_check.parse_output(stale_then_real, nonce="n1")[0] == 0
 
 
-def test_session_stopped_early_is_no_verdict_even_with_failures():
-    # Its failures could match the baseline's while unreached files go unchecked.
+def test_session_stopped_early_keeps_its_failures_but_is_marked_incomplete():
+    # Its failures stand, but they must not be compared with the baseline:
+    # a shared failure could clear while unreached files go unchecked.
     text = _payload(exitstatus=1, collected=3, ran=1, results=[
         {"id": "dags/a.py", "outcome": "failed", "msg": "KeyError: 'x'"}])
-    assert parse_check.parse_output(text)[0] == 2
+    rc, result = parse_check.parse_output(text)
+    assert rc == 3
+    assert result["incomplete"] == "the DAG integrity run stopped after 1 of 3 tests"
+
+
+def test_session_stopped_early_without_failures_is_no_verdict():
+    rc, result = parse_check.parse_output(_payload(collected=3, ran=1))
+    assert rc == 2
+    assert "stopped after 1 of 3" in result["reason"]
 
 
 def test_unparseable_last_line_does_not_hide_the_real_result():
@@ -331,21 +343,26 @@ def test_collection_error_keeps_its_cause_when_nothing_ran():
     assert result["collection_error"].startswith("TypeError")
 
 
-def test_collection_error_beside_failures_is_not_comparable():
+def test_collection_error_beside_failures_keeps_them_and_is_incomplete():
     text = _payload(exitstatus=1, collected=1, ran=1,
                     collect_errors=[{"nodeid": "x", "msg": "ImportError: boom"}],
                     results=[{"id": "dags/a.py", "outcome": "failed", "msg": "KeyError: 'x'"}])
-    assert parse_check.parse_output(text)[0] == 5
+    rc, result = parse_check.parse_output(text)
+    assert rc == 3
+    assert [f["path"] for f in result["failures"]] == ["dags/a.py"]
+    assert result["incomplete"].startswith("part of the DAG integrity test failed to collect")
 
 
-def test_directly_raised_import_error_keeps_its_class(tmp_path):
+@pytest.mark.parametrize("message", ["No module named 'gone'",
+                                     "No module named 'gone'\\nhint: install the extra"])
+def test_directly_raised_import_error_keeps_its_class(tmp_path, message):
     layout_project(tmp_path, {})
-    (tmp_path / ".astro" / "test_dag_integrity_default.py").write_text(textwrap.dedent("""\
+    (tmp_path / ".astro" / "test_dag_integrity_default.py").write_text(textwrap.dedent(f"""\
         import pytest
 
         @pytest.mark.parametrize("rel_path", ["dags/a.py"], ids=["dags/a.py"])
         def test_file_imports(rel_path):
-            raise ModuleNotFoundError("No module named 'gone'")
+            raise ModuleNotFoundError("{message}")
     """))
     rc, result = parse_check.parse_output(_pytest(tmp_path))
     assert rc == 3
@@ -366,4 +383,5 @@ def test_test_interrupted_mid_call_leaves_the_session_incomplete(tmp_path):
             raise KeyboardInterrupt
     """))
     rc, result = parse_check.parse_output(_pytest(tmp_path))
-    assert rc == 2
+    assert rc == 3
+    assert result["incomplete"] == "the DAG integrity run stopped after 1 of 2 tests"

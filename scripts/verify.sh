@@ -471,8 +471,11 @@ verify_parse_level() {
     exit 0
   fi
 
-  # target_rc == 3: real import failures inside the target image.
-  if [[ "$baseline_rc" == "0" || "$baseline_rc" == "3" ]]; then
+  # target_rc == 3: real import failures inside the target image. An
+  # incomplete target session is never compared: a shared failure could clear
+  # while the files that never ran go unchecked.
+  incomplete=$(jq -r '.incomplete // empty' "$WORKDIR/import-failures.json")
+  if [[ -z "$incomplete" && ( "$baseline_rc" == "0" || "$baseline_rc" == "3" ) ]]; then
     set +e
     cmp_out=$(python3 "$ACTION_PATH/scripts/compare_failures.py" \
       "$WORKDIR/import-failures.json" "$WORKDIR/baseline-failures.json")
@@ -492,7 +495,11 @@ verify_parse_level() {
       echo
       jq -r '.failures[] | "  - `\(.path)`: `\(.msg | gsub("`"; "'"'"'"))`"' "$WORKDIR/import-failures.json"
       echo
-      echo "_Baseline comparison unavailable (the pre-upgrade image could not be parsed); all failures are shown — some may pre-date this upgrade._"
+      if [[ -n "$incomplete" ]]; then
+        echo "_The integrity run was incomplete (${incomplete}), so it isn't compared with the pre-upgrade image; all failures are shown — some may pre-date this upgrade._"
+      else
+        echo "_Baseline comparison unavailable (the pre-upgrade image could not be parsed); all failures are shown — some may pre-date this upgrade._"
+      fi
     } > "$report"
   fi
   exit 0

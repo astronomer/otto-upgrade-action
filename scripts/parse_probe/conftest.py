@@ -79,11 +79,11 @@ def pytest_otto_makereport(item, call):
     outcome = yield
     report = outcome.get_result()
     if call.excinfo is not None:
-        # With the class: a custom test raising ModuleNotFoundError directly
-        # must still read as an import failure. The default template's message
-        # ends with DagBag's own "SomeError: ..." line, which stays last.
-        exc = call.excinfo.value
-        report._otto_msg = f"{type(exc).__name__}: {exc}"
+        # The class separately: a custom test raising ModuleNotFoundError
+        # itself must still read as an import failure, however long or
+        # multi-line its message is.
+        report._otto_msg = str(call.excinfo.value)
+        report._otto_exc_class = type(call.excinfo.value).__name__
     report._otto_id = _otto_test_id(item)
 
 
@@ -101,6 +101,7 @@ def pytest_otto_logreport(report):
     if report.failed and entry["outcome"] != "failed":
         entry["outcome"] = "failed"
         entry["msg"] = _otto_message(report)
+        entry["exc_class"] = getattr(report, "_otto_exc_class", "")
     elif report.skipped and report.when in ("setup", "call") and entry["outcome"] == "passed":
         entry["outcome"] = "skipped"
 
