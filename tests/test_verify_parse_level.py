@@ -193,3 +193,24 @@ def test_env_symlinked_outside_the_project_is_read_not_written(tmp_path, project
     out = run_verify(tmp_path, project, workdir)
     assert (out["status"], out["effective"]) == ("passed", "parse"), out["log"]
     assert real_env.read_text() == "BUCKET=b\n"
+
+
+def test_incomplete_target_session_is_never_cleared_by_the_baseline(tmp_path, project, workdir):
+    # A project plugin stops the session at the first failure, which the
+    # baseline shares. The file after it, broken only by the upgrade, never
+    # runs; comparing would call the shared failure pre-existing and pass.
+    (project / ".astro" / "conftest.py").write_text(
+        "def pytest_runtest_makereport(item, call):\n"
+        "    if call.excinfo is not None:\n"
+        "        item.session.shouldstop = 'project plugin stop'\n")
+    (project / "dags" / "a_broken.py").write_text("raise KeyError('needs a connection')\n")
+    (project / "dags" / "z_upgrade.py").write_text(
+        'import pathlib\nif "slack==2" in pathlib.Path("requirements.txt").read_text():\n'
+        '    raise ImportError("moved")\n')
+    commit(project, "dags")
+    snapshot(project, workdir)
+    (project / "requirements.txt").write_text("slack==2\n")
+    out = run_verify(tmp_path, project, workdir)
+    assert (out["status"], out["effective"]) == ("failed", "parse"), out["log"]
+    assert out["report"].startswith("⚠️ **The DAG integrity run was incomplete**")
+    assert "Image parse (baseline" not in out["log"]  # no baseline built for it

@@ -28,14 +28,18 @@ Env out:
 
 Exit codes (verify.sh keys on these):
   0  image built, every collected DAG file imports
-  3  image built, at least one DAG file failed to import
+  3  image built, at least one DAG file failed to import. "incomplete" carries
+     a reason when the session wasn't whole (a collection error, a stop before
+     every test ran, an abnormal pytest exit): the failures stand, but they
+     must not be compared with a baseline, since files that never ran could
+     hide behind failures the baseline shares
   4  the image itself failed to build (dependency resolution, Dockerfile error)
-  5  pytest died during COLLECTION, so no DAG was tested. Field case: the
+  5  pytest died during COLLECTION and nothing ran, so no DAG was tested. Field case: the
      repo's committed .astro/test_dag_integrity_default.py (from an older CLI)
      calls DagBag with an argument the target Airflow removed.
   2  no verdict: no result line (the run never completed, the CLI refused to
-     start it, or the reporter wasn't loaded), an interrupted or incomplete
-     session, or a session that tested no DAG file
+     start it, or the reporter wasn't loaded), an incomplete session with no
+     failures, or a session that tested no DAG file
 """
 
 from __future__ import annotations
@@ -110,31 +114,48 @@ def parse_output(text: str, nonce: str = "") -> tuple[int, dict]:
     for r in results:
         if r.get("outcome") != "failed":
             continue
-        msg = _terse(r.get("msg", ""))
-        cm = _EXC_CLASS.match(msg)
-        failures.append(failure(r.get("id", "?"), cm.group(1).rsplit(".", 1)[-1] if cm else "", msg))
+        raised = r.get("exc_class") or ""
+        if raised and raised != "Exception":
+            # A test that raised the error itself: its class and the first line
+            # of its message (where the module or symbol is named).
+            first = next((ln.strip() for ln in r.get("msg", "").splitlines() if ln.strip()), "")
+            exc_class, msg = raised, f"{raised}: {first}" if first else raised
+        else:
+            # The template wraps DagBag's error in a plain Exception; the real
+            # error is the traceback's last line.
+            msg = _terse(r.get("msg", ""))
+            cm = _EXC_CLASS.match(msg)
+            exc_class = cm.group(1).rsplit(".", 1)[-1] if cm else ""
+        failures.append(failure(r.get("id", "?"), exc_class, msg))
     failures.sort(key=lambda f: f["path"])
     # A skipped test checked nothing (an empty parametrize yields one skipped
     # placeholder when DagBag found no files).
     checked = sum(1 for r in results if r.get("outcome") != "skipped")
 
-    # A session that stopped early (a stepwise or stop-on-failure plugin the
-    # reporter can't override) is no verdict even with failures in it: compared
-    # against the baseline, its failures could clear while the files it never
-    # reached go unchecked.
-    # Something failed to collect, so some DAG file may never have been tested.
-    if collect_errors and not failures:
+    if collect_errors and not results:
         return 5, {"checked": 0, "failures": [],
                    "collection_error": _terse(collect_errors[0].get("msg", ""))}
+
+    # Whether every collected test ran to the end. Some DAG file may have gone
+    # untested otherwise, even if others ran.
     ran, collected = payload.get("ran"), payload.get("collected") or 0
-    if ran is not None and ran < collected:
-        return _no_verdict(text, f"the DAG integrity run stopped after {ran} "
-                                 f"of {collected} tests")
-    if failures:
-        return 3, {"checked": checked, "failures": failures}
     exitstatus = payload.get("exitstatus")
-    if exitstatus not in (0, 1):
-        return _no_verdict(text, f"the DAG integrity run ended abnormally (pytest exit {exitstatus})")
+    incomplete = ""
+    if collect_errors:
+        incomplete = "part of the DAG integrity test failed to collect: " + \
+            _terse(collect_errors[0].get("msg", ""))
+    elif ran is not None and ran < collected:
+        incomplete = f"the DAG integrity run stopped after {ran} of {collected} tests"
+    elif exitstatus not in (0, 1):
+        incomplete = f"the DAG integrity run ended abnormally (pytest exit {exitstatus})"
+
+    if failures:
+        result: dict = {"checked": checked, "failures": failures}
+        if incomplete:
+            result["incomplete"] = incomplete
+        return 3, result
+    if incomplete:
+        return _no_verdict(text, incomplete)
     if checked == 0:
         return _no_verdict(text, "the DAG integrity run tested no DAG files")
     return 0, {"checked": checked, "failures": []}

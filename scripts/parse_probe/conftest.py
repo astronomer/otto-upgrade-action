@@ -79,13 +79,20 @@ def pytest_otto_makereport(item, call):
     outcome = yield
     report = outcome.get_result()
     if call.excinfo is not None:
+        # The class separately: a custom test raising ModuleNotFoundError
+        # itself must still read as an import failure, however long or
+        # multi-line its message is.
         report._otto_msg = str(call.excinfo.value)
+        report._otto_exc_class = type(call.excinfo.value).__name__
     report._otto_id = _otto_test_id(item)
 
 
 @_otto_pytest.hookimpl(specname="pytest_runtest_logreport")
 def pytest_otto_logreport(report):
-    _otto_ran.add(report.nodeid)
+    # A test counts as run once its teardown reports: one interrupted mid-call
+    # must leave the session short of complete.
+    if report.when == "teardown":
+        _otto_ran.add(report.nodeid)
     test_id = getattr(report, "_otto_id", report.nodeid)
     if test_id is None:
         return
@@ -94,6 +101,7 @@ def pytest_otto_logreport(report):
     if report.failed and entry["outcome"] != "failed":
         entry["outcome"] = "failed"
         entry["msg"] = _otto_message(report)
+        entry["exc_class"] = getattr(report, "_otto_exc_class", "")
     elif report.skipped and report.when in ("setup", "call") and entry["outcome"] == "passed":
         entry["outcome"] = "skipped"
 
