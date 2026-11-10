@@ -114,14 +114,18 @@ def parse_output(text: str, nonce: str = "") -> tuple[int, dict]:
     for r in results:
         if r.get("outcome") != "failed":
             continue
-        msg = _terse(r.get("msg", ""))
-        cm = _EXC_CLASS.match(msg)
-        exc_class = cm.group(1).rsplit(".", 1)[-1] if cm else ""
-        # The template wraps DagBag's error in a plain Exception, so the class
-        # comes from the message's last line; a test that raised the error
-        # itself has it in exc_class.
-        if not exc_class and r.get("exc_class") not in (None, "", "Exception"):
-            exc_class = r["exc_class"]
+        raised = r.get("exc_class") or ""
+        if raised and raised != "Exception":
+            # A test that raised the error itself: its class and the first line
+            # of its message (where the module or symbol is named).
+            first = next((ln.strip() for ln in r.get("msg", "").splitlines() if ln.strip()), "")
+            exc_class, msg = raised, f"{raised}: {first}" if first else raised
+        else:
+            # The template wraps DagBag's error in a plain Exception; the real
+            # error is the traceback's last line.
+            msg = _terse(r.get("msg", ""))
+            cm = _EXC_CLASS.match(msg)
+            exc_class = cm.group(1).rsplit(".", 1)[-1] if cm else ""
         failures.append(failure(r.get("id", "?"), exc_class, msg))
     failures.sort(key=lambda f: f["path"])
     # A skipped test checked nothing (an empty parametrize yields one skipped

@@ -367,6 +367,8 @@ def test_directly_raised_import_error_keeps_its_class(tmp_path, message):
     rc, result = parse_check.parse_output(_pytest(tmp_path))
     assert rc == 3
     assert result["failures"][0]["exc_class"] == "ModuleNotFoundError"
+    # The module name survives for the baseline comparison's symbol check.
+    assert result["failures"][0]["msg"] == "ModuleNotFoundError: No module named 'gone'"
 
 
 def test_test_interrupted_mid_call_leaves_the_session_incomplete(tmp_path):

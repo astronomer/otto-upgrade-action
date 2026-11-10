@@ -212,4 +212,5 @@ def test_incomplete_target_session_is_never_cleared_by_the_baseline(tmp_path, pr
     (project / "requirements.txt").write_text("slack==2\n")
     out = run_verify(tmp_path, project, workdir)
     assert (out["status"], out["effective"]) == ("failed", "parse"), out["log"]
-    assert "was incomplete" in out["report"]
+    assert out["report"].startswith("⚠️ **The DAG integrity run was incomplete**")
+    assert "Image parse (baseline" not in out["log"]  # no baseline built for it

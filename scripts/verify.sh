@@ -407,10 +407,18 @@ verify_parse_level() {
     exit 0
   fi
 
+  # An incomplete target session (see parse_check.py) is never compared with
+  # a baseline: a shared failure could clear while the files that never ran go
+  # unchecked. So there's no baseline to build for it.
+  local incomplete=""
+  if [[ "$target_rc" -eq 3 ]]; then
+    incomplete=$(jq -r '.incomplete // empty' "$WORKDIR/import-failures.json" 2>/dev/null || true)
+  fi
+
   # Baseline: the same parse at the pre-upgrade state (current image + pins).
   set +e
-  make_baseline_copy
-  baseline_made=$?
+  baseline_made=1
+  [[ -n "$incomplete" ]] || { make_baseline_copy; baseline_made=$?; }
   baseline_rc=""
   if [[ "$baseline_made" -eq 0 ]]; then
     prepare_parse_dir "$baseline_dir" "$(jq -r '.runtime.current_airflow // empty' "$PLAN_FILE")"
@@ -471,10 +479,7 @@ verify_parse_level() {
     exit 0
   fi
 
-  # target_rc == 3: real import failures inside the target image. An
-  # incomplete target session is never compared: a shared failure could clear
-  # while the files that never ran go unchecked.
-  incomplete=$(jq -r '.incomplete // empty' "$WORKDIR/import-failures.json")
+  # target_rc == 3: real import failures inside the target image.
   if [[ -z "$incomplete" && ( "$baseline_rc" == "0" || "$baseline_rc" == "3" ) ]]; then
     set +e
     cmp_out=$(python3 "$ACTION_PATH/scripts/compare_failures.py" \
@@ -491,13 +496,16 @@ verify_parse_level() {
   else
     status="failed"
     {
+      if [[ -n "$incomplete" ]]; then
+        # Leads, so a short count isn't read as the whole project's.
+        echo "⚠️ **The DAG integrity run was incomplete** (\`$(printf '%s' "$incomplete" | tr '\`' "'")\`): some DAG files were never checked. The failures it did find are below; it isn't compared with the pre-upgrade image, so some may pre-date this upgrade."
+        echo
+      fi
       echo "❌ $(jq -r '.failures | length' "$WORKDIR/import-failures.json") of $(jq -r '.checked' "$WORKDIR/import-failures.json") DAG file(s) failed to import inside the target Runtime image:"
       echo
       jq -r '.failures[] | "  - `\(.path)`: `\(.msg | gsub("`"; "'"'"'"))`"' "$WORKDIR/import-failures.json"
-      echo
-      if [[ -n "$incomplete" ]]; then
-        echo "_The integrity run was incomplete (${incomplete}), so it isn't compared with the pre-upgrade image; all failures are shown — some may pre-date this upgrade._"
-      else
+      if [[ -z "$incomplete" ]]; then
+        echo
         echo "_Baseline comparison unavailable (the pre-upgrade image could not be parsed); all failures are shown — some may pre-date this upgrade._"
       fi
     } > "$report"
