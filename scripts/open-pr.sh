@@ -212,8 +212,8 @@ else
   echo "Opening a new PR."
   if ! pr_url=$(gh pr create --repo "$GITHUB_REPOSITORY" \
       --base "$base_ref" --head "$BRANCH" \
-      --title "$title" --body-file "$body_file" 2>/tmp/otto-upgrade/pr-create.err); then
-    err="$(cat /tmp/otto-upgrade/pr-create.err 2>/dev/null || true)"
+      --title "$title" --body-file "$body_file" 2>"$WORKDIR/pr-create.err"); then
+    err="$(cat "$WORKDIR/pr-create.err" 2>/dev/null || true)"
     echo "$err" >&2
     if printf '%s' "$err" | grep -qi "not permitted to create or approve pull requests"; then
       echo "::error::The upgrade branch '$BRANCH' was pushed, but opening the PR was blocked: GitHub Actions isn't allowed to create PRs in this repo. Enable Settings → Actions → General → 'Allow GitHub Actions to create and approve pull requests', or pass a PAT / GitHub App token as the 'github-token' input. Re-run after fixing — the action will open the PR from the already-pushed branch."
