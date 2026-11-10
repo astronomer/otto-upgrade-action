@@ -329,3 +329,41 @@ def test_collection_error_keeps_its_cause_when_nothing_ran():
     rc, result = parse_check.parse_output(text)
     assert rc == 5
     assert result["collection_error"].startswith("TypeError")
+
+
+def test_collection_error_beside_failures_is_not_comparable():
+    text = _payload(exitstatus=1, collected=1, ran=1,
+                    collect_errors=[{"nodeid": "x", "msg": "ImportError: boom"}],
+                    results=[{"id": "dags/a.py", "outcome": "failed", "msg": "KeyError: 'x'"}])
+    assert parse_check.parse_output(text)[0] == 5
+
+
+def test_directly_raised_import_error_keeps_its_class(tmp_path):
+    layout_project(tmp_path, {})
+    (tmp_path / ".astro" / "test_dag_integrity_default.py").write_text(textwrap.dedent("""\
+        import pytest
+
+        @pytest.mark.parametrize("rel_path", ["dags/a.py"], ids=["dags/a.py"])
+        def test_file_imports(rel_path):
+            raise ModuleNotFoundError("No module named 'gone'")
+    """))
+    rc, result = parse_check.parse_output(_pytest(tmp_path))
+    assert rc == 3
+    assert result["failures"][0]["exc_class"] == "ModuleNotFoundError"
+
+
+def test_test_interrupted_mid_call_leaves_the_session_incomplete(tmp_path):
+    layout_project(tmp_path, {})
+    (tmp_path / ".astro" / "test_dag_integrity_default.py").write_text(textwrap.dedent("""\
+        import pytest
+
+        FILES = ["dags/a.py", "dags/b.py"]
+
+        @pytest.mark.parametrize("rel_path", FILES, ids=FILES)
+        def test_file_imports(rel_path):
+            if rel_path == "dags/a.py":
+                raise Exception("dags/a.py failed to import with message \\n KeyError: 'x'")
+            raise KeyboardInterrupt
+    """))
+    rc, result = parse_check.parse_output(_pytest(tmp_path))
+    assert rc == 2

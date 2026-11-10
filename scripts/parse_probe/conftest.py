@@ -79,13 +79,20 @@ def pytest_otto_makereport(item, call):
     outcome = yield
     report = outcome.get_result()
     if call.excinfo is not None:
-        report._otto_msg = str(call.excinfo.value)
+        # With the class: a custom test raising ModuleNotFoundError directly
+        # must still read as an import failure. The default template's message
+        # ends with DagBag's own "SomeError: ..." line, which stays last.
+        exc = call.excinfo.value
+        report._otto_msg = f"{type(exc).__name__}: {exc}"
     report._otto_id = _otto_test_id(item)
 
 
 @_otto_pytest.hookimpl(specname="pytest_runtest_logreport")
 def pytest_otto_logreport(report):
-    _otto_ran.add(report.nodeid)
+    # A test counts as run once its teardown reports: one interrupted mid-call
+    # must leave the session short of complete.
+    if report.when == "teardown":
+        _otto_ran.add(report.nodeid)
     test_id = getattr(report, "_otto_id", report.nodeid)
     if test_id is None:
         return

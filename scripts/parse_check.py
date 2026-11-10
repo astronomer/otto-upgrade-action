@@ -122,8 +122,10 @@ def parse_output(text: str, nonce: str = "") -> tuple[int, dict]:
     # reporter can't override) is no verdict even with failures in it: compared
     # against the baseline, its failures could clear while the files it never
     # reached go unchecked.
-    # Something failed to collect, so some DAG file may never have been tested.
-    if collect_errors and not failures:
+    # Something failed to collect, so some DAG file may never have been tested,
+    # even when other files ran (and failed): comparing those failures with the
+    # baseline could pass while the uncollected files go unchecked.
+    if collect_errors:
         return 5, {"checked": 0, "failures": [],
                    "collection_error": _terse(collect_errors[0].get("msg", ""))}
     ran, collected = payload.get("ran"), payload.get("collected") or 0
