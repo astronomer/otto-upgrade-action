@@ -1,0 +1,4 @@
+project:
+    name: nested-standalone
+dev:
+    mode: standalone

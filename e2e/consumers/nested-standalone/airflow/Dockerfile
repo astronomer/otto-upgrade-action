@@ -1,0 +1,3 @@
+FROM astrocrpublic.azurecr.io/runtime:3.3-10
+ENV PYTHONPATH=/usr/local/airflow:${PYTHONPATH}
+ENV AIRFLOW__CORE__MAX_TEMPLATED_FIELD_LENGTH=100000

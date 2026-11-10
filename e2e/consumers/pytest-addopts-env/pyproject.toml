@@ -1,0 +1,4 @@
+# Mirrors a real consumer: project-wide pytest options that also apply to the
+# DAG integrity run inside the image, colouring and reshaping its output.
+[tool.pytest.ini_options]
+addopts = ["--tb=short", "--no-header", "--color=yes"]
